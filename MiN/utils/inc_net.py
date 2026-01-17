@@ -98,7 +98,45 @@ class MiNbaseNet(nn.Module):
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
+    # --- THÊM VÀO utils/inc_net.py (Trong class MiNbaseNet) ---
+    
+    @torch.no_grad()
+    def fit_features(self, features: torch.Tensor, Y: torch.Tensor) -> None:
+        """
+        Phiên bản fit dành riêng cho features đã trích xuất (từ CFS).
+        Bỏ qua bước self.backbone(X).
+        """
+        # Tắt autocast để tính toán chính xác ma trận nghịch đảo
+        with autocast(enabled=False): 
+            X = features.float() 
+            X = self.buffer(X)   
 
+            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
+
+            num_targets = Y.shape[1]
+            if num_targets > self.out_features:
+                increment_size = num_targets - self.out_features
+                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                self.weight = torch.cat((self.weight, tail), dim=1)
+            elif num_targets < self.out_features:
+                # Trường hợp hiếm gặp, mở rộng Y nếu cần
+                increment_size = self.out_features - num_targets
+                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                Y = torch.cat((Y, tail), dim=1)
+
+            # Thuật toán RLS (Recursive Least Squares)
+            I = torch.eye(X.shape[0]).to(X)
+            term = I + X @ self.R @ X.T
+            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            
+            # Tính nghịch đảo
+            try:
+                K = torch.inverse(term + jitter)
+            except:
+                K = torch.pinverse(term + jitter)
+            
+            self.R -= self.R @ X.T @ K @ X @ self.R
+            self.weight += self.R @ X.T @ (Y - X @ self.weight)
     def update_fc(self, nb_classes):
         """
         Cập nhật lớp Normal FC (cho việc training Noise).
