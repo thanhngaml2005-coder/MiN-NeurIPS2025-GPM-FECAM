@@ -268,8 +268,8 @@ class MinNet(object):
             lr = self.init_lr
             weight_decay = self.init_weight_decay
         else:
-            epochs = self.epochs
-            lr = self.lr
+            epochs = 5
+            lr = self.lr * 0.1
             weight_decay = self.weight_decay
 
         for param in self._network.parameters():
