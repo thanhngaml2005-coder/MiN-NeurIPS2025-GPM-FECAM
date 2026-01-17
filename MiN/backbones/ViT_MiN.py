@@ -101,20 +101,8 @@ class PiNoise(nn.Module):
     #     torch.nn.init.constant_(module.bias, 0.)
 
     def _init_zero(self, module, scale=1e-4):
-        """
-        Khởi tạo trọng số ngẫu nhiên nhưng với biên độ cực nhỏ (Near-Zero).
-        Giúp phá vỡ đối xứng (Symmetry Breaking) nhưng vẫn giữ noise ban đầu xấp xỉ 0.
-        """
-        # 1. Khởi tạo Kaiming Uniform (Chuẩn cho ReLU/GELU networks)
-        nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
-        
-        # 2. Thu nhỏ trọng số về gần 0
-        with torch.no_grad():
-            module.weight.data *= scale
-            
-        # 3. Bias vẫn nên để bằng 0 để tránh shift mean ban đầu
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0.)
+        torch.nn.init.constant_(module.weight, 0.)
+        torch.nn.init.constant_(module.bias, 0.)
     def update_noise(self):
         """
         [Bước 2]: Sequential Init.
