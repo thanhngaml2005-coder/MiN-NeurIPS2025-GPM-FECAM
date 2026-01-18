@@ -205,8 +205,7 @@ class MinNet(object):
         
         prog_bar = tqdm(range(self.fit_epoch))
         
-        # [FIX] Dùng normal_fc.out_features thay vì fc.out_features
-        # normal_fc là layer SGD, nhưng nó có số class tương đương với known_class
+        # Dùng normal_fc.out_features để lấy tổng số class hiện tại
         num_cls = self._network.normal_fc.out_features
         
         with torch.no_grad():
@@ -216,7 +215,8 @@ class MinNet(object):
                     # One-hot encoding
                     targets_oh = F.one_hot(targets, num_classes=num_cls).float()
                     
-                    # Gọi hàm fit của MiNbaseNet (đã có @torch.no_grad bên trong, nhưng bọc ngoài càng tốt)
+                    # Gọi hàm fit của MiNbaseNet
+                    # Hàm fit bên inc_net.py giờ đã tự xử lý đầu vào là ảnh
                     self._network.fit(inputs, targets_oh)
                 
                 info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
@@ -290,7 +290,7 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(device)
                 with autocast('cuda'):
-                    # [FIX] Detach ngay để tránh giữ Graph
+                    # Detach feature
                     feats = model.extract_feature(inputs).detach()
                 all_features.append(feats)
                 all_labels.append(targets)
@@ -310,7 +310,7 @@ class MinNet(object):
         cfs_epochs = 15 
         
         for ep in range(cfs_epochs):
-            # [FIX] Shuffle ở mỗi Epoch
+            # Shuffle mỗi epoch
             perm = torch.randperm(num_samples)
             for i in range(0, num_samples, cfs_batch_size):
                 idx = perm[i : i + cfs_batch_size]
@@ -373,7 +373,7 @@ class MinNet(object):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 with autocast('cuda'):
-                    # [FIX] Detach feature để tránh memory leak
+                    # Detach feature để tránh memory leak
                     features = self._network.extract_feature(inputs).detach().float()
                 X_new_list.append(features)
                 Y_new_list.append(targets)
@@ -384,24 +384,22 @@ class MinNet(object):
         # 2. Get Buffered Features (Old Tasks)
         X_old_list, Y_old_list = [], []
         
-        # [FIX] Logic lọc class: Chỉ lấy những class đã học TRƯỚC task hiện tại
-        # (self.known_class là số lượng class tính đến đầu task này)
+        # Chỉ lấy class đã học TRƯỚC Task hiện tại
         if len(self.feature_buffer) > 0:
             for cls, feats in self.feature_buffer.items():
                 if cls < self.known_class: # Chỉ lấy Old Classes
                     X_old_list.append(feats.to(self.device))
-                    # [FIX] Đảm bảo dtype=torch.long
+                    # Đảm bảo dtype=torch.long
                     Y_old_list.append(torch.full((feats.size(0),), cls, dtype=torch.long, device=self.device))
             
             if len(X_old_list) > 0:
                 X_old = torch.cat(X_old_list, dim=0)
                 Y_old = torch.cat(Y_old_list, dim=0)
                 
-                # Balancing: Không repeat quá nhiều để tránh Overfit vào điểm exemplar
-                # Dùng tỷ lệ nhẹ nhàng hơn
+                # Balancing: Giảm tỷ lệ repeat
                 avg_new = X_new.size(0) // (self.increment if self.cur_task > 0 else self.init_class)
                 avg_old = 20
-                repeat_factor = max(1, int((avg_new / avg_old) * 0.5)) # Giảm tỷ lệ repeat xuống 50%
+                repeat_factor = max(1, int((avg_new / avg_old) * 0.5)) 
                 
                 X_old = X_old.repeat(repeat_factor, 1)
                 Y_old = Y_old.repeat(repeat_factor)
@@ -416,24 +414,24 @@ class MinNet(object):
             X_total, Y_total = X_new, Y_new
 
         # 3. Fit RLS (Batch-wise để tránh OOM)
-        # [FIX] Dùng normal_fc.out_features để lấy tổng số class hiện tại
+        # Dùng normal_fc.out_features để lấy tổng số class hiện tại
         num_classes = self._network.normal_fc.out_features
         Y_total_oh = F.one_hot(Y_total, num_classes=num_classes).float()
         
-        batch_size_fit = 4096 # Tăng batch size lên vì chỉ tính toán ma trận
+        batch_size_fit = 4096 
         total_samples = X_total.size(0)
         perm = torch.randperm(total_samples)
         
         info = f"Task {self.cur_task} --> Re-fit RLS with Buffer..."
         self.logger.info(info)
         
-        # [FIX] Tắt gradient hoàn toàn cho RLS fit
         with torch.no_grad():
             for i in tqdm(range(0, total_samples, batch_size_fit), desc="Re-fitting"):
                 idx = perm[i : i + batch_size_fit]
                 x_batch = X_total[idx]
                 y_batch = Y_total_oh[idx]
-                # x_batch đã được detach từ trên, nên an toàn
+                
+                # Gọi hàm fit (hàm này giờ nhận input 2D và tự hiểu)
                 self._network.fit(x_batch, y_batch)
 
     def after_train(self, data_manger):

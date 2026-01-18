@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
 # Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
-from torch.cuda.amp import autocast 
+from torch.amp import autocast 
 
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
@@ -113,7 +113,6 @@ class MiNbaseNet(nn.Module):
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
             # Task đầu: Có bias
-            # [FIX LỖI TẠI ĐÂY]: Đổi fc thành new_fc
             new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
         if self.normal_fc is not None:
@@ -195,12 +194,22 @@ class MiNbaseNet(nn.Module):
         """
         Thuật toán Recursive Least Squares (RLS).
         Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
+        Hàm này TỰ ĐỘNG XỬ LÝ đầu vào là ẢNH (4D) hoặc FEATURE (2D).
         """
         # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
-        with autocast(enabled=False):
-            # 1. Feature Extraction & Expansion
-            X = self.backbone(X).float() # ViT Features
-            X = self.buffer(X)           # Random Expansion -> float32
+        with autocast('cuda', enabled=False):
+            
+            # --- [LOGIC QUAN TRỌNG] Kiểm tra đầu vào ---
+            if X.ndim == 4: 
+                # Nếu là Ảnh [B, C, H, W] (lúc fit_fc bình thường) -> Chạy qua Backbone
+                X = self.backbone(X).float() 
+            else:
+                # Nếu đã là Feature [B, Dim] (lúc re_fit) -> Chỉ ép kiểu float
+                X = X.float()
+
+            # 1. Feature Expansion (Random Buffer)
+            # Lúc này X chắc chắn là Feature [B, Dim]
+            X = self.buffer(X)           
             
             # Đưa về cùng device
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
@@ -217,14 +226,18 @@ class MiNbaseNet(nn.Module):
                 Y = torch.cat((Y, tail), dim=1)
 
             # 3. Công thức cập nhật RLS
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
+            # Term = I + X * R * X^T
+            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             
             # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             
             # Nghịch đảo ma trận
-            K = torch.inverse(term + jitter)
+            try:
+                K = torch.inverse(term + jitter)
+            except RuntimeError:
+                # Fallback: Dùng pseudo-inverse nếu inverse thường lỗi
+                K = torch.linalg.pinv(term + jitter)
             
             # Cập nhật R (Covariance Matrix)
             self.R -= self.R @ X.T @ K @ X @ self.R
