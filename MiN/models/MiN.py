@@ -130,7 +130,9 @@ class MinNet(object):
         self._network.update_noise()
         
         # 1. Fit FC (Initial Learning)
-        self.fit_fc(train_loader, test_loader)
+        # Sử dụng DataLoader buffer_batch để fit nhanh hơn nếu cần
+        fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        self.fit_fc(fit_loader, test_loader)
         
         # 2. Train Noise
         self.run(train_loader)
@@ -140,7 +142,6 @@ class MinNet(object):
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
         clean_loader = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
         
-        # [FIX] Đảm bảo chọn đúng feature cho buffer
         new_exemplars = self.get_selected_features_with_cfs(self._network, clean_loader, num_select=20)
         self.feature_buffer.update(new_exemplars)
         self._clear_gpu()
@@ -203,16 +204,19 @@ class MinNet(object):
         self._network.to(self.device)
         
         prog_bar = tqdm(range(self.fit_epoch))
-        # [FIX] Tắt gradient hoàn toàn cho RLS fit
+        
+        # [FIX] Dùng normal_fc.out_features thay vì fc.out_features
+        # normal_fc là layer SGD, nhưng nó có số class tương đương với known_class
+        num_cls = self._network.normal_fc.out_features
+        
         with torch.no_grad():
             for _, epoch in enumerate(prog_bar):
                 for i, (_, inputs, targets) in enumerate(train_loader):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    targets_oh = F.one_hot(targets, num_classes=self._network.fc.out_features).float()
+                    # One-hot encoding
+                    targets_oh = F.one_hot(targets, num_classes=num_cls).float()
                     
-                    # [FIX] Inputs ở đây là ảnh raw, mạng sẽ tự forward.
-                    # Hàm fit bên trong inc_net.py thường sẽ gọi extract_feature.
-                    # Đảm bảo inc_net.py xử lý detached feature.
+                    # Gọi hàm fit của MiNbaseNet (đã có @torch.no_grad bên trong, nhưng bọc ngoài càng tốt)
                     self._network.fit(inputs, targets_oh)
                 
                 info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
@@ -281,12 +285,12 @@ class MinNet(object):
         all_features = []
         all_labels = []
         
-        print("--> Collecting features for CFS...")
+        # print("--> Collecting features for CFS...")
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(device)
                 with autocast('cuda'):
-                    # [FIX] Detach ngay lập tức để ngắt đồ thị
+                    # [FIX] Detach ngay để tránh giữ Graph
                     feats = model.extract_feature(inputs).detach()
                 all_features.append(feats)
                 all_labels.append(targets)
@@ -300,13 +304,13 @@ class MinNet(object):
         criterion = NegativeContrastiveLoss(tau=0.1)
         
         f_cont.train()
-        print("--> Training CFS Network...")
+        # print("--> Training CFS Network...")
         cfs_batch_size = 256
         num_samples = all_features.size(0)
-        cfs_epochs = 30
+        cfs_epochs = 15 
         
         for ep in range(cfs_epochs):
-            # [FIX] Shuffle MỖI EPOCH
+            # [FIX] Shuffle ở mỗi Epoch
             perm = torch.randperm(num_samples)
             for i in range(0, num_samples, cfs_batch_size):
                 idx = perm[i : i + cfs_batch_size]
@@ -322,7 +326,7 @@ class MinNet(object):
         final_exemplars = {}
         unique_classes = torch.unique(all_labels).cpu().numpy()
         
-        print(f"--> Selecting Top-{num_select} Exemplars...")
+        # print(f"--> Selecting Top-{num_select} Exemplars...")
         
         for cls in unique_classes:
             cls_mask = (all_labels == cls)
@@ -363,7 +367,7 @@ class MinNet(object):
         
         # 1. Get Real Features (New Task)
         X_new_list, Y_new_list = [], []
-        # [FIX] Tắt Gradient cho quá trình extract
+        
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
@@ -380,8 +384,8 @@ class MinNet(object):
         # 2. Get Buffered Features (Old Tasks)
         X_old_list, Y_old_list = [], []
         
-        # [FIX] Logic lọc class chuẩn: Chỉ lấy class thuộc về các Task TRƯỚC ĐÓ
-        # self.known_class là tổng số class của các task trước
+        # [FIX] Logic lọc class: Chỉ lấy những class đã học TRƯỚC task hiện tại
+        # (self.known_class là số lượng class tính đến đầu task này)
         if len(self.feature_buffer) > 0:
             for cls, feats in self.feature_buffer.items():
                 if cls < self.known_class: # Chỉ lấy Old Classes
@@ -393,15 +397,16 @@ class MinNet(object):
                 X_old = torch.cat(X_old_list, dim=0)
                 Y_old = torch.cat(Y_old_list, dim=0)
                 
-                # Balancing
+                # Balancing: Không repeat quá nhiều để tránh Overfit vào điểm exemplar
+                # Dùng tỷ lệ nhẹ nhàng hơn
                 avg_new = X_new.size(0) // (self.increment if self.cur_task > 0 else self.init_class)
                 avg_old = 20
-                repeat_factor = max(1, int(avg_new / avg_old))
+                repeat_factor = max(1, int((avg_new / avg_old) * 0.5)) # Giảm tỷ lệ repeat xuống 50%
                 
                 X_old = X_old.repeat(repeat_factor, 1)
                 Y_old = Y_old.repeat(repeat_factor)
                 
-                print(f"--> Re-fit: {len(X_new)} New + {len(X_old)} Old (x{repeat_factor} repeated)")
+                # print(f"--> Re-fit: {len(X_new)} New + {len(X_old)} Old (x{repeat_factor} repeated)")
                 
                 X_total = torch.cat([X_new, X_old], dim=0)
                 Y_total = torch.cat([Y_new, Y_old], dim=0)
@@ -410,11 +415,12 @@ class MinNet(object):
         else:
             X_total, Y_total = X_new, Y_new
 
-        # 3. Fit RLS (Batch-wise để tránh OOM nếu dữ liệu lớn)
-        num_classes = self._network.fc.out_features
+        # 3. Fit RLS (Batch-wise để tránh OOM)
+        # [FIX] Dùng normal_fc.out_features để lấy tổng số class hiện tại
+        num_classes = self._network.normal_fc.out_features
         Y_total_oh = F.one_hot(Y_total, num_classes=num_classes).float()
         
-        batch_size_fit = 2048
+        batch_size_fit = 4096 # Tăng batch size lên vì chỉ tính toán ma trận
         total_samples = X_total.size(0)
         perm = torch.randperm(total_samples)
         
