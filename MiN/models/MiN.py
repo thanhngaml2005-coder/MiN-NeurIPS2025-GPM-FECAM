@@ -3,24 +3,58 @@ import random
 import numpy as np
 from tqdm import tqdm
 import torch
-from torch import optim
+from torch import optim, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import copy
-import gc  # [ADDED] Để dọn rác bộ nhớ
+import gc
 import os
 
+# Utils imports
 from utils.inc_net import MiNbaseNet
-from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
-# [ADDED] Import Mixed Precision
-from torch.amp import autocast, GradScaler
+# Mixed Precision
+from torch.amp import autocast, GradScaler 
 
 EPSILON = 1e-8
+
+# =============================================================================
+#  HELPER CLASSES FOR CFS (CONTRASTIVE FEATURE SELECTION)
+# =============================================================================
+
+class NegativeContrastiveLoss(torch.nn.Module):
+    def __init__(self, tau=0.1):
+        super().__init__()
+        self.tau = tau
+    def forward(self, x): 
+        x = F.normalize(x, dim=1)
+        x_1 = torch.unsqueeze(x, dim=0)
+        x_2 = torch.unsqueeze(x, dim=1)
+        cos = torch.sum(x_1 * x_2, dim=2) / self.tau
+        exp_cos = torch.exp(cos)
+        mask = torch.eye(x.size(0), device=x.device).bool()
+        exp_cos = exp_cos.masked_fill(mask, 0)
+        loss = torch.log(exp_cos.sum(dim=1) / (x.size(0) - 1) + EPSILON)
+        return torch.mean(loss)
+
+class CFS_Mapping(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.f_cont = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim),
+            torch.nn.LayerNorm(dim), 
+            torch.nn.GELU(),
+            torch.nn.Linear(dim, dim)
+        )
+    def forward(self, x):
+        x = self.f_cont(x)
+        return F.normalize(x, p=2, dim=1)
+
+# =============================================================================
+#  MAIN CLASS: MinNet
+# =============================================================================
 
 class MinNet(object):
     def __init__(self, args, loger):
@@ -31,6 +65,7 @@ class MinNet(object):
         self.device = args['device']
         self.num_workers = args["num_workers"]
 
+        # Hyperparameters
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
         self.init_weight_decay = args["init_weight_decay"]
@@ -39,59 +74,38 @@ class MinNet(object):
         self.lr = args["lr"]
         self.batch_size = args["batch_size"]
         self.weight_decay = args["weight_decay"]
-        self.epochs = args["epochs"]
+        self.epochs = args["epochs"] # Default epoch setting
 
         self.init_class = args["init_class"]
         self.increment = args["increment"]
 
-        self.buffer_size = args["buffer_size"]
         self.buffer_batch = args["buffer_batch"]
-        self.gamma = args['gamma']
         self.fit_epoch = args["fit_epochs"]
 
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        self.class_acc = []
-        self.task_acc = []
         
-        # [ADDED] Scaler cho Mixed Precision
+        # Mixed Precision Scaler
         self.scaler = GradScaler('cuda')
-
-    def _clear_gpu(self):
-        # [ADDED] Hàm dọn dẹp GPU
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def after_train(self, data_manger):
-        if self.cur_task == 0:
-            self.known_class = self.init_class
-        else:
-            self.known_class += self.increment
-
-        _, test_list, _ = data_manger.get_task_list(self.cur_task)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
-        eval_res = self.eval_task(test_loader)
-        self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
-        self.logger.info('total acc: {}'.format(self.total_acc))
-        self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
-        print('total acc: {}'.format(self.total_acc))
-        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        del test_set
+        
+        # [QUAN TRỌNG] Buffer lưu trữ Feature cũ (Thay vì lưu ảnh)
+        # Structure: {label (int): tensor [N_select, Feature_Dim]}
+        self.feature_buffer = {} 
 
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
+
+    def _clear_gpu(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
-        # [MODIFIED] Thêm no_grad và autocast để test nhanh và nhẹ hơn
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(device)
@@ -108,298 +122,378 @@ class MinNet(object):
             targets[i] = datamanger.map_cat2order(targets[i])
         return targets
 
+    # -------------------------------------------------------------------------
+    #  TASK 0 TRAINING
+    # -------------------------------------------------------------------------
     def init_train(self, data_manger):
         self.cur_task += 1
-        train_list, test_list, train_list_name = data_manger.get_task_list(0)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
-
+        train_list, test_list, _ = data_manger.get_task_list(0)
+        
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
-
+        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
         self.test_loader = test_loader
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
-                param.requires_grad = True
-
+                param.requires_grad = True # Task 0 cho phép chỉnh nhẹ backbone nếu cần (hoặc False tùy config)
+        
+        # 1. Khởi tạo Classifier & Noise
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
-        # [FIX OOM] Dọn GPU trước và sau khi tính proto
-        self._clear_gpu()
+        # 2. Fit RLS lần đầu (cho phép mở rộng ma trận)
+        train_loader_for_fit = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        self.fit_fc(train_loader_for_fit, test_loader)
         
-        
+        # 3. Train Noise (Giai đoạn quan trọng nhất)
         self.run(train_loader)
-        self._network.after_task_magmax_merge()
         
+        # 4. [NEW] Chọn Exemplars bằng CFS để lưu vào Buffer
+        # Dùng dữ liệu sạch (no aug) để chọn cho chuẩn
+        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
+        clean_loader = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+        
+        new_exemplars = self.get_selected_features_with_cfs(self._network, clean_loader, num_select=20)
+        self.feature_buffer.update(new_exemplars)
         self._clear_gpu()
-       
+
+        # 5. Re-fit: Cập nhật Classifier lần cuối (Dùng dữ liệu thật + Buffer nếu có)
+        # Ở Task 0 thì chưa có buffer cũ, nhưng cứ gọi hàm chuẩn
+        self.re_fit(clean_loader, test_loader)
         
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-        self.fit_fc(train_loader, test_loader)
-
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        if self.args['pretrained']:
+        self.known_class = self.init_class
+        if self.args['pretrained']: # Freeze backbone sau task 0
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
-        
-        # [ADDED] Clear memory
-        del train_set, test_set
-        self._clear_gpu()
-
+    # -------------------------------------------------------------------------
+    #  INCREMENTAL TRAINING (TASK > 0)
+    # -------------------------------------------------------------------------
     def increment_train(self, data_manger):
         self.cur_task += 1
-        train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
+        train_list, test_list, _ = data_manger.get_task_list(self.cur_task)
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
         self.test_loader = test_loader
 
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
-
+        # 1. Fit FC để mở rộng ma trận cho class mới
         self.fit_fc(train_loader, test_loader)
+        self._clear_gpu()
 
         self._network.update_fc(self.increment)
-
-        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
-        self._network.update_noise()
         
-        self._clear_gpu()
-
+        # 2. Sequential Init cho Noise (đã xử lý trong inc_net.py) & Update
+        train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        self._network.update_noise() 
         
-        self.run(train_loader)
-        self._network.after_task_magmax_merge()
+        # 3. Train Noise (Fine-tuning)
+        self.run(train_loader_run)
+        
+        # 4. [NEW] CFS Selection: Chọn exemplars cho Task MỚI này
+        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
+        clean_loader = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+        
+        new_exemplars = self.get_selected_features_with_cfs(self._network, clean_loader, num_select=20)
+        self.feature_buffer.update(new_exemplars) # Gộp vào kho
         self._clear_gpu()
 
+        # 5. Re-fit: Trộn dữ liệu mới (Real) + Dữ liệu cũ (Buffer) để sửa lỗi lệch pha
+        self.re_fit(clean_loader, test_loader)
+        
+        self.known_class += self.increment
 
-        del train_set
-
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                    num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                    num_workers=self.num_workers)
-
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
-
-        self.re_fit(train_loader, test_loader)
-
-        del train_set, test_set
-        self._clear_gpu()
-
+    # -------------------------------------------------------------------------
+    #  CORE FUNCTIONS
+    # -------------------------------------------------------------------------
     def fit_fc(self, train_loader, test_loader):
+        """Bước mở rộng và học thô RLS với Augmentation"""
         self._network.eval()
         self._network.to(self.device)
-
+        
         prog_bar = tqdm(range(self.fit_epoch))
         for _, epoch in enumerate(prog_bar):
-            self._network.to(self.device)
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets = torch.nn.functional.one_hot(targets)
-                # Logic gốc: Fit Analytical (RLS). 
-                # Không dùng Autocast ở đây vì RLS cần độ chính xác cao (ma trận nghịch đảo)
-                self._network.fit(inputs, targets)
+                # One-hot cho RLS
+                targets_oh = torch.nn.functional.one_hot(targets, num_classes=self._network.fc.out_features).float()
+                self._network.fit(inputs, targets_oh)
             
-            info = "Task {} --> Update Analytical Classifier!".format(
-                self.cur_task,
-            )
+            info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
             self.logger.info(info)
             prog_bar.set_description(info)
-            # [ADDED] Clear cache sau mỗi epoch fit
-            self._clear_gpu()
-
-    def re_fit(self, train_loader, test_loader):
-        self._network.eval()
-        self._network.to(self.device)
-        prog_bar = tqdm(train_loader)
-        for i, (_, inputs, targets) in enumerate(prog_bar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            targets = torch.nn.functional.one_hot(targets)
-            self._network.fit(inputs, targets)
-
-            info = "Task {} --> Reupdate Analytical Classifier!".format(
-                self.cur_task,
-            )
-            
-            self.logger.info(info)
-            prog_bar.set_description(info)
-        self._clear_gpu()
+            if epoch % 5 == 0: gc.collect()
 
     def run(self, train_loader):
+        """Train bộ Noise với Distillation"""
+        # [DYNAMIC EPOCHS STRATEGY]
         if self.cur_task == 0:
-            epochs = self.init_epochs
+            epochs = 10 # Train kỹ task đầu
             lr = self.init_lr
-            weight_decay = self.init_weight_decay
         else:
-            epochs = 5
-            lr = self.lr * 0.1
-            weight_decay = self.weight_decay
+            epochs = 5  # Train nhanh task sau (Sequential Fine-tuning)
+            lr = self.lr 
 
-        for param in self._network.parameters():
-            param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
-            param.requires_grad = True
-            
-        if self.cur_task == 0:
-            self._network.init_unfreeze()
-        else:
-            self._network.unfreeze_noise()
+        weight_decay = self.weight_decay
+
+        # Chỉ train parameters của Noise và FC (nếu cần), đóng băng backbone
+        for param in self._network.parameters(): param.requires_grad = False
+        if self.cur_task == 0: self._network.init_unfreeze() # Mở khóa noise
+        else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
+        self._clear_gpu()
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
-        for _, epoch in enumerate(prog_bar):
-            losses = 0.0
-            correct, total = 0, 0
 
+        for _, epoch in enumerate(prog_bar):
+            losses, correct, total = 0.0, 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
+                optimizer.zero_grad(set_to_none=True)
                 
-                # [ADDED] set_to_none=True tiết kiệm RAM hơn
-                optimizer.zero_grad(set_to_none=True) 
-
-                # [ADDED] Autocast để giảm 50% VRAM khi train
+                # Mixed Precision Training
                 with autocast('cuda'):
                     if self.cur_task > 0:
+                        # Distillation Logic
                         with torch.no_grad():
-                            outputs1 = self._network(inputs, new_forward=False)
-                            logits1 = outputs1['logits']
-                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
-                        logits_final = logits2
+                            outputs1 = self._network(inputs, new_forward=False) # Model cũ (đóng băng)
+                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False) # Model đang train
+                        
+                        # Output Distillation: Logits mới + Logits cũ
+                        logits_final = outputs2['logits'] + outputs1['logits']
+                        loss = F.cross_entropy(logits_final, targets.long())
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
-                        logits_final = logits
+                        logits_final = outputs["logits"]
+                        loss = F.cross_entropy(logits_final, targets.long())
 
-                # [ADDED] Backward với Scaler
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
                 losses += loss.item()
-
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-                
-                # [ADDED] Xóa biến tạm
-                del inputs, targets, loss, logits_final
-
+            
             scheduler.step()
             train_acc = 100. * correct / total
-
-            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
-                self.cur_task,
-                epoch + 1,
-                epochs,
-                losses / len(train_loader),
-                train_acc,
-            )
+            info = "Task {} Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc)
             self.logger.info(info)
             prog_bar.set_description(info)
+        self._clear_gpu()
+
+    def get_selected_features_with_cfs(self, model, train_loader, num_select=20):
+        """
+        Chọn lọc Exemplars sử dụng CFS Training + Herding Selection.
+        """
+        device = self.device
+        model.eval()
+        
+        # 1. Gom toàn bộ Feature của Task hiện tại
+        all_features = []
+        all_labels = []
+        
+        print("--> Collecting features for CFS...")
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(device)
+                with autocast('cuda'):
+                    feats = model.extract_feature(inputs).detach()
+                all_features.append(feats)
+                all_labels.append(targets)
+        
+        all_features = torch.cat(all_features).float() # [N, Dim] (FP32)
+        all_labels = torch.cat(all_labels).to(device)
+        feature_dim = all_features.shape[1]
+
+        # 2. Train mạng CFS để học không gian metric
+        f_cont = CFS_Mapping(feature_dim).to(device).float()
+        optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
+        criterion = NegativeContrastiveLoss(tau=0.1)
+        
+        f_cont.train()
+        print("--> Training CFS Network...")
+        cfs_batch_size = 256
+        num_samples = all_features.size(0)
+        cfs_epochs = 15 
+        
+        for ep in range(cfs_epochs):
+            perm = torch.randperm(num_samples)
+            for i in range(0, num_samples, cfs_batch_size):
+                idx = perm[i : i + cfs_batch_size]
+                batch_feat = all_features[idx].to(device)
+                optimizer.zero_grad()
+                embeddings = f_cont(batch_feat)
+                loss = criterion(embeddings)
+                loss.backward()
+                optimizer.step()
+
+        # 3. Chọn Feature (Herding trên Latent Space)
+        f_cont.eval()
+        final_exemplars = {}
+        unique_classes = torch.unique(all_labels).cpu().numpy()
+        
+        print(f"--> Selecting Top-{num_select} Exemplars...")
+        
+        for cls in unique_classes:
+            cls_mask = (all_labels == cls)
+            raw_feats = all_features[cls_mask].to(device) # Feature gốc
             
-            # [ADDED] Clear cache sau mỗi epoch
-            if epoch % 5 == 0:
-                self._clear_gpu()
+            if raw_feats.size(0) <= num_select:
+                final_exemplars[cls] = raw_feats.cpu()
+                continue
+                
+            with torch.no_grad():
+                latent_feats = f_cont(raw_feats) # Feature trong không gian CFS
+            
+            mu_latent = latent_feats.mean(dim=0)
+            selected_indices = []
+            current_sum = torch.zeros_like(mu_latent)
+            remaining_mask = torch.ones(raw_feats.size(0), dtype=torch.bool, device=device)
+            
+            for k in range(num_select):
+                target = mu_latent * (k + 1) - current_sum
+                dists = torch.norm(latent_feats - target, dim=1)
+                dists[~remaining_mask] = float('inf')
+                best_idx = torch.argmin(dists).item()
+                
+                selected_indices.append(best_idx)
+                remaining_mask[best_idx] = False
+                current_sum += latent_feats[best_idx]
+            
+            # Lưu Feature GỐC
+            final_exemplars[cls] = raw_feats[selected_indices].cpu()
+
+        del f_cont, optimizer, criterion, all_features
+        self._clear_gpu()
+        return final_exemplars
+
+    def re_fit(self, train_loader, test_loader):
+        """
+        Bước cập nhật Classifier cuối cùng.
+        Kết hợp: Dữ liệu thật (Task mới) + Exemplars từ Buffer (Task cũ)
+        """
+        self._network.eval()
+        self._network.to(self.device)
+        
+        # 1. Lấy dữ liệu TASK MỚI
+        X_new_list, Y_new_list = [], []
+        # print("--> Extracting New Features for Re-fit...")
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                with autocast('cuda'):
+                    features = self._network.extract_feature(inputs)
+                X_new_list.append(features.float())
+                Y_new_list.append(targets)
+        
+        X_new = torch.cat(X_new_list, dim=0)
+        Y_new = torch.cat(Y_new_list, dim=0)
+        
+        # 2. Lấy Exemplars TASK CŨ từ Buffer
+        X_old_list, Y_old_list = [], []
+        current_classes = torch.unique(Y_new).cpu().numpy()
+        
+        if len(self.feature_buffer) > 0:
+            for cls, feats in self.feature_buffer.items():
+                if cls not in current_classes: # Chỉ lấy task cũ
+                    X_old_list.append(feats.to(self.device))
+                    Y_old_list.append(torch.full((feats.size(0),), cls, device=self.device))
+            
+            if len(X_old_list) > 0:
+                X_old = torch.cat(X_old_list, dim=0)
+                Y_old = torch.cat(Y_old_list, dim=0)
+                
+                # --- CÂN BẰNG DỮ LIỆU (Balancing) ---
+                # Task mới rất đông (~500 ảnh/class), Buffer rất ít (20/class)
+                # Nhân bản Buffer lên để RLS không ignore nó
+                avg_new = X_new.size(0) // len(current_classes)
+                avg_old = 20 # Số lượng exemplars
+                repeat_factor = max(1, int(avg_new / avg_old))
+                
+                X_old = X_old.repeat(repeat_factor, 1)
+                Y_old = Y_old.repeat(repeat_factor)
+                
+                print(f"--> Re-fit Merging: {len(X_new)} New + {len(X_old)} Old (x{repeat_factor} repeat)")
+                
+                # Gộp
+                X_total = torch.cat([X_new, X_old], dim=0)
+                Y_total = torch.cat([Y_new, Y_old], dim=0)
+            else:
+                X_total, Y_total = X_new, Y_new
+        else:
+            X_total, Y_total = X_new, Y_new
+
+        # 3. Fit RLS một lần duy nhất với cục dữ liệu hỗn hợp
+        # RLS cần One-hot target
+        num_classes = self._network.fc.out_features
+        Y_total_oh = F.one_hot(Y_total.long(), num_classes=num_classes).float()
+        
+        # Gọi hàm fit (cần đảm bảo inc_net.py hỗ trợ nhận Tensor input thay vì loader, 
+        # hoặc hàm fit của bạn đã xử lý batch bên trong thì gọi loop batch ở đây.
+        # Ở đây tôi giả định hàm fit của bạn nhận Tensor [N, Dim] và [N, C])
+        
+        # Nếu bộ nhớ không đủ để fit 1 lần, hãy chia batch thủ công ở đây
+        batch_size_fit = 2048 # Batch lớn cho RLS
+        total_samples = X_total.size(0)
+        
+        perm = torch.randperm(total_samples)
+        
+        info = f"Task {self.cur_task} --> Re-fit RLS with Buffer..."
+        self.logger.info(info)
+        
+        for i in tqdm(range(0, total_samples, batch_size_fit), desc="Re-fitting"):
+            idx = perm[i : i + batch_size_fit]
+            x_batch = X_total[idx]
+            y_batch = Y_total_oh[idx]
+            self._network.fit(x_batch, y_batch)
+
+    def after_train(self, data_manger):
+        _, test_list, _ = data_manger.get_task_list(self.cur_task)
+        test_set = data_manger.get_task_data(source="test", class_list=test_list)
+        test_set.labels = self.cat2order(test_set.labels, data_manger)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
+        
+        eval_res = self.eval_task(test_loader)
+        self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
+        self.logger.info('total acc: {}'.format(self.total_acc))
+        self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        del test_set
 
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        # [ADDED] no_grad
-        with torch.no_grad():
+        with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                
                 outputs = model(inputs)
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
                 pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
                 label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
+        
         class_info = calculate_class_metrics(pred, label)
         task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
         return {
             "all_class_accy": class_info['all_accy'],
-            "class_accy": class_info['class_accy'],
-            "class_confusion": class_info['class_confusion_matrices'],
-            "task_accy": task_info['all_accy'],
-            "task_confusion": task_info['task_confusion_matrices'],
-            "all_task_accy": task_info['task_accy'],
+            "task_confusion": task_info['task_confusion_matrices']
         }
-
-    # =========================================================================
-    # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
-    # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
-    # =========================================================================
-    def get_task_prototype(self, model, train_loader):
-        model = model.eval()
-        model.to(self.device)
-        features = []
-        
-        # 1. Thu thập features (CHUYỂN VỀ CPU NGAY LẬP TỨC)
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                
-                # Dùng autocast khi extract feature để nhanh hơn
-                with autocast('cuda'):
-                    feature = model.extract_feature(inputs)
-                
-                # .detach().cpu() là chìa khóa để tránh OOM
-                features.append(feature.detach().cpu())
-        
-        # 2. Concat trên CPU (RAM thường lớn hơn VRAM)
-        all_features = torch.cat(features, dim=0)
-        
-        # 3. Tính Mean (Vẫn tính trên CPU hoặc đưa về GPU nếu cần)
-        # Vì chỉ tính mean của 1 tensor lớn, đưa về GPU tính sẽ nhanh, 
-        # nhưng nếu tensor quá lớn > VRAM thì tính trên CPU luôn.
-        # Ở đây tôi để tính trên GPU cho nhanh, nếu vẫn OOM thì xóa .to(self.device)
-        prototype = torch.mean(all_features, dim=0).to(self.device)
-        
-        self._clear_gpu()
-        return prototype
