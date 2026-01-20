@@ -97,7 +97,7 @@ class InfLoRA_PiNoise(nn.Module):
         
         # Init = 0 (Base)
         self._init_near_zero(self.mu)
-        self._init__near_zero(self.sigma)
+        self._init_near_zero(self.sigma)
         self.mu_fixed = None 
         self.sigma_fixed = None
         # --- History Storage (CPU) ---
