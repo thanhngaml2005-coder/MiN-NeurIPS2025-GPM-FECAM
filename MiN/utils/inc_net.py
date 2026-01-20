@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
 # Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
-from torch.amp import autocast 
+from torch.cuda.amp import autocast 
 
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
@@ -43,38 +43,29 @@ class BaseIncNet(nn.Module):
             'logits': logits
         }
 
-# [FIXED] Chuyển sang kế thừa nn.Module để tránh lỗi bias của nn.Linear
-class RandomBuffer(nn.Module):
+
+class RandomBuffer(torch.nn.Linear):
     """
     Lớp mở rộng đặc trưng ngẫu nhiên (Random Projection).
     """
     def __init__(self, in_features: int, buffer_size: int, device):
-        super().__init__()
+        super(torch.nn.Linear, self).__init__()
+        self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
         
+        # [QUAN TRỌNG] Sử dụng float32 để đảm bảo độ chính xác khi tính RLS
         factory_kwargs = {"device": device, "dtype": torch.float32}
         
-        # Tạo ma trận ngẫu nhiên nhưng lưu dưới dạng buffer (không train)
-        # Shape: [In, Out] để nhân X @ W
-        self.register_buffer("weight", torch.empty((in_features, buffer_size), **factory_kwargs))
-        
-        # Explicitly set bias to None
-        self.bias = None
+        self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
+        self.register_buffer("weight", self.W)
 
         self.reset_parameters()
-
-    def reset_parameters(self):
-        # Tự khởi tạo Kaiming Uniform (giống Linear)
-        # Lưu ý: weight shape là [In, Out], kaiming_uniform_ mặc định tính fan_in theo dim 1.
-        # Ở đây ta muốn fan_in là In_features (dim 0).
-        # Tuy nhiên với Random Projection, phân phối chuẩn là đủ tốt.
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         # Ép kiểu input X về cùng kiểu với weight (float32)
         X = X.to(self.weight.dtype)
-        return F.relu(X @ self.weight)
+        return F.relu(X @ self.W)
 
 
 class MiNbaseNet(nn.Module):
@@ -107,9 +98,6 @@ class MiNbaseNet(nn.Module):
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
-        
-        # [NEW] Lưu trữ CFS samples cho mỗi task (để re-fit)
-        self.task_cfs_samples = []  # List of [20, feature_dim] tensors
 
     def update_fc(self, nb_classes):
         """
@@ -125,6 +113,7 @@ class MiNbaseNet(nn.Module):
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
             # Task đầu: Có bias
+            # [FIX LỖI TẠI ĐÂY]: Đổi fc thành new_fc
             new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
         if self.normal_fc is not None:
@@ -146,26 +135,25 @@ class MiNbaseNet(nn.Module):
             self.normal_fc = new_fc
 
     # =========================================================================
-    # [PROTOTYPE MANAGEMENT]
-    # =========================================================================
-    def extend_task_prototype(self, prototype):
-        # Hàm này có thể dùng để lưu prototype tính bằng mean nếu cần
-        pass
-
-    def update_task_prototype(self, prototype):
-        pass
-
-    # =========================================================================
     # [MAGMAX & NOISE CONTROL SECTION]
     # =========================================================================
     
     def update_noise(self):
+        """
+        Gọi khi bắt đầu Task mới.
+        Kích hoạt chế độ Sequential Initialization trong PiNoise.
+        """
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].update_noise()
 
     def after_task_magmax_merge(self):
+        """
+        Gọi sau khi kết thúc Task.
+        Kích hoạt việc LƯU (Save) và TRỘN (Merge) tham số theo MagMax.
+        """
         print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
         for j in range(self.backbone.layer_num):
+            # Hàm này nằm trong PiNoise
             self.backbone.noise_maker[j].after_task_training()
 
     def unfreeze_noise(self):
@@ -201,57 +189,69 @@ class MiNbaseNet(nn.Module):
         # Đảm bảo features cùng kiểu với trọng số RLS (float32)
         features = features.to(self.weight) 
         return features @ self.weight
-
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Thuật toán Recursive Least Squares (RLS).
-        Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
+        Huấn luyện Analytical Classifier sử dụng Recursive Least Squares (RLS).
+        Phiên bản ổn định cao (Robust Version) sử dụng Cholesky Solve.
         """
-        # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
-        with autocast('cuda', enabled=False):
+        # [QUAN TRỌNG] Tắt Autocast: RLS cần độ chính xác FP32 để không bị lỗi ma trận suy biến
+        with torch.cuda.amp.autocast(enabled=False):
+            # 1. Feature Extraction & Expansion
+            # Chuyển về float32 ngay lập tức
+            X = self.backbone(X).float() 
+            if hasattr(self, 'buffer'):
+                X = self.buffer(X) # Random Expansion (nếu có)
             
-            # --- [FIX QUAN TRỌNG] Kiểm tra đầu vào là Ảnh hay Feature ---
-            if X.ndim == 4: 
-                # Nếu là Ảnh [B, C, H, W] -> Chạy qua Backbone để lấy Feature
-                X = self.backbone(X).float() 
-            else:
-                # Nếu đã là Feature [B, Dim] -> Chỉ cần ép kiểu
-                X = X.float()
-
-            # 1. Feature Expansion (Random Buffer)
-            X = self.buffer(X)           
-            
-            # Đưa về cùng device
+            # Đưa về cùng device với trọng số RLS
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
-            # 2. Mở rộng chiều của classifier nếu có lớp mới
+            # 2. Mở rộng chiều của Classifier (Dynamic Expansion)
+            # Nếu số lớp trong Y lớn hơn số lớp hiện tại của weight, ta mở rộng ma trận
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
             elif num_targets < self.weight.shape[1]:
+                # Trường hợp hiếm: Y ít lớp hơn (ví dụ chỉ batch của task cũ), pad Y thêm số 0
                 increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # 3. Công thức cập nhật RLS
-            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
+            # 3. Tính toán RLS Update (Woodbury Matrix Identity)
+            # Công thức gốc: P_new = P - P X^T (I + X P X^T)^-1 X P
+            # Đặt term = (I + X P X^T)
             
-            # Thêm jitter để tránh lỗi ma trận suy biến
+            I = torch.eye(X.shape[0], device=X.device)
+            term = I + X @ self.R @ X.T
+            
+            # [STABILITY FIX 1] Thêm Jitter để đảm bảo ma trận không bị suy biến (Singular)
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            term_stable = term + jitter
             
-            # Nghịch đảo ma trận
+            # [STABILITY FIX 2] Dùng Cholesky Solve thay vì Inverse trực tiếp
+            # Tính term_inv = (term_stable)^-1
             try:
-                K = torch.inverse(term + jitter)
+                # Cholesky nhanh và ổn định cho ma trận đối xứng dương (Symmetric Positive Definite)
+                L = torch.linalg.cholesky(term_stable)
+                term_inv = torch.cholesky_solve(I, L)
             except RuntimeError:
-                K = torch.linalg.pinv(term + jitter)
+                # Fallback: Nếu Cholesky fail (rất hiếm), dùng linalg.solve thường (chậm hơn chút nhưng an toàn)
+                term_inv = torch.linalg.solve(term_stable, I)
             
-            # Cập nhật R và Weight
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
-
+            # Tính Kalman Gain: K = P * X^T * term_inv
+            # self.R chính là ma trận P (Inverse Covariance Matrix)
+            K = self.R @ X.T @ term_inv
+            
+            # 4. Cập nhật Ma trận hiệp phương sai (R)
+            # R_new = R - K * X * R
+            self.R = self.R - K @ X @ self.R
+            
+            # 5. Cập nhật Trọng số Classifier (Weight)
+            # W_new = W + K * (Y - X * W)
+            # (Y - X @ self.weight) là Prediction Error
+            self.weight = self.weight + K @ (Y - X @ self.weight)
     # =========================================================================
     # [FORWARD PASSES]
     # =========================================================================
@@ -298,3 +298,67 @@ class MiNbaseNet(nn.Module):
         return {
             "logits": logits
         }
+    def update_GPM(self, threshold=0.99):
+        """
+        [FIX ISSUE 4] Robust GPM Update with Orthonormalization
+        """
+        print(f"--> [GPM] Updating Basis (Threshold={threshold})...")
+        
+        for module in self.backbone.noise_maker:
+            R = module.cur_matrix
+            if R.sum() == 0: continue
+
+            # 1. SVD trên covariance matrix hiện tại
+            # R là ma trận đối xứng (X^T X), dùng eigh sẽ nhanh và ổn định hơn svd thường
+            try:
+                # eigh trả về eigenvalues tăng dần, ta cần đảo ngược lại
+                S, U = torch.linalg.eigh(R) 
+                S = S.flip(0)
+                U = U.flip(1)
+            except:
+                # Fallback nếu lỗi
+                U, S, V = torch.linalg.svd(R)
+
+            # 2. Chọn k vector
+            s_sq = S.abs() # S là eigenvalues của R (chính là s^2 của X)
+            s_sum = torch.sum(s_sq)
+            s_cum = torch.cumsum(s_sq, dim=0) / s_sum
+            k = torch.searchsorted(s_cum, threshold).item() + 1
+            
+            # Basis đề xuất từ task mới
+            new_basis = U[:, :k] # [Hidden, k]
+
+            # 3. [CRITICAL FIX] Orthonormalize against OLD Basis
+            # Nếu đã có basis cũ, phải đảm bảo basis mới vuông góc với nó
+            if module.basis.shape[1] > 0:
+                old_basis = module.basis # [Hidden, M]
+                
+                # Chiếu new_basis lên không gian cũ: P = B_old @ B_old^T
+                # proj = old_basis @ (old_basis.T @ new_basis)
+                # new_basis_ortho = new_basis - proj
+                # Cách viết tối ưu bộ nhớ:
+                projection = torch.matmul(old_basis.T, new_basis)
+                new_basis_residual = new_basis - torch.matmul(old_basis, projection)
+                
+                # 4. Normalize lại (Gram-Schmidt)
+                # Để đảm bảo tính trực chuẩn (Orthonormality)
+                norms = torch.norm(new_basis_residual, dim=0)
+                
+                # Chỉ giữ lại các vector có norm đủ lớn (chưa nằm trong không gian cũ)
+                # Epsilon nhỏ để tránh chia cho 0
+                valid_indices = norms > 1e-5 
+                
+                if valid_indices.sum() > 0:
+                    new_basis_clean = new_basis_residual[:, valid_indices]
+                    new_basis_clean = new_basis_clean / norms[valid_indices] # Normalize
+                    
+                    # Cập nhật: Ghép vào
+                    module.basis = torch.cat((module.basis, new_basis_clean), dim=1)
+            else:
+                # Task đầu tiên: Chỉ cần Normalize là đủ (SVD U đã trực giao sẵn)
+                # Nhưng U của SVD đã là trực chuẩn rồi, không cần làm gì thêm
+                module.basis = new_basis
+
+            # Reset buffers
+            module.cur_matrix.zero_()
+            module.n_cur_matrix.zero_()

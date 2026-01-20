@@ -40,6 +40,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.jit import Final
 
+
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm, PatchDropout, SwiGLUPacked, \
@@ -65,9 +66,9 @@ import torch
 import torch.nn as nn
 import copy
 
-class PiNoise(nn.Module):
+class InfLoRA_PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
-        super(PiNoise, self).__init__()
+        super(InfLoRA_PiNoise, self).__init__()
         
         # --- Shared Fixed Parts ---
         self.MLP = nn.Linear(in_dim, out_dim)
@@ -78,6 +79,13 @@ class PiNoise(nn.Module):
         nn.init.xavier_uniform_(self.w_down) 
         self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
         nn.init.xavier_uniform_(self.w_up)
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
+        
+        self.register_buffer('basis', torch.empty(hidden_dim, 0)) 
+        # cur_matrix: Dùng để hứng dữ liệu (Covariance Matrix)
+        self.register_buffer('cur_matrix', torch.zeros(hidden_dim, hidden_dim))
+        self.register_buffer('n_cur_matrix', torch.tensor(0, dtype=torch.long))
 
         self.hidden_dim = hidden_dim
         self.act = nn.GELU()
@@ -123,7 +131,8 @@ class PiNoise(nn.Module):
         """
         for param in self.mu.parameters(): param.requires_grad = True
         for param in self.sigma.parameters(): param.requires_grad = True
-
+    def unfreeze_noise(self):
+        self.update_noise()
     def after_task_training(self):
         """
         [Bước 3 & 4]: Lưu Task Vector và thực hiện Parameter-wise MagMax
@@ -169,20 +178,44 @@ class PiNoise(nn.Module):
         self.mu.load_state_dict(merge_state_dicts(self.history_mu))
         self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
 
-    def forward(self, hyper_features, new_forward=False):
-        # Forward đơn giản: Chỉ chạy qua mạng hiện tại (đã được merge)
-        x1 = self.MLP(hyper_features)
-        x_down = hyper_features @ self.w_down
-        
+    def forward(self, x, get_cur_feat=False):
+        # x: [B, N, D]
+        x_down = x @ self.w_down # [B, N, hidden]
+
+        # --- [FIX ISSUE 3] Covariance/Correlation Accumulation ---
+        if get_cur_feat:
+            # Flatten: [B*N, hidden]
+            x_flat = x_down.detach().reshape(-1, self.hidden_dim)
+            
+            # Tùy chọn: Nếu muốn Covariance chuẩn thì phải trừ Mean. 
+            # Tuy nhiên GPM gốc dùng Correlation (X^T X). Ta giữ nguyên Correlation 
+            # để đúng bài toán gốc, nhưng đảm bảo tính toán ổn định.
+            batch_corr = torch.mm(x_flat.T, x_flat) 
+            
+            # Update Moving Average
+            total = self.n_cur_matrix + x_flat.shape[0]
+            # Công thức cập nhật trung bình: (Old_Avg * Old_N + New_Sum) / New_N
+            self.cur_matrix = (self.cur_matrix * self.n_cur_matrix + batch_corr) / total
+            self.n_cur_matrix = total
+
+        # --- [FIX ISSUE 2] Correct Projection Formula ---
+        # Chỉ chiếu khi basis tồn tại và đang training
+        if self.basis.shape[1] > 0 and self.training:
+            # Basis B phải là Orthonormal (B^T B = I). Điều này được đảm bảo ở update_GPM.
+            # Công thức chiếu: x_proj = x @ B @ B^T
+            # Toán học: (x_down [B,N,h] @ basis [h,k]) -> [B,N,k]
+            #           result @ basis.T [k,h] -> [B,N,h]
+            proj = (x_down @ self.basis) @ self.basis.T
+            
+            # Trừ đi phần chiếu để lấy phần vuông góc
+            x_down = x_down - proj
+
         noise = self.mu(x_down) + self.sigma(x_down)
-        
-        return x1 + (noise @ self.w_up) + hyper_features
-    
-    # Hàm tương thích ngược
+        return x + (noise @ self.w_up)
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
-    def unfreeze_noise(self): self.update_noise()
+    
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
@@ -533,6 +566,7 @@ class VisionTransformer(nn.Module):
             global_pool: Literal['', 'avg', 'token', 'map'] = 'token',
             embed_dim: int = 768,
             depth: int = 12,
+            hidden_dim = 384,
             num_heads: int = 12,
             mlp_ratio: float = 4.,
             qkv_bias: bool = True,
@@ -676,6 +710,12 @@ class VisionTransformer(nn.Module):
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
+        self.layer_num = depth
+        self.noise_maker = nn.ModuleList([
+            InfLoRA_PiNoise(embed_dim, embed_dim, hidden_dim=hidden_dim) 
+            for _ in range(depth)
+        ])
+        self.embed_dim = embed_dim
 
     def init_weights(self, mode: Literal['jax', 'jax_nlhb', 'moco', ''] = '') -> None:
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
@@ -805,40 +845,34 @@ class VisionTransformer(nn.Module):
             return tuple(zip(outputs, prefix_tokens))
         return tuple(outputs)
 
-    def forward_features(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, get_cur_feat = False) -> torch.Tensor:
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
 
-        for i in range(len(self.blocks)):
-            if new_forward:
-                x = self.noise_maker[i].forward_new(self.blocks[i](x))
-            else:
-                x = self.noise_maker[i](self.blocks[i](x))
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            # Truyền cờ get_cur_feat xuống Noise Module
+            x = self.noise_maker[i](x, get_cur_feat=get_cur_feat)
+            
         x = self.norm(x)
         return x
 
     def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
-        if self.attn_pool is not None:
-            x = self.attn_pool(x)
-        elif self.global_pool == 'avg':
-            x = x[:, self.num_prefix_tokens:].mean(dim=1)
-        elif self.global_pool:
-            x = x[:, 0]  # class token
-        x = self.fc_norm(x)
-        x = self.head_drop(x)
-        return x if pre_logits else self.head(x)
-
-    def forward(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
-        if new_forward:
-            x = self.forward_features(x, new_forward=new_forward)
-        else:
-            x = self.forward_features(x)
-        x = self.forward_head(x)
+        if self.global_pool == 'avg':
+            # Giả sử token đầu là CLS, lấy avg các token sau
+            x = x[:, 1:].mean(dim=1)
+        elif self.global_pool == 'token':
+            x = x[:, 0]
         return x
 
-
+    def forward(self, x: torch.Tensor, get_cur_feat=False):
+        x = self.forward_features(x, get_cur_feat=get_cur_feat)
+        x = self.forward_head(x)
+        # --- [FIX ISSUE 1a] Return Tensor features ---
+        # Trả về Tensor [B, Dim] để MiNbaseNet xử lý tiếp (vào Buffer -> Classifier)
+        return x
 def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
     """ ViT weight initialization, original timm impl (for reproducibility) """
     if isinstance(module, nn.Linear):
