@@ -96,8 +96,8 @@ class InfLoRA_PiNoise(nn.Module):
         self.sigma = nn.Linear(hidden_dim, hidden_dim)
         
         # Init = 0 (Base)
-        self._init_zero(self.mu)
-        self._init_zero(self.sigma)
+        self._init_near_zero(self.mu)
+        self._init__near_zero(self.sigma)
         self.mu_fixed = None 
         self.sigma_fixed = None
         # --- History Storage (CPU) ---
@@ -109,7 +109,7 @@ class InfLoRA_PiNoise(nn.Module):
     #     torch.nn.init.constant_(module.weight, 0.)
     #     torch.nn.init.constant_(module.bias, 0.)
 
-    def _init_zero(self, module, scale=1e-4):
+    def _init_near_zero(self, module, scale=1e-4):
         """
         Khởi tạo trọng số ngẫu nhiên nhưng với biên độ cực nhỏ (Near-Zero).
         Giúp phá vỡ đối xứng (Symmetry Breaking) nhưng vẫn giữ noise ban đầu xấp xỉ 0.
