@@ -298,71 +298,76 @@ class MiNbaseNet(nn.Module):
         return {
             "logits": logits
         }
-    def update_GPM(self, start_threshold=0.96, end_threshold=0.99):
+    def update_GPM(self, threshold=0.965):
         """
-        [FIX ISSUE 4] Robust GPM Update with Orthonormalization
+        [InfLoRA Step 2] Tính toán SVD và cập nhật Basis (Modified Gram-Schmidt)
+        threshold: Ngưỡng năng lượng giữ lại (Default 0.965 là mức an toàn)
         """
-        total_tasks = self.args.get('total_sessions', 10) 
-        current_task = self.args.get('current_task', 0) # Cần cập nhật biến này từ trainer
-
-        # Công thức Dynamic Threshold của InfLoRA
-        threshold = start_threshold + (end_threshold - start_threshold) * (current_task / total_tasks)
-        print(f"--> [GPM] Calculating Basis with Dynamic Threshold: {threshold:.4f} (Task {current_task}/{total_tasks})")
+        # Nếu muốn dùng Dynamic Threshold (tăng dần theo task), uncomment đoạn dưới:
+        # current_task = self.backbone.cur_task if hasattr(self.backbone, 'cur_task') else 0
+        # total_tasks = 10 # Hoặc lấy từ args
+        # threshold = 0.96 + (0.99 - 0.96) * (current_task / total_tasks)
+        
+        print(f"--> [GPM] Calculating Orthogonal Basis (Threshold={threshold})...")
+        
+        updated_layers = 0
         for module in self.backbone.noise_maker:
-            R = module.cur_matrix
+            # Lấy ma trận covariance đã hứng được (phải là float32)
+            R = module.cur_matrix.float()
             if R.sum() == 0: continue
 
-            # 1. SVD trên covariance matrix hiện tại
-            # R là ma trận đối xứng (X^T X), dùng eigh sẽ nhanh và ổn định hơn svd thường
+            # 1. Tính SVD: R = U * S * V^T
+            # R đối xứng nên dùng eigh nhanh và ổn định hơn
             try:
-                # eigh trả về eigenvalues tăng dần, ta cần đảo ngược lại
-                S, U = torch.linalg.eigh(R) 
-                S = S.flip(0)
+                S, U = torch.linalg.eigh(R)
+                S = S.flip(0) # Sắp xếp giảm dần
                 U = U.flip(1)
             except:
-                # Fallback nếu lỗi
                 U, S, V = torch.linalg.svd(R)
 
-            # 2. Chọn k vector
-            s_sq = S.abs() # S là eigenvalues của R (chính là s^2 của X)
+            # 2. Chọn số lượng vector (Rank) dựa trên threshold năng lượng
+            s_sq = S.abs()
             s_sum = torch.sum(s_sq)
             s_cum = torch.cumsum(s_sq, dim=0) / s_sum
             k = torch.searchsorted(s_cum, threshold).item() + 1
             
+            # Giới hạn k để không chiếm hết không gian (chừa chỗ cho task sau)
+            max_k = int(R.shape[0] * 0.95) # Không bao giờ lấy quá 95% chiều
+            if k > max_k: k = max_k
+            
+            if k == 0: 
+                module.cur_matrix.zero_()
+                module.n_cur_matrix.zero_()
+                continue
+
             # Basis đề xuất từ task mới
             new_basis = U[:, :k] # [Hidden, k]
 
-            # 3. [CRITICAL FIX] Orthonormalize against OLD Basis
-            # Nếu đã có basis cũ, phải đảm bảo basis mới vuông góc với nó
+            # 3. [CRITICAL] Orthonormalize against OLD Basis (Modified Gram-Schmidt)
             if module.basis.shape[1] > 0:
-                old_basis = module.basis # [Hidden, M]
+                # Trực giao hóa vector mới với basis cũ
+                # new_basis_ortho = new_basis - P_old(new_basis)
+                projection = torch.matmul(module.basis.T, new_basis)
+                new_basis_residual = new_basis - torch.matmul(module.basis, projection)
                 
-                # Chiếu new_basis lên không gian cũ: P = B_old @ B_old^T
-                # proj = old_basis @ (old_basis.T @ new_basis)
-                # new_basis_ortho = new_basis - proj
-                # Cách viết tối ưu bộ nhớ:
-                projection = torch.matmul(old_basis.T, new_basis)
-                new_basis_residual = new_basis - torch.matmul(old_basis, projection)
-                
-                # 4. Normalize lại (Gram-Schmidt)
-                # Để đảm bảo tính trực chuẩn (Orthonormality)
+                # Normalize lại
                 norms = torch.norm(new_basis_residual, dim=0)
-                
-                # Chỉ giữ lại các vector có norm đủ lớn (chưa nằm trong không gian cũ)
-                # Epsilon nhỏ để tránh chia cho 0
-                valid_indices = norms > 1e-5 
+                # Chỉ lấy những vector có norm đủ lớn (chưa nằm trong không gian cũ)
+                valid_indices = norms > 1e-6 
                 
                 if valid_indices.sum() > 0:
                     new_basis_clean = new_basis_residual[:, valid_indices]
-                    new_basis_clean = new_basis_clean / norms[valid_indices] # Normalize
+                    new_basis_clean = new_basis_clean / norms[valid_indices]
                     
-                    # Cập nhật: Ghép vào
+                    # Ghép vào basis cũ
                     module.basis = torch.cat((module.basis, new_basis_clean), dim=1)
             else:
-                # Task đầu tiên: Chỉ cần Normalize là đủ (SVD U đã trực giao sẵn)
-                # Nhưng U của SVD đã là trực chuẩn rồi, không cần làm gì thêm
                 module.basis = new_basis
 
-            # Reset buffers
+            updated_layers += 1
+            
+            # 5. Reset bộ đệm
             module.cur_matrix.zero_()
             module.n_cur_matrix.zero_()
+            
+        print(f"--> [GPM] Updated basis for {updated_layers} layers.")
