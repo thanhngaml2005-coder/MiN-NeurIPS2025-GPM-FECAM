@@ -143,7 +143,7 @@ class MinNet(object):
                 self._network.backbone(inputs, get_cur_feat=True)
         
         # [INFLORA STEP 2] Tính toán Basis gốc từ Task 0
-        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.99))
+        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.965))
 
         self._clear_gpu()
         
