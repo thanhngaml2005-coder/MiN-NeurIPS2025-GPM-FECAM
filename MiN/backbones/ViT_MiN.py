@@ -690,7 +690,7 @@ class VisionTransformer(nn.Module):
             )
             for i in range(depth)])
         self.noise_maker = nn.Sequential(*[
-            Inflora_Pinoise(768, 768, args['hidden_dim']) for i in range(depth)
+            InfLoRA_PiNoise(768, 768, args['hidden_dim']) for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
