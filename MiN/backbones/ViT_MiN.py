@@ -107,9 +107,9 @@ class BiLORA_Linear(nn.Module):
         with torch.no_grad():
             # 1. Tạo bản đồ tần số cho task hiện tại (Dense map)
             current_task_dense = torch.zeros_like(self.global_freq_weight).view(-1)
-            current_task_dense[self.active_mask] = self.active_params
+            mask = self.active_mask.to(self.global_freq_weight.device)
+            current_task_dense[mask] = self.active_params
             current_task_dense = current_task_dense.view(self.freq_h, self.freq_w)
-
             # 2. So sánh độ lớn (Magnitude)
             global_mag = self.global_freq_weight.abs()
             current_mag = current_task_dense.abs()
@@ -131,21 +131,21 @@ class BiLORA_Linear(nn.Module):
         total_freq = self.global_freq_weight.clone()
         
         # 2. Nếu đang train, cộng thêm tín hiệu đang học (Active Params)
-        # (Chỉ cộng tạm thời vào luồng forward, chưa merge vĩnh viễn)
         if self.active_params is not None and self.active_mask is not None:
              flat_freq = total_freq.view(-1)
-             flat_freq.index_add_(0, self.active_mask, self.active_params)
+             
+             # [FIX LỖI DEVICE] 
+             # active_mask có thể đang ở CPU, cần đưa về cùng device với flat_freq (GPU)
+             mask = self.active_mask.to(flat_freq.device) 
+             
+             flat_freq.index_add_(0, mask, self.active_params)
              total_freq = flat_freq.view(self.freq_h, self.freq_w)
 
-        # 3. Inverse FFT: Biến đổi ngược về miền trọng số thực
-        # irfft2 tự động xử lý tính đối xứng Hermitian để trả về số thực
+        # 3. Inverse FFT
         delta_w = torch.fft.irfft2(total_freq, s=(self.out_features, self.in_features))
         
-        # 4. Scale factor (Theo lý thuyết BiLORA để bảo toàn năng lượng)
         scale = math.sqrt(self.out_features * self.in_features)
-        
         return delta_w * scale
-
     def forward(self, x):
         # 1. Base Forward (Cố định)
         base_out = F.linear(x, self.weight, self.bias)

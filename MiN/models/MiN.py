@@ -55,7 +55,7 @@ class MinNet(object):
         self.class_acc = []
         self.task_acc = []
         
-        self.scaler = GradScaler()
+        self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
         gc.collect()
@@ -305,7 +305,7 @@ class MinNet(object):
                 optimizer.zero_grad(set_to_none=True) 
 
                 # Autocast Training (Nhanh + Nhẹ)
-                with autocast(enabled=True):
+                with autocast('cuda', enabled=True):
                     if self.cur_task > 0:
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
