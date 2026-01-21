@@ -34,36 +34,27 @@ class BiLORA_Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.k = k # Số lượng tần số được phép học trong mỗi task
+        self.k = k 
         
-        # 1. Trọng số gốc (Base Weights - Luôn đóng băng)
+        # 1. Trọng số gốc
         self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
         self.bias = nn.Parameter(torch.Tensor(out_features))
         
-        # 2. GLOBAL FREQUENCY MEMORY (Bộ nhớ tần số toàn cục)
-        # Kích thước ma trận tần số cho rfft2 (Real FFT)
-        # Chiều cao = out_features, Chiều rộng = in_features // 2 + 1
+        # 2. Global Memory (Vẫn giữ Complex vì đây là Buffer, không phải Parameter train)
         self.freq_h = out_features
         self.freq_w = (in_features // 2) + 1
-        
-        # Buffer lưu trữ kiến thức tổng hợp (đã merge). 
-        # Dùng register_buffer để tránh lỗi mismatch device khi to(device)
         self.register_buffer('global_freq_weight', torch.zeros((self.freq_h, self.freq_w), dtype=torch.cfloat))
         
-        # 3. Task hiện tại (Trainable Parts)
-        # active_mask: Lưu chỉ số (index) của các tần số đang được train
-        # active_params: Lưu giá trị của các tần số đó
+        # 3. Task hiện tại
         self.active_mask = None   
         self.active_params = None 
         
         self.reset_parameters()
         
-        # Freeze Base
         self.weight.requires_grad = False
         self.bias.requires_grad = False
 
     def reset_parameters(self):
-        # Init theo chuẩn Kaiming
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if self.bias is not None:
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
@@ -71,74 +62,68 @@ class BiLORA_Linear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def new_task(self):
-        """
-        Khởi tạo cho Task mới:
-        1. Sinh Mask ngẫu nhiên (chọn vị trí tần số để học).
-        2. Khởi tạo Active Parameters (giá trị tần số).
-        """
+        """Khởi tạo task mới"""
         device = self.weight.device
         
-        # A. Sinh Mask ngẫu nhiên
-        # Tổng số điểm tần số có thể chọn
+        # A. Sinh Mask
         total_freqs = self.freq_h * self.freq_w
-        
-        # Random permutation để lấy k chỉ số ngẫu nhiên
         indices = torch.randperm(total_freqs)[:self.k].to(device)
-        
-        # Lưu mask vào buffer (không cần grad)
         self.active_mask = indices
         
-        # B. Sinh Parameter mới để train
-        # Khởi tạo giá trị nhỏ (Near-zero) để bắt đầu học mượt mà
-        self.active_params = nn.Parameter(torch.zeros(self.k, dtype=torch.cfloat, device=device))
-        nn.init.normal_(self.active_params.real, 0, 0.002)
-        nn.init.normal_(self.active_params.imag, 0, 0.002)
+        # B. Sinh Parameter mới (FIX: Dùng Float32 shape (k, 2))
+        # Thay vì complex64, ta dùng float32 với chiều cuối = 2 (Real, Imag)
+        # Điều này đánh lừa Scaler rằng đây là tensor thực bình thường.
+        self.active_params = nn.Parameter(torch.zeros(self.k, 2, dtype=torch.float32, device=device))
+        
+        # Init normal
+        nn.init.normal_(self.active_params, 0, 0.002)
 
     def perform_magmax_merge(self):
-        """
-        [TRÁI TIM CỦA THUẬT TOÁN]
-        Frequency-Domain MagMax Merge:
-        So sánh độ lớn (Magnitude) của tần số Task mới với Global Memory.
-        Nếu Task mới mạnh hơn -> Ghi đè.
-        """
         if self.active_params is None or self.active_mask is None:
             return
 
         with torch.no_grad():
-            # 1. Tạo bản đồ tần số cho task hiện tại (Dense map)
+            # [TRICK] Chuyển đổi từ (k, 2) Float -> (k) Complex ngay trước khi merge
+            # view_as_complex yêu cầu input tensor phải có dimension cuối là 2
+            params_complex = torch.view_as_complex(self.active_params)
+            
+            # 1. Tạo bản đồ tần số
             current_task_dense = torch.zeros_like(self.global_freq_weight).view(-1)
+            
+            # Fix lỗi device mismatch (nếu có)
             mask = self.active_mask.to(self.global_freq_weight.device)
-            current_task_dense[mask] = self.active_params
+            params_complex = params_complex.to(self.global_freq_weight.device)
+            
+            current_task_dense[mask] = params_complex
             current_task_dense = current_task_dense.view(self.freq_h, self.freq_w)
-            # 2. So sánh độ lớn (Magnitude)
+
+            # 2. So sánh độ lớn
             global_mag = self.global_freq_weight.abs()
             current_mag = current_task_dense.abs()
             
-            # 3. Tạo Mask cập nhật: Update ở đâu mà Task mới có tín hiệu mạnh hơn
-            # (Hoặc vị trí đó Global chưa có gì)
+            # 3. MagMax Update
             update_mask = (current_mag > global_mag)
-            
-            # 4. Ghi đè giá trị (MagMax Update)
             self.global_freq_weight[update_mask] = current_task_dense[update_mask]
             
-            # 5. Dọn dẹp biến tạm để giải phóng VRAM
             self.active_params = None
             self.active_mask = None
 
     def get_delta_weight(self):
-        """Tái tạo Delta W (Update trọng số) từ miền tần số"""
         # 1. Lấy kiến thức toàn cục
         total_freq = self.global_freq_weight.clone()
         
-        # 2. Nếu đang train, cộng thêm tín hiệu đang học (Active Params)
+        # 2. Cộng thêm tín hiệu đang học
         if self.active_params is not None and self.active_mask is not None:
              flat_freq = total_freq.view(-1)
              
-             # [FIX LỖI DEVICE] 
-             # active_mask có thể đang ở CPU, cần đưa về cùng device với flat_freq (GPU)
-             mask = self.active_mask.to(flat_freq.device) 
+             # [TRICK] Chuyển đổi Float(k, 2) -> Complex(k) on-the-fly
+             params_complex = torch.view_as_complex(self.active_params)
              
-             flat_freq.index_add_(0, mask, self.active_params)
+             # Đảm bảo cùng device
+             mask = self.active_mask.to(flat_freq.device)
+             params_complex = params_complex.to(flat_freq.device)
+             
+             flat_freq.index_add_(0, mask, params_complex)
              total_freq = flat_freq.view(self.freq_h, self.freq_w)
 
         # 3. Inverse FFT
@@ -146,19 +131,12 @@ class BiLORA_Linear(nn.Module):
         
         scale = math.sqrt(self.out_features * self.in_features)
         return delta_w * scale
+
     def forward(self, x):
-        # 1. Base Forward (Cố định)
         base_out = F.linear(x, self.weight, self.bias)
-        
-        # 2. BiLORA Delta Forward
         delta_w = self.get_delta_weight()
         delta_out = F.linear(x, delta_w)
-        
         return base_out + delta_out
-
-
-
-
 class Noise_weigh(nn.Module):
     def __init__(self, init_value=1.):
         super().__init__()
