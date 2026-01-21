@@ -421,7 +421,7 @@ class VisionTransformer(nn.Module):
 
     # --- CORE GPM FUNCTIONS (NEW) ---
 
-    def update_GPM(self, threshold=0.95):
+    def update_GPM(self, threshold=0.85):
         """
         Tính toán SVD, cập nhật Basis và kiểm tra độ bão hòa không gian.
         """
