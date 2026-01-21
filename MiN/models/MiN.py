@@ -272,10 +272,17 @@ class MinNet(object):
             epochs = self.init_epochs
             lr = self.init_lr
             weight_decay = self.init_weight_decay
+            patience = 10 # Task 0 cần kiên nhẫn hơn chút
         else:
-            epochs = self.epochs
+            epochs = self.epochs 
             lr = self.lr 
             weight_decay = self.weight_decay
+            patience = 5  # Các task sau nếu 5 epoch ko giảm thì dừng luôn
+
+        # Setup Early Stopping vars
+        best_loss = float('inf')
+        patience_counter = 0
+        min_delta = 1e-4 # Mức giảm tối thiểu để được coi là "có cải thiện"
 
         for param in self._network.parameters():
             param.requires_grad = False
@@ -304,7 +311,6 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True) 
 
-                # Autocast Training (Nhanh + Nhẹ)
                 with autocast('cuda', enabled=True):
                     if self.cur_task > 0:
                         with torch.no_grad():
@@ -321,7 +327,6 @@ class MinNet(object):
                         loss = F.cross_entropy(logits, targets.long())
                         logits_final = logits
 
-                # Scale Backward
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -336,15 +341,30 @@ class MinNet(object):
 
             scheduler.step()
             train_acc = 100. * correct / total
+            avg_loss = losses / len(train_loader)
 
-            info = "Task {} --> Training: Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(
-                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
+            info = "Task {} --> Epoch {}/{} | Loss {:.3f} | Acc {:.2f} | Patience {}/{}".format(
+                self.cur_task, epoch + 1, epochs, avg_loss, train_acc, patience_counter, patience
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
             if epoch % 5 == 0:
                 self._clear_gpu()
+
+            # ==========================================
+            # [EARLY STOPPING LOGIC]
+            # ==========================================
+            if avg_loss < best_loss - min_delta:
+                best_loss = avg_loss
+                patience_counter = 0 # Reset bộ đếm nếu loss giảm
+            else:
+                patience_counter += 1 # Tăng bộ đếm nếu loss không giảm
+                
+            if patience_counter >= patience:
+                print(f"\n[Early Stopping] Loss didn't improve for {patience} epochs. Stop training at Epoch {epoch+1}.")
+                self.logger.info(f"[Early Stopping] Triggered at Epoch {epoch+1}")
+                break
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
