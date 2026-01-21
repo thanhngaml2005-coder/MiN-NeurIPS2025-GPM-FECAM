@@ -157,7 +157,7 @@ class MinNet(object):
                 if i > 250: break 
         
         # 3. UPDATE GPM (Tính SVD và lưu vào Basis)
-        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.965))
+        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.95))
 
         # 4. MERGE (MagMax)
         self._network.after_task_magmax_merge()
@@ -243,7 +243,7 @@ class MinNet(object):
                 if i > 250: break # Lấy mẫu đại diện
 
         # 3. UPDATE GPM
-        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.965))
+        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.95))
 
         # 4. MERGE (MagMax)
         self._network.after_task_magmax_merge()

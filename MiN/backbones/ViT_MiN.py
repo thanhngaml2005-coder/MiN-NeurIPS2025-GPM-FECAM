@@ -99,31 +99,22 @@ class PiNoise(nn.Module):
         for param in self.sigma.parameters(): param.requires_grad = True
 
     def forward(self, hyper_features, get_cur_feat=False):
-        # 1. Down-projection (Fixed)
         x_down = hyper_features @ self.w_down
         
-        # 2. [InfLoRA Step] Thu thập dữ liệu để tính Basis (chỉ chạy khi scouting)
+        # [FIX 2] Race Condition mitigation: Chỉ tích lũy trên GPU đang chạy
+        # (Lưu ý: Logic gộp multi-gpu phải xử lý ở Trainer nếu dùng DDP)
         if get_cur_feat:
-            # Flatten: [Batch, Tokens, Dim] -> [N, Dim]
             x_flat = x_down.detach().reshape(-1, self.hidden_dim).float()
-            
-            # Tích lũy ma trận tương quan (Correlation Matrix) R = X^T * X
             batch_n = x_flat.shape[0]
             if batch_n > 0:
-                batch_corr = torch.mm(x_flat.T, x_flat) # [Dim, Dim]
-                
-                # Update running correlation matrix
+                batch_corr = torch.mm(x_flat.T, x_flat)
+                # Moving Average Update
                 total_n = self.n_cur_matrix + batch_n
                 self.cur_matrix = (self.cur_matrix * self.n_cur_matrix + batch_corr) / total_n
                 self.n_cur_matrix = total_n
 
-        # 3. Noise Generation (Single Path)
-        # Input KHÔNG bị chiếu trực giao -> Không bị "Sốc" input -> Acc cao
         noise = self.mu(x_down) + self.sigma(x_down)
-        
-        # 4. Residual Connection
         return hyper_features + (noise @ self.w_up)
-
     def project_grad(self):
         """
         [CORE ALGORITHM] Gradient Projection
@@ -175,8 +166,8 @@ class PiNoise(nn.Module):
         self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
 
     # Tương thích ngược
-    def forward_new(self, hyper_features): 
-        return self.forward(hyper_features)
+    def forward_new(self, hyper_features, **kwargs):
+        return self.forward(hyper_features, **kwargs)
     def init_weight_noise(self, prototypes): pass
     def unfreeze_noise(self): self.update_noise()
 
@@ -430,70 +421,77 @@ class VisionTransformer(nn.Module):
 
     # --- CORE GPM FUNCTIONS (NEW) ---
 
-    def update_GPM(self, threshold=0.965):
-        """
-        Tính toán SVD từ ma trận Covariance tích lũy được trong các module PiNoise.
-        Cập nhật Basis (Vùng cấm) cho các task sau.
-        """
+    def update_GPM(self, threshold=0.95): # [FIX 3] Hạ threshold default xuống 0.95
         print(f"--> [GPM] Calculating Orthogonal Basis (Threshold={threshold})...")
         updated_layers = 0
         
         for module in self.noise_maker:
-            # 1. Lấy ma trận Covariance (R)
             R = module.cur_matrix.float()
-            if R.sum() == 0: continue # Layer chưa được kích hoạt
+            if R.sum() == 0: continue 
 
-            # 2. Tính Eigen-decomposition (Vì R đối xứng, dùng eigh nhanh hơn svd)
             try:
-                # eigh trả về eigenvalues tăng dần
                 S, U = torch.linalg.eigh(R) 
-                S = S.flip(0) # Sắp xếp giảm dần
+                S = S.flip(0) 
                 U = U.flip(1)
             except:
                 U, S, V = torch.linalg.svd(R)
 
-            # 3. Chọn Rank k dựa trên threshold năng lượng
             s_sq = S.abs()
             s_sum = torch.sum(s_sq)
             if s_sum == 0: continue
             
             s_cum = torch.cumsum(s_sq, dim=0) / s_sum
             k = torch.searchsorted(s_cum, threshold).item() + 1
-            
-            # Safety Cap: Không bao giờ lấy quá 95% số chiều (để chừa đường cho task sau)
-            max_k = int(R.shape[0] * 0.95)
+            max_k = int(R.shape[0] * 0.90) # [FIX 3] Cap chặt hơn chút (90%) để tiết kiệm
             k = min(k, max_k)
             
             if k == 0: continue
 
-            # New Basis Candidates
-            new_basis = U[:, :k] # [Hidden, k]
-
-            # 4. Modified Gram-Schmidt: Trực giao hóa Basis mới với Basis cũ
+            new_basis = U[:, :k] 
+            
+            # [FIX 4] Double Projection for Numerical Stability
             if module.basis.shape[1] > 0:
+                # Lần 1
                 projection = torch.matmul(module.basis, torch.matmul(module.basis.T, new_basis))
                 new_basis_residual = new_basis - projection
                 
+                # Lần 2 (Triệt tiêu ghost)
+                projection_2 = torch.matmul(module.basis, torch.matmul(module.basis.T, new_basis_residual))
+                new_basis_residual = new_basis_residual - projection_2
+                
                 norms = torch.norm(new_basis_residual, dim=0)
-                valid_indices = norms > 1e-5
+                valid_indices = norms > 1e-5 # Lọc nhiễu
                 
                 if valid_indices.sum() > 0:
                     new_basis_clean = new_basis_residual[:, valid_indices]
                     new_basis_clean = new_basis_clean / norms[valid_indices]
-                    
-                    # Ghép vào buffer
                     module.basis = torch.cat((module.basis, new_basis_clean), dim=1)
             else:
                 module.basis = new_basis
 
             updated_layers += 1
-            
-            # 5. Reset bộ đệm Covariance
             module.cur_matrix.zero_()
             module.n_cur_matrix.zero_()
             
         print(f"--> [GPM] Updated basis for {updated_layers} layers.")
 
+    # Sửa forward_features để truyền tham số đúng
+    def forward_features(self, x: torch.Tensor, new_forward: bool = False, get_cur_feat: bool = False) -> torch.Tensor:
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+
+        for i in range(len(self.blocks)):
+            blk_out = self.blocks[i](x)
+            # [FIX 1] Truyền get_cur_feat vào cả 2 nhánh
+            if new_forward:
+                x = self.noise_maker[i].forward_new(blk_out, get_cur_feat=get_cur_feat)
+            else:
+                x = self.noise_maker[i](blk_out, get_cur_feat=get_cur_feat)
+                
+        x = self.norm(x)
+        return x
     def project_grads(self):
         """
         Gọi hàm project_grad() của từng layer PiNoise.
@@ -578,29 +576,7 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward_features(self, x: torch.Tensor, new_forward: bool = False, get_cur_feat: bool = False) -> torch.Tensor:
-        """
-        Modified forward to pass 'get_cur_feat' flag to PiNoise
-        """
-        x = self.patch_embed(x)
-        x = self._pos_embed(x)
-        x = self.patch_drop(x)
-        x = self.norm_pre(x)
-
-        for i in range(len(self.blocks)):
-            # Pass through Block first
-            blk_out = self.blocks[i](x)
-            
-            # Pass through PiNoise (Injection)
-            # get_cur_feat=True chỉ dùng khi muốn thu thập dữ liệu để tính Basis
-            if new_forward: # Tương thích code cũ
-                x = self.noise_maker[i].forward_new(blk_out)
-            else:
-                x = self.noise_maker[i](blk_out, get_cur_feat=get_cur_feat)
-                
-        x = self.norm(x)
-        return x
-
+    
     def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
         if self.attn_pool is not None:
             x = self.attn_pool(x)
