@@ -421,14 +421,20 @@ class VisionTransformer(nn.Module):
 
     # --- CORE GPM FUNCTIONS (NEW) ---
 
-    def update_GPM(self, threshold=0.95): # [FIX 3] Hạ threshold default xuống 0.95
+    def update_GPM(self, threshold=0.95):
+        """
+        Tính toán SVD, cập nhật Basis và kiểm tra độ bão hòa không gian.
+        """
         print(f"--> [GPM] Calculating Orthogonal Basis (Threshold={threshold})...")
         updated_layers = 0
         
-        for module in self.noise_maker:
+        # Dùng enumerate để lấy index 'i' cho việc log
+        for i, module in enumerate(self.noise_maker):
+            # 1. Lấy ma trận Covariance (R)
             R = module.cur_matrix.float()
-            if R.sum() == 0: continue 
+            if R.sum() == 0: continue # Layer chưa được kích hoạt
 
+            # 2. Tính Eigen-decomposition
             try:
                 S, U = torch.linalg.eigh(R) 
                 S = S.flip(0) 
@@ -436,45 +442,66 @@ class VisionTransformer(nn.Module):
             except:
                 U, S, V = torch.linalg.svd(R)
 
+            # 3. Chọn Rank k
             s_sq = S.abs()
             s_sum = torch.sum(s_sq)
             if s_sum == 0: continue
             
             s_cum = torch.cumsum(s_sq, dim=0) / s_sum
             k = torch.searchsorted(s_cum, threshold).item() + 1
-            max_k = int(R.shape[0] * 0.90) # [FIX 3] Cap chặt hơn chút (90%) để tiết kiệm
+            
+            # Safety Cap: Giới hạn 90% để tránh lỗi tính toán khi full rank
+            max_k = int(R.shape[0] * 0.90)
             k = min(k, max_k)
             
             if k == 0: continue
 
+            # New Basis Candidates
             new_basis = U[:, :k] 
-            
-            # [FIX 4] Double Projection for Numerical Stability
+
+            # 4. Modified Gram-Schmidt & Double Projection (Chống nhiễu số học)
             if module.basis.shape[1] > 0:
-                # Lần 1
+                # Lần 1: Chiếu
                 projection = torch.matmul(module.basis, torch.matmul(module.basis.T, new_basis))
                 new_basis_residual = new_basis - projection
                 
-                # Lần 2 (Triệt tiêu ghost)
+                # Lần 2: Chiếu lại (Double Projection) để triệt tiêu sai số cực nhỏ
                 projection_2 = torch.matmul(module.basis, torch.matmul(module.basis.T, new_basis_residual))
                 new_basis_residual = new_basis_residual - projection_2
                 
+                # Normalize
                 norms = torch.norm(new_basis_residual, dim=0)
-                valid_indices = norms > 1e-5 # Lọc nhiễu
+                valid_indices = norms > 1e-5 # Lọc bỏ các vector đã nằm trong không gian cũ
                 
                 if valid_indices.sum() > 0:
                     new_basis_clean = new_basis_residual[:, valid_indices]
                     new_basis_clean = new_basis_clean / norms[valid_indices]
+                    
+                    # Ghép vào buffer
                     module.basis = torch.cat((module.basis, new_basis_clean), dim=1)
             else:
                 module.basis = new_basis
 
             updated_layers += 1
+            
+            # 5. Reset bộ đệm Covariance
             module.cur_matrix.zero_()
             module.n_cur_matrix.zero_()
+
+            # =================================================================
+            # [SATURATION CHECK] KIỂM TRA "ĐỘ CHẬT" CỦA KHÔNG GIAN
+            # =================================================================
+            current_dims = module.basis.shape[1]
+            total_dims = module.basis.shape[0] # Hidden dim (ví dụ 384 hoặc 768)
+            usage_pct = (current_dims / total_dims) * 100
+            
+            print(f"    Layer {i:02d}: Basis Size {current_dims}/{total_dims} ({usage_pct:.2f}%)")
+            
+            if usage_pct > 90.0:
+                print(f"    [WARNING] Layer {i} is SATURATED (>90%)! Consider reducing threshold.")
+            # =================================================================
             
         print(f"--> [GPM] Updated basis for {updated_layers} layers.")
-
     # Sửa forward_features để truyền tham số đúng
     def forward_features(self, x: torch.Tensor, new_forward: bool = False, get_cur_feat: bool = False) -> torch.Tensor:
         x = self.patch_embed(x)
