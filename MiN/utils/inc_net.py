@@ -47,6 +47,7 @@ class BaseIncNet(nn.Module):
 class RandomBuffer(torch.nn.Linear):
     """
     Lớp mở rộng đặc trưng ngẫu nhiên (Random Projection).
+    Đóng vai trò như Kernel Approximation.
     """
     def __init__(self, in_features: int, buffer_size: int, device):
         super(torch.nn.Linear, self).__init__()
@@ -55,6 +56,7 @@ class RandomBuffer(torch.nn.Linear):
         self.out_features = buffer_size
         
         # [QUAN TRỌNG] Sử dụng float32 để đảm bảo độ chính xác khi tính RLS
+        # FP16 (Half) không đủ chính xác cho ma trận hiệp phương sai
         factory_kwargs = {"device": device, "dtype": torch.float32}
         
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
@@ -88,13 +90,13 @@ class MiNbaseNet(nn.Module):
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
 
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
-        self.register_buffer("weight", weight) # Trọng số của Analytic Classifier
+        self.register_buffer("weight", weight) # Trọng số của Analytic Classifier (Test time)
 
         self.R: torch.Tensor
         R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
         self.register_buffer("R", R) # Ma trận hiệp phương sai đảo (Inverse Covariance Matrix)
 
-        # Normal FC: Dùng để train Gradient Descent cho Noise Generator
+        # Normal FC: Dùng để train Gradient Descent cho Noise Generator (BiLORA)
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
@@ -113,16 +115,15 @@ class MiNbaseNet(nn.Module):
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
             # Task đầu: Có bias
-            # [FIX LỖI TẠI ĐÂY]: Đổi fc thành new_fc
             new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
         if self.normal_fc is not None:
-            # Sequential Init: Copy trọng số cũ
+            # Sequential Init: Copy trọng số cũ sang layer mới mở rộng
             old_nb_output = self.normal_fc.out_features
             with torch.no_grad():
                 # Copy phần cũ
                 new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
-                # Init phần mới về 0
+                # Init phần mới về 0 (để bắt đầu học từ neutral)
                 nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
             
             del self.normal_fc
@@ -135,57 +136,62 @@ class MiNbaseNet(nn.Module):
             self.normal_fc = new_fc
 
     # =========================================================================
-    # [MAGMAX & NOISE CONTROL SECTION]
+    # [BiLORA & MAGMAX CONTROL SECTION]
     # =========================================================================
     
     def update_noise(self):
         """
-        Gọi khi bắt đầu Task mới.
-        Kích hoạt chế độ Sequential Initialization trong PiNoise.
+        [STEP 1 - BiLORA]: Gọi khi bắt đầu Task mới.
+        Hàm này kích hoạt BiLORA_Linear.new_task() trong vit_min.py.
+        Tác dụng: Sinh Mask ngẫu nhiên mới và tạo Parameter mới để train.
         """
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].update_noise()
+        # Duyệt qua các blocks của ViT (hoặc module chứa noise_maker)
+        # Giả sử noise_maker được gắn vào self.backbone.noise_maker (như trong vit_min.py)
+        if hasattr(self.backbone, 'noise_maker'):
+            for j in range(len(self.backbone.noise_maker)):
+                self.backbone.noise_maker[j].update_noise()
 
     def after_task_magmax_merge(self):
         """
-        Gọi sau khi kết thúc Task.
-        Kích hoạt việc LƯU (Save) và TRỘN (Merge) tham số theo MagMax.
+        [STEP 2 - MagMax]: Gọi sau khi kết thúc Task.
+        Hàm này kích hoạt BiLORA_Linear.perform_magmax_merge() trong vit_min.py.
+        Tác dụng: Gộp tham số vừa train vào bộ nhớ tần số toàn cục dựa trên độ lớn.
         """
-        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        for j in range(self.backbone.layer_num):
-            # Hàm này nằm trong PiNoise
-            self.backbone.noise_maker[j].after_task_training()
+        print(f"--> [IncNet] Task {self.cur_task}: Triggering Frequency-Domain MagMax Merging...")
+        if hasattr(self.backbone, 'noise_maker'):
+            for j in range(len(self.backbone.noise_maker)):
+                self.backbone.noise_maker[j].after_task_training()
 
     def unfreeze_noise(self):
         """Chỉ mở khóa gradient cho các module Noise (cho các task > 0)"""
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].unfreeze_noise()
+        # Logic freeze/unfreeze chi tiết đã được xử lý bên trong BiLORA_Linear
+        # Hàm này chỉ mang tính chất kích hoạt update state nếu cần
+        self.update_noise() 
 
     def init_unfreeze(self):
         """
         Mở khóa gradient cho Task 0.
         Bao gồm Noise modules và các lớp Normalization của Backbone để ổn định hơn.
         """
-        for j in range(self.backbone.layer_num):
-            # Unfreeze Noise
-            self.backbone.noise_maker[j].unfreeze_noise()
-            
-            # Unfreeze LayerNorms trong từng Block ViT
-            for p in self.backbone.blocks[j].norm1.parameters():
-                p.requires_grad = True
-            for p in self.backbone.blocks[j].norm2.parameters():
-                p.requires_grad = True
-                
-        # Unfreeze LayerNorm cuối cùng
+        self.update_noise() # Sinh mask cho task 0
+        
+        # Unfreeze LayerNorms (Thường giúp hội tụ tốt hơn ở Task đầu)
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
+            
+        # Nếu block có norm riêng
+        for blk in self.backbone.blocks:
+            if hasattr(blk, 'norm1'):
+                for p in blk.norm1.parameters(): p.requires_grad = True
+            if hasattr(blk, 'norm2'):
+                for p in blk.norm2.parameters(): p.requires_grad = True
 
     # =========================================================================
     # [ANALYTIC LEARNING (RLS) SECTION]
     # =========================================================================
 
     def forward_fc(self, features):
-        """Forward qua Analytic Classifier"""
+        """Forward qua Analytic Classifier (Test Time)"""
         # Đảm bảo features cùng kiểu với trọng số RLS (float32)
         features = features.to(self.weight) 
         return features @ self.weight
@@ -197,6 +203,7 @@ class MiNbaseNet(nn.Module):
         Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
         """
         # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
+        # Nếu dùng FP16, ma trận hiệp phương sai sẽ rất dễ bị suy biến (singular)
         with autocast(enabled=False):
             # 1. Feature Extraction & Expansion
             X = self.backbone(X).float() # ViT Features
@@ -205,7 +212,7 @@ class MiNbaseNet(nn.Module):
             # Đưa về cùng device
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
-            # 2. Mở rộng chiều của classifier nếu có lớp mới
+            # 2. Mở rộng chiều của classifier nếu có lớp mới (Class Incremental)
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
@@ -216,20 +223,21 @@ class MiNbaseNet(nn.Module):
                 tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # 3. Công thức cập nhật RLS
+            # 3. Công thức cập nhật RLS (Woodbury Matrix Identity application)
             I = torch.eye(X.shape[0]).to(X)
             term = I + X @ self.R @ X.T
             
-            # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
+            # Thêm jitter (nhiễu cực nhỏ) trên đường chéo để đảm bảo khả nghịch
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             
             # Nghịch đảo ma trận
             K = torch.inverse(term + jitter)
             
-            # Cập nhật R (Covariance Matrix)
+            # Cập nhật R (Inverse Covariance Matrix)
             self.R -= self.R @ X.T @ K @ X @ self.R
             
             # Cập nhật Trọng số Classifier
+            # W_new = W_old + K * (Y - X * W_old)
             self.weight += self.R @ X.T @ (Y - X @ self.weight)
 
     # =========================================================================
@@ -262,6 +270,7 @@ class MiNbaseNet(nn.Module):
         """
         Dùng cho Training (Gradient Descent).
         Chạy qua backbone -> Buffer -> Normal FC (trainable).
+        Gradient sẽ lan truyền ngược về Backbone -> PiNoise -> BiLORA Params.
         """
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
@@ -278,12 +287,3 @@ class MiNbaseNet(nn.Module):
         return {
             "logits": logits
         }
-    def update_GPM(self, threshold=0.965):
-        """Wrapper gọi xuống Backbone để tính SVD"""
-        if hasattr(self.backbone, 'update_GPM'):
-            self.backbone.update_GPM(threshold=threshold)
-
-    def project_grads(self):
-        """Wrapper gọi xuống Backbone để chiếu Gradient"""
-        if hasattr(self.backbone, 'project_grads'):
-            self.backbone.project_grads()

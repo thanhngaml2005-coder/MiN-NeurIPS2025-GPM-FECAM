@@ -7,7 +7,7 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import copy
-import gc  # [ADDED] Để dọn rác bộ nhớ
+import gc  # Để dọn rác bộ nhớ
 import os
 
 from utils.inc_net import MiNbaseNet
@@ -17,7 +17,7 @@ from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
-# [ADDED] Import Mixed Precision
+# Mixed Precision
 from torch.cuda.amp import autocast, GradScaler
 
 EPSILON = 1e-8
@@ -55,11 +55,9 @@ class MinNet(object):
         self.class_acc = []
         self.task_acc = []
         
-        # [ADDED] Scaler cho Mixed Precision
         self.scaler = GradScaler()
 
     def _clear_gpu(self):
-        # [ADDED] Hàm dọn dẹp GPU
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -91,8 +89,7 @@ class MinNet(object):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
-        # [MODIFIED] Thêm no_grad và autocast để test nhanh và nhẹ hơn
-        with torch.no_grad(), autocast():
+        with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(device)
                 outputs = model(inputs)
@@ -109,9 +106,7 @@ class MinNet(object):
         return targets
 
     def init_train(self, data_manger):
-        # =======================================================
-        # GIAI ĐOẠN TASK 0: KHỞI TẠO & HỌC CƠ BẢN
-        # =======================================================
+        # --- TASK 0 ---
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
         self.logger.info("task_list: {}".format(train_list_name))
@@ -134,63 +129,47 @@ class MinNet(object):
                 param.requires_grad = True
 
         self._network.update_fc(self.init_class)
+        
+        # [STEP 1] Kích hoạt BiLORA (Sinh Mask & Params)
         self._network.update_noise()
-        self._network.to(self.device)
         
         self._clear_gpu()
         
-        # 1. TRAIN (Học tự do trên Task 0, Basis rỗng nên không bị cản trở)
-        print("--> [Task 0] Start Training (Free Space)...")
+        # [STEP 2] Training Loop
         self.run(train_loader)
-
-        # 2. COLLECT BASIS (Thu thập dữ liệu Task 0 để bảo vệ nó khỏi Task 1)
-        # Bước này rất quan trọng: Sau khi train xong, model đã "khôn" nhất,
-        # ta mới chụp ảnh không gian đặc trưng để lưu vào Basis.
-        print("--> [Task 0] Collecting Basis for Future Protection...")
-        self._network.eval()
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                # Kích hoạt get_cur_feat=True để tích lũy Covariance
-                self._network.backbone(inputs, get_cur_feat=True)
-                # Chỉ cần lấy mẫu đại diện khoảng 250 batch, không cần chạy hết data
-                if i > 250: break 
         
-        # 3. UPDATE GPM (Tính SVD và lưu vào Basis)
-        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.85))
-
-        # 4. MERGE (MagMax)
+        # [STEP 3] MagMax Merge trong miền tần số
         self._network.after_task_magmax_merge()
         
         self._clear_gpu()
         
-        # 5. FIT CLASSIFIER (RLS)
-        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                      num_workers=self.num_workers)
-        test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                     num_workers=self.num_workers)
-        self.fit_fc(train_loader_buf, test_loader_buf)
+        # [STEP 4] Analytic Classifier Fit
+        # Dùng buffer_batch lớn để fit RLS
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+                                  num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+                                 num_workers=self.num_workers)
+        self.fit_fc(train_loader, test_loader)
 
+        # Refit (Optional - Tăng độ chính xác)
         train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader_re = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader_re = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader_re, test_loader_re)
+        self.re_fit(train_loader, test_loader)
         
-        del train_set, test_set, train_loader, test_loader, train_loader_buf, test_loader_buf
+        del train_set, test_set
         self._clear_gpu()
 
     def increment_train(self, data_manger):
-        # =======================================================
-        # GIAI ĐOẠN TASK T > 0: HỌC TĂNG CƯỜNG CÓ BẢO VỆ
-        # =======================================================
+        # --- INCREMENTAL TASKS ---
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
@@ -201,73 +180,54 @@ class MinNet(object):
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
 
-        self.test_loader = test_loader_buf
+        self.test_loader = test_loader
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # Cập nhật RLS Classifier cho class mới trước
-        self.fit_fc(train_loader_buf, test_loader_buf)
+        self.fit_fc(train_loader, test_loader)
 
         self._network.update_fc(self.increment)
-        self._network.to(self.device)
 
-        # DataLoader chuẩn cho Training
+        # [STEP 1] Kích hoạt BiLORA cho task mới
+        self._network.update_noise()
+        
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
-        self._network.update_noise()
         
         self._clear_gpu()
 
-        # 1. TRAIN (BẢO VỆ GRADIENT)
-        # Tại đây hàm run() sẽ gọi project_grads() trong mỗi bước.
-        # Basis hiện tại đang chứa thông tin Task 0...t-1 -> Bảo vệ kiến thức cũ.
-        # Task t chưa có trong Basis -> Học tự do.
-        print(f"--> [Task {self.cur_task}] Start Training (Protected by GPM)...")
+        # [STEP 2] Training Loop
         self.run(train_loader)
-
-        # 2. COLLECT BASIS (Thu thập dữ liệu Task hiện tại)
-        # Sau khi học xong, nạp task hiện tại vào Basis để chuẩn bị cho Task t+1
-        print(f"--> [Task {self.cur_task}] Collecting Basis for Future Protection...")
-        self._network.eval()
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                self._network.backbone(inputs, get_cur_feat=True)
-                if i > 250: break # Lấy mẫu đại diện
-
-        # 3. UPDATE GPM
-        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.85))
-
-        # 4. MERGE (MagMax)
+        
+        # [STEP 3] MagMax Merge
         self._network.after_task_magmax_merge()
         self._clear_gpu()
 
-
         del train_set
 
-        # 5. REFIT CLASSIFIER (Tinh chỉnh cuối cùng)
+        # [STEP 4] Re-fit Analytic Classifier
         train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
 
-        train_loader_re = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                     num_workers=self.num_workers)
-        test_loader_re = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                     num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader_re, test_loader_re)
+        self.re_fit(train_loader, test_loader)
 
-        del train_set, test_set, train_loader, train_loader_re, test_loader_re
+        del train_set, test_set
         self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader):
@@ -280,8 +240,7 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
-                # Logic gốc: Fit Analytical (RLS). 
-                # RLS cần độ chính xác cao nên tự nó tắt autocast bên trong hàm fit của inc_net
+                # Analytic Fit -> KHÔNG dùng Autocast ở đây (đã handle trong inc_net)
                 self._network.fit(inputs, targets)
             
             info = "Task {} --> Update Analytical Classifier!".format(
@@ -314,7 +273,7 @@ class MinNet(object):
             lr = self.init_lr
             weight_decay = self.init_weight_decay
         else:
-            epochs = 5
+            epochs = self.epochs # 5 epochs như bạn muốn
             lr = self.lr * 0.1
             weight_decay = self.weight_decay
 
@@ -345,19 +304,14 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True) 
 
-                # 1. FORWARD PASS
-                with autocast():
+                # Autocast Training (Nhanh + Nhẹ)
+                with autocast(enabled=True):
                     if self.cur_task > 0:
-                        # Forward với Soft Distillation (nếu cần thiết cho legacy code, 
-                        # nhưng GPM chủ yếu dựa vào bảo vệ gradient)
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
-                        
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
-                        
-                        # Cộng logits: Kỹ thuật Distillation đơn giản của MiN
                         logits2 = logits2 + logits1
                         loss = F.cross_entropy(logits2, targets.long())
                         logits_final = logits2
@@ -367,23 +321,8 @@ class MinNet(object):
                         loss = F.cross_entropy(logits, targets.long())
                         logits_final = logits
 
-                # 2. BACKWARD PASS
+                # Scale Backward
                 self.scaler.scale(loss).backward()
-                
-                # 3. [CORE GPM STEP] PROJECT GRADIENTS
-                # ==============================================================
-                # Trước khi cập nhật trọng số, ta phải "chiếu" gradient.
-                # Scaler phải được unscale trước để ta có thể can thiệp vào gradient thật.
-                self.scaler.unscale_(optimizer) 
-                
-                # Gọi hàm chiếu gradient (Máy dò mìn).
-                # Hàm này sẽ cắt bỏ các thành phần gradient hướng về phía Task cũ
-                self._network.project_grads() 
-                # ==============================================================
-
-                # 4. OPTIMIZER STEP
-                # Vì đã unscale rồi nên scaler.step sẽ chạy như optimizer.step bình thường
-                # nhưng vẫn xử lý kiểm tra NaN/Inf.
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
@@ -398,52 +337,11 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "Task {} --> Training (GPM Protected): Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(
-                self.cur_task,
-                epoch + 1,
-                epochs,
-                losses / len(train_loader),
-                train_acc,
+            info = "Task {} --> Training: Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(
+                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
             if epoch % 5 == 0:
                 self._clear_gpu()
-
-    def eval_task(self, test_loader):
-        model = self._network.eval()
-        pred, label = [], []
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(self.device)
-                outputs = model(inputs)
-                logits = outputs["logits"]
-                predicts = torch.max(logits, dim=1)[1]
-                pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
-                label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
-        class_info = calculate_class_metrics(pred, label)
-        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
-        return {
-            "all_class_accy": class_info['all_accy'],
-            "class_accy": class_info['class_accy'],
-            "class_confusion": class_info['class_confusion_matrices'],
-            "task_accy": task_info['all_accy'],
-            "task_confusion": task_info['task_confusion_matrices'],
-            "all_task_accy": task_info['task_accy'],
-        }
-
-    def get_task_prototype(self, model, train_loader):
-        model = model.eval()
-        model.to(self.device)
-        features = []
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                with autocast():
-                    feature = model.extract_feature(inputs)
-                features.append(feature.detach().cpu())
-        all_features = torch.cat(features, dim=0)
-        prototype = torch.mean(all_features, dim=0).to(self.device)
-        self._clear_gpu()
-        return prototype

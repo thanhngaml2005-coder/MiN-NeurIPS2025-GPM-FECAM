@@ -1,7 +1,3 @@
-""" Vision Transformer (ViT) in PyTorch
-
-Modified for MiN + MagMax + InfLoRA (Gradient Projection Memory)
-"""
 import copy
 import logging
 import math
@@ -18,164 +14,206 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.jit import Final
+import torch.fft # [QUAN TRỌNG] Thư viện Fast Fourier Transform
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm, PatchDropout, SwiGLUPacked, \
     trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, use_fused_attn, \
     get_act_layer, get_norm_layer, LayerType
-from timm.models._builder import build_model_with_cfg
-from timm.models._registry import register_model, generate_default_cfgs
 
-# [FIX IMPORT ERROR] Tự định nghĩa lại named_apply để tránh lỗi version timm
-def named_apply(fn, module, name='', depth_first=True, include_root=False):
-    if not depth_first and include_root:
-        fn(module=module, name=name)
-    for child_name, child_module in module.named_children():
-        child_name = '.'.join((name, child_name)) if name else child_name
-        named_apply(fn=fn, module=child_module, name=child_name, depth_first=depth_first, include_root=True)
-    if depth_first and include_root:
-        fn(module=module, name=name)
-
-__all__ = ['VisionTransformer']
-
+__all__ = ['VisionTransformer'] 
 
 _logger = logging.getLogger(__name__)
 
-# =========================================================================
-#  CORE MODULE: PiNoise (MiN + MagMax + InfLoRA/GPM)
-# =========================================================================
+# =============================================================================
+# [NEW CLASS] BiLORA_Linear với Frequency-MagMax
+# =============================================================================
+class BiLORA_Linear(nn.Module):
+    def __init__(self, in_features, out_features, k=2000): 
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.k = k # Số lượng tần số được phép học trong mỗi task
+        
+        # 1. Trọng số gốc (Base Weights - Luôn đóng băng)
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.bias = nn.Parameter(torch.Tensor(out_features))
+        
+        # 2. GLOBAL FREQUENCY MEMORY (Bộ nhớ tần số toàn cục)
+        # Kích thước ma trận tần số cho rfft2 (Real FFT)
+        # Chiều cao = out_features, Chiều rộng = in_features // 2 + 1
+        self.freq_h = out_features
+        self.freq_w = (in_features // 2) + 1
+        
+        # Buffer lưu trữ kiến thức tổng hợp (đã merge). 
+        # Dùng register_buffer để tránh lỗi mismatch device khi to(device)
+        self.register_buffer('global_freq_weight', torch.zeros((self.freq_h, self.freq_w), dtype=torch.cfloat))
+        
+        # 3. Task hiện tại (Trainable Parts)
+        # active_mask: Lưu chỉ số (index) của các tần số đang được train
+        # active_params: Lưu giá trị của các tần số đó
+        self.active_mask = None   
+        self.active_params = None 
+        
+        self.reset_parameters()
+        
+        # Freeze Base
+        self.weight.requires_grad = False
+        self.bias.requires_grad = False
+
+    def reset_parameters(self):
+        # Init theo chuẩn Kaiming
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def new_task(self):
+        """
+        Khởi tạo cho Task mới:
+        1. Sinh Mask ngẫu nhiên (chọn vị trí tần số để học).
+        2. Khởi tạo Active Parameters (giá trị tần số).
+        """
+        device = self.weight.device
+        
+        # A. Sinh Mask ngẫu nhiên
+        # Tổng số điểm tần số có thể chọn
+        total_freqs = self.freq_h * self.freq_w
+        
+        # Random permutation để lấy k chỉ số ngẫu nhiên
+        indices = torch.randperm(total_freqs)[:self.k].to(device)
+        
+        # Lưu mask vào buffer (không cần grad)
+        self.active_mask = indices
+        
+        # B. Sinh Parameter mới để train
+        # Khởi tạo giá trị nhỏ (Near-zero) để bắt đầu học mượt mà
+        self.active_params = nn.Parameter(torch.zeros(self.k, dtype=torch.cfloat, device=device))
+        nn.init.normal_(self.active_params.real, 0, 0.002)
+        nn.init.normal_(self.active_params.imag, 0, 0.002)
+
+    def perform_magmax_merge(self):
+        """
+        [TRÁI TIM CỦA THUẬT TOÁN]
+        Frequency-Domain MagMax Merge:
+        So sánh độ lớn (Magnitude) của tần số Task mới với Global Memory.
+        Nếu Task mới mạnh hơn -> Ghi đè.
+        """
+        if self.active_params is None or self.active_mask is None:
+            return
+
+        with torch.no_grad():
+            # 1. Tạo bản đồ tần số cho task hiện tại (Dense map)
+            current_task_dense = torch.zeros_like(self.global_freq_weight).view(-1)
+            current_task_dense[self.active_mask] = self.active_params
+            current_task_dense = current_task_dense.view(self.freq_h, self.freq_w)
+
+            # 2. So sánh độ lớn (Magnitude)
+            global_mag = self.global_freq_weight.abs()
+            current_mag = current_task_dense.abs()
+            
+            # 3. Tạo Mask cập nhật: Update ở đâu mà Task mới có tín hiệu mạnh hơn
+            # (Hoặc vị trí đó Global chưa có gì)
+            update_mask = (current_mag > global_mag)
+            
+            # 4. Ghi đè giá trị (MagMax Update)
+            self.global_freq_weight[update_mask] = current_task_dense[update_mask]
+            
+            # 5. Dọn dẹp biến tạm để giải phóng VRAM
+            self.active_params = None
+            self.active_mask = None
+
+    def get_delta_weight(self):
+        """Tái tạo Delta W (Update trọng số) từ miền tần số"""
+        # 1. Lấy kiến thức toàn cục
+        total_freq = self.global_freq_weight.clone()
+        
+        # 2. Nếu đang train, cộng thêm tín hiệu đang học (Active Params)
+        # (Chỉ cộng tạm thời vào luồng forward, chưa merge vĩnh viễn)
+        if self.active_params is not None and self.active_mask is not None:
+             flat_freq = total_freq.view(-1)
+             flat_freq.index_add_(0, self.active_mask, self.active_params)
+             total_freq = flat_freq.view(self.freq_h, self.freq_w)
+
+        # 3. Inverse FFT: Biến đổi ngược về miền trọng số thực
+        # irfft2 tự động xử lý tính đối xứng Hermitian để trả về số thực
+        delta_w = torch.fft.irfft2(total_freq, s=(self.out_features, self.in_features))
+        
+        # 4. Scale factor (Theo lý thuyết BiLORA để bảo toàn năng lượng)
+        scale = math.sqrt(self.out_features * self.in_features)
+        
+        return delta_w * scale
+
+    def forward(self, x):
+        # 1. Base Forward (Cố định)
+        base_out = F.linear(x, self.weight, self.bias)
+        
+        # 2. BiLORA Delta Forward
+        delta_w = self.get_delta_weight()
+        delta_out = F.linear(x, delta_w)
+        
+        return base_out + delta_out
+
+
+
+
+class Noise_weigh(nn.Module):
+    def __init__(self, init_value=1.):
+        super().__init__()
+        self.weight = torch.tensor(init_value, requires_grad=True)
+
+    def forward(self, x):
+        return x * self.weight
+
+
+import torch
+import torch.nn as nn
+import copy
 
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
         super(PiNoise, self).__init__()
         
-        # --- 1. Shared Fixed Parts (Projection) ---
+        # Projection Layers (Giữ nguyên)
         self.w_down = nn.Parameter(torch.empty((in_dim, hidden_dim)))
-        self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
-        
-        # Init Xavier Uniform
         nn.init.xavier_uniform_(self.w_down) 
+        self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
         nn.init.xavier_uniform_(self.w_up)
-        
-        # Freeze Projection Layers (MiN Core Principle)
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
 
         self.hidden_dim = hidden_dim
+        self.act = nn.GELU()
 
-        # --- 2. Trainable Parts (Noise Generator - Single Path) ---
-        # Đây là phần duy nhất được học
-        self.mu = nn.Linear(hidden_dim, hidden_dim)
-        self.sigma = nn.Linear(hidden_dim, hidden_dim)
-        
-        # Init Near-Zero (Để bắt đầu từ trạng thái giống backbone gốc)
-        self._init_zero(self.mu)
-        self._init_zero(self.sigma)
-
-        # --- 3. MagMax History Storage ---
-        self.history_mu = []    
-        self.history_sigma = [] 
-
-        # --- 4. InfLoRA / GPM Components (Gradient Projection) ---
-        # self.basis: Lưu các hướng (subspace) của các task cũ cần bảo vệ
-        self.register_buffer('basis', torch.empty(hidden_dim, 0))
-        
-        # Temporary buffers for Covariance Calculation (Scouting phase)
-        self.register_buffer('cur_matrix', torch.zeros(hidden_dim, hidden_dim))
-        self.register_buffer('n_cur_matrix', torch.tensor(0, dtype=torch.long))
-
-    def _init_zero(self, module, scale=1e-4):
-        """Khởi tạo trọng số cực nhỏ (Near-Zero)"""
-        nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
-        with torch.no_grad():
-            module.weight.data *= scale
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0.)
+        # [REPLACEMENT] Thay Linear thường bằng BiLORA_Linear
+        # k=1000 đến 2000 là mức an toàn cho hidden_dim=384
+        # Nó tương đương ~2-5% tham số, rất nhẹ.
+        self.mu = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
+        self.sigma = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
 
     def update_noise(self):
-        """Mở khóa Gradient cho task mới"""
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
-
-    def forward(self, hyper_features, get_cur_feat=False):
-        x_down = hyper_features @ self.w_down
-        
-        # [FIX 2] Race Condition mitigation: Chỉ tích lũy trên GPU đang chạy
-        # (Lưu ý: Logic gộp multi-gpu phải xử lý ở Trainer nếu dùng DDP)
-        if get_cur_feat:
-            x_flat = x_down.detach().reshape(-1, self.hidden_dim).float()
-            batch_n = x_flat.shape[0]
-            if batch_n > 0:
-                batch_corr = torch.mm(x_flat.T, x_flat)
-                # Moving Average Update
-                total_n = self.n_cur_matrix + batch_n
-                self.cur_matrix = (self.cur_matrix * self.n_cur_matrix + batch_corr) / total_n
-                self.n_cur_matrix = total_n
-
-        noise = self.mu(x_down) + self.sigma(x_down)
-        return hyper_features + (noise @ self.w_up)
-    def project_grad(self):
-        """
-        [CORE ALGORITHM] Gradient Projection
-        Hàm này được gọi TRƯỚC optimizer.step()
-        Nó cắt bỏ phần Gradient vuông góc với Task cũ.
-        """
-        if self.basis.shape[1] == 0: return # Chưa có task cũ, học tự do
-
-        targets = [self.mu, self.sigma]
-        for module in targets:
-            if module.weight.grad is not None:
-                # Grad: [Out, In]
-                # Basis: [In, k]
-                
-                # Chiếu Gradient lên không gian Basis: Proj = (Grad @ Basis) @ Basis.T
-                # Đây là thành phần vi phạm (gây quên)
-                grad_proj = (module.weight.grad @ self.basis) @ self.basis.T
-                
-                # Loại bỏ thành phần vi phạm -> Chỉ giữ lại hướng an toàn
-                module.weight.grad = module.weight.grad - grad_proj
+        """Kích hoạt Task mới"""
+        self.mu.new_task()
+        self.sigma.new_task()
 
     def after_task_training(self):
-        """Lưu Task Vector và MagMax Merge"""
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        """Kích hoạt Merge sau khi train"""
+        self.mu.perform_magmax_merge()
+        self.sigma.perform_magmax_merge()
+
+    def forward(self, hyper_features, new_forward=False):
+        # Pipeline: Down -> (Mu + Sigma) -> Up
+        x_down = hyper_features @ self.w_down
         
-        self.history_mu.append(mu_state)
-        self.history_sigma.append(sigma_state)
-
-        # Merge cứng
-        self._perform_parameter_magmax()
-
-    def _perform_parameter_magmax(self):
-        if not self.history_mu: return
-
-        def merge_state_dicts(history_list):
-            keys = history_list[0].keys()
-            merged_dict = {}
-            for key in keys:
-                stacked_params = torch.stack([d[key] for d in history_list], dim=0)
-                # Max Magnitude Selection
-                magnitudes = torch.abs(stacked_params)
-                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                best_param = torch.gather(stacked_params, 0, max_indices).squeeze(0)
-                merged_dict[key] = best_param.to(self.w_down.device)
-            return merged_dict
-
-        self.mu.load_state_dict(merge_state_dicts(self.history_mu))
-        self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
-
-    # Tương thích ngược
+        noise = self.mu(x_down) + self.sigma(x_down)
+        
+        return hyper_features + (noise @ self.w_up)
+    
+    # Hàm tương thích ngược
     def forward_new(self, hyper_features, **kwargs):
-        return self.forward(hyper_features, **kwargs)
+        return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
     def unfreeze_noise(self): self.update_noise()
-
-
-# =========================================================================
-#  STANDARD ViT BLOCKS (Keep Original)
-# =========================================================================
-
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
@@ -288,12 +326,232 @@ class Block(nn.Module):
         return x
 
 
-# =========================================================================
-#  MAIN ViT CLASS (Modified for GPM Integration)
-# =========================================================================
+class ResPostBlock(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            init_values: Optional[float] = None,
+            drop_path: float = 0.,
+            act_layer: nn.Module = nn.GELU,
+            norm_layer: nn.Module = nn.LayerNorm,
+            mlp_layer: nn.Module = Mlp,
+    ) -> None:
+        super().__init__()
+        self.init_values = init_values
+
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
+        )
+        self.norm1 = norm_layer(dim)
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.mlp = mlp_layer(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
+        self.norm2 = norm_layer(dim)
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        # NOTE this init overrides that base model init with specific changes for the block type
+        if self.init_values is not None:
+            nn.init.constant_(self.norm1.weight, self.init_values)
+            nn.init.constant_(self.norm2.weight, self.init_values)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path1(self.norm1(self.attn(x)))
+        x = x + self.drop_path2(self.norm2(self.mlp(x)))
+        return x
+
+
+class ParallelScalingBlock(nn.Module):
+    """ Parallel ViT block (MLP & Attention in parallel)
+    Based on:
+      'Scaling Vision Transformers to 22 Billion Parameters` - https://arxiv.org/abs/2302.05442
+    """
+    fused_attn: Final[bool]
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            init_values: Optional[float] = None,
+            drop_path: float = 0.,
+            act_layer: nn.Module = nn.GELU,
+            norm_layer: nn.Module = nn.LayerNorm,
+            mlp_layer: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = use_fused_attn()
+        mlp_hidden_dim = int(mlp_ratio * dim)
+        in_proj_out_dim = mlp_hidden_dim + 3 * dim
+
+        self.in_norm = norm_layer(dim)
+        self.in_proj = nn.Linear(dim, in_proj_out_dim, bias=qkv_bias)
+        self.in_split = [mlp_hidden_dim] + [dim] * 3
+        if qkv_bias:
+            self.register_buffer('qkv_bias', None)
+            self.register_parameter('mlp_bias', None)
+        else:
+            self.register_buffer('qkv_bias', torch.zeros(3 * dim), persistent=False)
+            self.mlp_bias = nn.Parameter(torch.zeros(mlp_hidden_dim))
+
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_out_proj = nn.Linear(dim, dim)
+
+        self.mlp_drop = nn.Dropout(proj_drop)
+        self.mlp_act = act_layer()
+        self.mlp_out_proj = nn.Linear(mlp_hidden_dim, dim)
+
+        self.ls = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+
+        # Combined MLP fc1 & qkv projections
+        y = self.in_norm(x)
+        if self.mlp_bias is not None:
+            # Concat constant zero-bias for qkv w/ trainable mlp_bias.
+            # Appears faster than adding to x_mlp separately
+            y = F.linear(y, self.in_proj.weight, torch.cat((self.qkv_bias, self.mlp_bias)))
+        else:
+            y = self.in_proj(y)
+        x_mlp, q, k, v = torch.split(y, self.in_split, dim=-1)
+
+        # Dot product attention w/ qk norm
+        q = self.q_norm(q.view(B, N, self.num_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(k.view(B, N, self.num_heads, self.head_dim)).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.fused_attn:
+            x_attn = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x_attn = attn @ v
+        x_attn = x_attn.transpose(1, 2).reshape(B, N, C)
+        x_attn = self.attn_out_proj(x_attn)
+
+        # MLP activation, dropout, fc2
+        x_mlp = self.mlp_act(x_mlp)
+        x_mlp = self.mlp_drop(x_mlp)
+        x_mlp = self.mlp_out_proj(x_mlp)
+
+        # Add residual w/ drop path & layer scale applied
+        y = self.drop_path(self.ls(x_attn + x_mlp))
+        x = x + y
+
+        return x
+
+
+class ParallelThingsBlock(nn.Module):
+    """ Parallel ViT block (N parallel attention followed by N parallel MLP)
+    Based on:
+      `Three things everyone should know about Vision Transformers` - https://arxiv.org/abs/2203.09795
+    """
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            num_parallel: int = 2,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            init_values: Optional[float] = None,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: nn.Module = nn.GELU,
+            norm_layer: nn.Module = nn.LayerNorm,
+            mlp_layer: nn.Module = Mlp,
+    ) -> None:
+        super().__init__()
+        self.num_parallel = num_parallel
+        self.attns = nn.ModuleList()
+        self.ffns = nn.ModuleList()
+        for _ in range(num_parallel):
+            self.attns.append(nn.Sequential(OrderedDict([
+                ('norm', norm_layer(dim)),
+                ('attn', Attention(
+                    dim,
+                    num_heads=num_heads,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    norm_layer=norm_layer,
+                )),
+                ('ls', LayerScale(dim, init_values=init_values) if init_values else nn.Identity()),
+                ('drop_path', DropPath(drop_path) if drop_path > 0. else nn.Identity())
+            ])))
+            self.ffns.append(nn.Sequential(OrderedDict([
+                ('norm', norm_layer(dim)),
+                ('mlp', mlp_layer(
+                    dim,
+                    hidden_features=int(dim * mlp_ratio),
+                    act_layer=act_layer,
+                    drop=proj_drop,
+                )),
+                ('ls', LayerScale(dim, init_values=init_values) if init_values else nn.Identity()),
+                ('drop_path', DropPath(drop_path) if drop_path > 0. else nn.Identity())
+            ])))
+
+    def _forward_jit(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + torch.stack([attn(x) for attn in self.attns]).sum(dim=0)
+        x = x + torch.stack([ffn(x) for ffn in self.ffns]).sum(dim=0)
+        return x
+
+    @torch.jit.ignore
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + sum(attn(x) for attn in self.attns)
+        x = x + sum(ffn(x) for ffn in self.ffns)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            return self._forward_jit(x)
+        else:
+            return self._forward(x)
+
 
 class VisionTransformer(nn.Module):
-    """ Vision Transformer with MiN + InfLoRA Support """
+    """ Vision Transformer
+
+    A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
+        - https://arxiv.org/abs/2010.11929
+    """
     dynamic_img_size: Final[bool]
 
     def __init__(
@@ -331,6 +589,33 @@ class VisionTransformer(nn.Module):
             mlp_layer: Type[nn.Module] = Mlp,
             args: dict = None,
     ) -> None:
+        """
+        Args:
+            img_size: Input image size.
+            patch_size: Patch size.
+            in_chans: Number of image input channels.
+            num_classes: Mumber of classes for classification head.
+            global_pool: Type of global pooling for final sequence (default: 'token').
+            embed_dim: Transformer embedding dimension.
+            depth: Depth of transformer.
+            num_heads: Number of attention heads.
+            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
+            qkv_bias: Enable bias for qkv projections if True.
+            init_values: Layer-scale init values (layer-scale enabled if not None).
+            class_token: Use class token.
+            no_embed_class: Don't include position embeddings for class (or reg) tokens.
+            reg_tokens: Number of register tokens.
+            fc_norm: Pre head norm after pool (instead of before), if None, enabled when global_pool == 'avg'.
+            drop_rate: Head dropout rate.
+            pos_drop_rate: Position embedding dropout rate.
+            attn_drop_rate: Attention dropout rate.
+            drop_path_rate: Stochastic depth rate.
+            weight_init: Weight initialization scheme.
+            embed_layer: Patch embedding layer.
+            norm_layer: Normalization layer.
+            act_layer: MLP activation layer.
+            block_fn: Transformer block layer.
+        """
         super().__init__()
         assert global_pool in ('', 'avg', 'token', 'map')
         assert class_token or global_pool != 'token'
@@ -338,26 +623,32 @@ class VisionTransformer(nn.Module):
         norm_layer = get_norm_layer(norm_layer) or partial(nn.LayerNorm, eps=1e-6)
         act_layer = get_act_layer(act_layer) or nn.GELU
 
+        # # test
+        # self.noise_maker = PiNoise(768, 768)
+        # # over
+
+
         self.num_classes = num_classes
         self.global_pool = global_pool
-        self.num_features = self.embed_dim = embed_dim
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.num_prefix_tokens = 1 if class_token else 0
         self.num_prefix_tokens += reg_tokens
         self.num_reg_tokens = reg_tokens
         self.has_class_token = class_token
-        self.no_embed_class = no_embed_class
+        self.no_embed_class = no_embed_class  # don't embed prefix positions (includes reg)
         self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = False
 
         embed_args = {}
         if dynamic_img_size:
+            # flatten deferred until after pos embed
             embed_args.update(dict(strict_img_size=False, output_fmt='NHWC'))
         self.patch_embed = embed_layer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
-            bias=not pre_norm,
+            bias=not pre_norm,  # disable bias if pre-norm is used (e.g. CLIP)
             dynamic_img_pad=dynamic_img_pad,
             **embed_args,
         )
@@ -377,7 +668,7 @@ class VisionTransformer(nn.Module):
             self.patch_drop = nn.Identity()
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.Sequential(*[
             block_fn(
                 dim=embed_dim,
@@ -394,12 +685,9 @@ class VisionTransformer(nn.Module):
                 mlp_layer=mlp_layer,
             )
             for i in range(depth)])
-        
-        # --- PiNoise Injection ---
         self.noise_maker = nn.Sequential(*[
-            PiNoise(embed_dim, embed_dim, args.get('hidden_dim', 384)) for i in range(depth)
+            PiNoise(768, 768, args['hidden_dim']) for i in range(depth)
         ])
-        
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
         # Classifier Head
@@ -419,116 +707,6 @@ class VisionTransformer(nn.Module):
         if weight_init != 'skip':
             self.init_weights(weight_init)
 
-    # --- CORE GPM FUNCTIONS (NEW) ---
-
-    def update_GPM(self, threshold=0.85):
-        """
-        Tính toán SVD, cập nhật Basis và kiểm tra độ bão hòa không gian.
-        """
-        print(f"--> [GPM] Calculating Orthogonal Basis (Threshold={threshold})...")
-        updated_layers = 0
-        
-        # Dùng enumerate để lấy index 'i' cho việc log
-        for i, module in enumerate(self.noise_maker):
-            # 1. Lấy ma trận Covariance (R)
-            R = module.cur_matrix.float()
-            if R.sum() == 0: continue # Layer chưa được kích hoạt
-
-            # 2. Tính Eigen-decomposition
-            try:
-                S, U = torch.linalg.eigh(R) 
-                S = S.flip(0) 
-                U = U.flip(1)
-            except:
-                U, S, V = torch.linalg.svd(R)
-
-            # 3. Chọn Rank k
-            s_sq = S.abs()
-            s_sum = torch.sum(s_sq)
-            if s_sum == 0: continue
-            
-            s_cum = torch.cumsum(s_sq, dim=0) / s_sum
-            k = torch.searchsorted(s_cum, threshold).item() + 1
-            
-            # Safety Cap: Giới hạn 90% để tránh lỗi tính toán khi full rank
-            max_k = int(R.shape[0] * 0.90)
-            k = min(k, max_k)
-            
-            if k == 0: continue
-
-            # New Basis Candidates
-            new_basis = U[:, :k] 
-
-            # 4. Modified Gram-Schmidt & Double Projection (Chống nhiễu số học)
-            if module.basis.shape[1] > 0:
-                # Lần 1: Chiếu
-                projection = torch.matmul(module.basis, torch.matmul(module.basis.T, new_basis))
-                new_basis_residual = new_basis - projection
-                
-                # Lần 2: Chiếu lại (Double Projection) để triệt tiêu sai số cực nhỏ
-                projection_2 = torch.matmul(module.basis, torch.matmul(module.basis.T, new_basis_residual))
-                new_basis_residual = new_basis_residual - projection_2
-                
-                # Normalize
-                norms = torch.norm(new_basis_residual, dim=0)
-                valid_indices = norms > 1e-5 # Lọc bỏ các vector đã nằm trong không gian cũ
-                
-                if valid_indices.sum() > 0:
-                    new_basis_clean = new_basis_residual[:, valid_indices]
-                    new_basis_clean = new_basis_clean / norms[valid_indices]
-                    
-                    # Ghép vào buffer
-                    module.basis = torch.cat((module.basis, new_basis_clean), dim=1)
-            else:
-                module.basis = new_basis
-
-            updated_layers += 1
-            
-            # 5. Reset bộ đệm Covariance
-            module.cur_matrix.zero_()
-            module.n_cur_matrix.zero_()
-
-            # =================================================================
-            # [SATURATION CHECK] KIỂM TRA "ĐỘ CHẬT" CỦA KHÔNG GIAN
-            # =================================================================
-            current_dims = module.basis.shape[1]
-            total_dims = module.basis.shape[0] # Hidden dim (ví dụ 384 hoặc 768)
-            usage_pct = (current_dims / total_dims) * 100
-            
-            print(f"    Layer {i:02d}: Basis Size {current_dims}/{total_dims} ({usage_pct:.2f}%)")
-            
-            if usage_pct > 90.0:
-                print(f"    [WARNING] Layer {i} is SATURATED (>90%)! Consider reducing threshold.")
-            # =================================================================
-            
-        print(f"--> [GPM] Updated basis for {updated_layers} layers.")
-    # Sửa forward_features để truyền tham số đúng
-    def forward_features(self, x: torch.Tensor, new_forward: bool = False, get_cur_feat: bool = False) -> torch.Tensor:
-        x = self.patch_embed(x)
-        x = self._pos_embed(x)
-        x = self.patch_drop(x)
-        x = self.norm_pre(x)
-
-        for i in range(len(self.blocks)):
-            blk_out = self.blocks[i](x)
-            # [FIX 1] Truyền get_cur_feat vào cả 2 nhánh
-            if new_forward:
-                x = self.noise_maker[i].forward_new(blk_out, get_cur_feat=get_cur_feat)
-            else:
-                x = self.noise_maker[i](blk_out, get_cur_feat=get_cur_feat)
-                
-        x = self.norm(x)
-        return x
-    def project_grads(self):
-        """
-        Gọi hàm project_grad() của từng layer PiNoise.
-        Cần gọi hàm này trong Trainer Loop trước optimizer.step().
-        """
-        for module in self.noise_maker:
-            module.project_grad()
-
-    # --- END CORE GPM FUNCTIONS ---
-
     def init_weights(self, mode: Literal['jax', 'jax_nlhb', 'moco', ''] = '') -> None:
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
@@ -538,6 +716,7 @@ class VisionTransformer(nn.Module):
         named_apply(get_init_weights_vit(mode, head_bias), self)
 
     def _init_weights(self, m: nn.Module) -> None:
+        # this fn left here for compat with downstream users
         init_weights_vit_timm(m)
 
     @torch.jit.ignore()
@@ -570,7 +749,7 @@ class VisionTransformer(nn.Module):
             if global_pool == 'map' and self.attn_pool is None:
                 assert False, "Cannot currently add attention pooling in reset_classifier()."
             elif global_pool != 'map ' and self.attn_pool is not None:
-                self.attn_pool = None 
+                self.attn_pool = None  # remove attention pooling
             self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
@@ -593,17 +772,83 @@ class VisionTransformer(nn.Module):
             to_cat.append(self.reg_token.expand(x.shape[0], -1, -1))
 
         if self.no_embed_class:
+            # deit-3, updated JAX (big vision)
+            # position embedding does not overlap with class token, add then concat
             x = x + pos_embed
             if to_cat:
                 x = torch.cat(to_cat + [x], dim=1)
         else:
+            # original timm, JAX, and deit vit impl
+            # pos_embed has entry for class token, concat then add
             if to_cat:
                 x = torch.cat(to_cat + [x], dim=1)
             x = x + pos_embed
 
         return self.pos_drop(x)
 
-    
+    def _intermediate_layers(
+            self,
+            x: torch.Tensor,
+            n: Union[int, Sequence] = 1,
+    ) -> List[torch.Tensor]:
+        outputs, num_blocks = [], len(self.blocks)
+        take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
+
+        # forward pass
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            if i in take_indices:
+                outputs.append(x)
+
+        return outputs
+
+    def get_intermediate_layers(
+            self,
+            x: torch.Tensor,
+            n: Union[int, Sequence] = 1,
+            reshape: bool = False,
+            return_prefix_tokens: bool = False,
+            norm: bool = False,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
+        """ Intermediate layer accessor (NOTE: This is a WIP experiment).
+        Inspired by DINO / DINOv2 interface
+        """
+        # take last n blocks if n is an int, if in is a sequence, select by matching indices
+        outputs = self._intermediate_layers(x, n)
+        if norm:
+            outputs = [self.norm(out) for out in outputs]
+        prefix_tokens = [out[:, 0:self.num_prefix_tokens] for out in outputs]
+        outputs = [out[:, self.num_prefix_tokens:] for out in outputs]
+
+        if reshape:
+            grid_size = self.patch_embed.grid_size
+            outputs = [
+                out.reshape(x.shape[0], grid_size[0], grid_size[1], -1).permute(0, 3, 1, 2).contiguous()
+                for out in outputs
+            ]
+
+        if return_prefix_tokens:
+            return tuple(zip(outputs, prefix_tokens))
+        return tuple(outputs)
+
+    def forward_features(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+
+        for i in range(len(self.blocks)):
+            if new_forward:
+                x = self.noise_maker[i].forward_new(self.blocks[i](x))
+            else:
+                x = self.noise_maker[i](self.blocks[i](x))
+        x = self.norm(x)
+        return x
+
     def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
         if self.attn_pool is not None:
             x = self.attn_pool(x)
@@ -615,8 +860,11 @@ class VisionTransformer(nn.Module):
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x: torch.Tensor, new_forward: bool = False, get_cur_feat: bool = False) -> torch.Tensor:
-        x = self.forward_features(x, new_forward=new_forward, get_cur_feat=get_cur_feat)
+    def forward(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
+        if new_forward:
+            x = self.forward_features(x, new_forward=new_forward)
+        else:
+            x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
