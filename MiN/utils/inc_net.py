@@ -189,69 +189,49 @@ class MiNbaseNet(nn.Module):
         # Đảm bảo features cùng kiểu với trọng số RLS (float32)
         features = features.to(self.weight) 
         return features @ self.weight
+
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Huấn luyện Analytical Classifier sử dụng Recursive Least Squares (RLS).
-        Phiên bản ổn định cao (Robust Version) sử dụng Cholesky Solve.
+        Thuật toán Recursive Least Squares (RLS).
+        Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
         """
-        # [QUAN TRỌNG] Tắt Autocast: RLS cần độ chính xác FP32 để không bị lỗi ma trận suy biến
-        with torch.cuda.amp.autocast(enabled=False):
+        # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
+        with autocast(enabled=False):
             # 1. Feature Extraction & Expansion
-            # Chuyển về float32 ngay lập tức
-            X = self.backbone(X).float() 
-            if hasattr(self, 'buffer'):
-                X = self.buffer(X) # Random Expansion (nếu có)
+            X = self.backbone(X).float() # ViT Features
+            X = self.buffer(X)           # Random Expansion -> float32
             
-            # Đưa về cùng device với trọng số RLS
+            # Đưa về cùng device
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
-            # 2. Mở rộng chiều của Classifier (Dynamic Expansion)
-            # Nếu số lớp trong Y lớn hơn số lớp hiện tại của weight, ta mở rộng ma trận
+            # 2. Mở rộng chiều của classifier nếu có lớp mới
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
+                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
                 self.weight = torch.cat((self.weight, tail), dim=1)
             elif num_targets < self.weight.shape[1]:
-                # Trường hợp hiếm: Y ít lớp hơn (ví dụ chỉ batch của task cũ), pad Y thêm số 0
                 increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
+                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # 3. Tính toán RLS Update (Woodbury Matrix Identity)
-            # Công thức gốc: P_new = P - P X^T (I + X P X^T)^-1 X P
-            # Đặt term = (I + X P X^T)
-            
-            I = torch.eye(X.shape[0], device=X.device)
+            # 3. Công thức cập nhật RLS
+            I = torch.eye(X.shape[0]).to(X)
             term = I + X @ self.R @ X.T
             
-            # [STABILITY FIX 1] Thêm Jitter để đảm bảo ma trận không bị suy biến (Singular)
+            # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
-            term_stable = term + jitter
             
-            # [STABILITY FIX 2] Dùng Cholesky Solve thay vì Inverse trực tiếp
-            # Tính term_inv = (term_stable)^-1
-            try:
-                # Cholesky nhanh và ổn định cho ma trận đối xứng dương (Symmetric Positive Definite)
-                L = torch.linalg.cholesky(term_stable)
-                term_inv = torch.cholesky_solve(I, L)
-            except RuntimeError:
-                # Fallback: Nếu Cholesky fail (rất hiếm), dùng linalg.solve thường (chậm hơn chút nhưng an toàn)
-                term_inv = torch.linalg.solve(term_stable, I)
+            # Nghịch đảo ma trận
+            K = torch.inverse(term + jitter)
             
-            # Tính Kalman Gain: K = P * X^T * term_inv
-            # self.R chính là ma trận P (Inverse Covariance Matrix)
-            K = self.R @ X.T @ term_inv
+            # Cập nhật R (Covariance Matrix)
+            self.R -= self.R @ X.T @ K @ X @ self.R
             
-            # 4. Cập nhật Ma trận hiệp phương sai (R)
-            # R_new = R - K * X * R
-            self.R = self.R - K @ X @ self.R
-            
-            # 5. Cập nhật Trọng số Classifier (Weight)
-            # W_new = W + K * (Y - X * W)
-            # (Y - X @ self.weight) là Prediction Error
-            self.weight = self.weight + K @ (Y - X @ self.weight)
+            # Cập nhật Trọng số Classifier
+            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+
     # =========================================================================
     # [FORWARD PASSES]
     # =========================================================================
@@ -299,75 +279,11 @@ class MiNbaseNet(nn.Module):
             "logits": logits
         }
     def update_GPM(self, threshold=0.965):
-        """
-        [InfLoRA Step 2] Tính toán SVD và cập nhật Basis (Modified Gram-Schmidt)
-        threshold: Ngưỡng năng lượng giữ lại (Default 0.965 là mức an toàn)
-        """
-        # Nếu muốn dùng Dynamic Threshold (tăng dần theo task), uncomment đoạn dưới:
-        # current_task = self.backbone.cur_task if hasattr(self.backbone, 'cur_task') else 0
-        # total_tasks = 10 # Hoặc lấy từ args
-        # threshold = 0.96 + (0.99 - 0.96) * (current_task / total_tasks)
-        
-        print(f"--> [GPM] Calculating Orthogonal Basis (Threshold={threshold})...")
-        
-        updated_layers = 0
-        for module in self.backbone.noise_maker:
-            # Lấy ma trận covariance đã hứng được (phải là float32)
-            R = module.cur_matrix.float()
-            if R.sum() == 0: continue
+        """Wrapper gọi xuống Backbone để tính SVD"""
+        if hasattr(self.backbone, 'update_GPM'):
+            self.backbone.update_GPM(threshold=threshold)
 
-            # 1. Tính SVD: R = U * S * V^T
-            # R đối xứng nên dùng eigh nhanh và ổn định hơn
-            try:
-                S, U = torch.linalg.eigh(R)
-                S = S.flip(0) # Sắp xếp giảm dần
-                U = U.flip(1)
-            except:
-                U, S, V = torch.linalg.svd(R)
-
-            # 2. Chọn số lượng vector (Rank) dựa trên threshold năng lượng
-            s_sq = S.abs()
-            s_sum = torch.sum(s_sq)
-            s_cum = torch.cumsum(s_sq, dim=0) / s_sum
-            k = torch.searchsorted(s_cum, threshold).item() + 1
-            
-            # Giới hạn k để không chiếm hết không gian (chừa chỗ cho task sau)
-            max_k = int(R.shape[0] * 0.95) # Không bao giờ lấy quá 95% chiều
-            if k > max_k: k = max_k
-            
-            if k == 0: 
-                module.cur_matrix.zero_()
-                module.n_cur_matrix.zero_()
-                continue
-
-            # Basis đề xuất từ task mới
-            new_basis = U[:, :k] # [Hidden, k]
-
-            # 3. [CRITICAL] Orthonormalize against OLD Basis (Modified Gram-Schmidt)
-            if module.basis.shape[1] > 0:
-                # Trực giao hóa vector mới với basis cũ
-                # new_basis_ortho = new_basis - P_old(new_basis)
-                projection = torch.matmul(module.basis.T, new_basis)
-                new_basis_residual = new_basis - torch.matmul(module.basis, projection)
-                
-                # Normalize lại
-                norms = torch.norm(new_basis_residual, dim=0)
-                # Chỉ lấy những vector có norm đủ lớn (chưa nằm trong không gian cũ)
-                valid_indices = norms > 1e-6 
-                
-                if valid_indices.sum() > 0:
-                    new_basis_clean = new_basis_residual[:, valid_indices]
-                    new_basis_clean = new_basis_clean / norms[valid_indices]
-                    
-                    # Ghép vào basis cũ
-                    module.basis = torch.cat((module.basis, new_basis_clean), dim=1)
-            else:
-                module.basis = new_basis
-
-            updated_layers += 1
-            
-            # 5. Reset bộ đệm
-            module.cur_matrix.zero_()
-            module.n_cur_matrix.zero_()
-            
-        print(f"--> [GPM] Updated basis for {updated_layers} layers.")
+    def project_grads(self):
+        """Wrapper gọi xuống Backbone để chiếu Gradient"""
+        if hasattr(self.backbone, 'project_grads'):
+            self.backbone.project_grads()

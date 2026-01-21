@@ -40,7 +40,6 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.jit import Final
 
-
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm, PatchDropout, SwiGLUPacked, \
@@ -66,9 +65,9 @@ import torch
 import torch.nn as nn
 import copy
 
-class InfLoRA_PiNoise(nn.Module):
+class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
-        super(InfLoRA_PiNoise, self).__init__()
+        super(PiNoise, self).__init__()
         
         # --- Shared Fixed Parts ---
         self.MLP = nn.Linear(in_dim, out_dim)
@@ -81,11 +80,6 @@ class InfLoRA_PiNoise(nn.Module):
         nn.init.xavier_uniform_(self.w_up)
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
-        
-        self.register_buffer('basis', torch.empty(hidden_dim, 0)) 
-        # cur_matrix: Dùng để hứng dữ liệu (Covariance Matrix)
-        self.register_buffer('cur_matrix', torch.zeros(hidden_dim, hidden_dim))
-        self.register_buffer('n_cur_matrix', torch.tensor(0, dtype=torch.long))
 
         self.hidden_dim = hidden_dim
         self.act = nn.GELU()
@@ -96,20 +90,19 @@ class InfLoRA_PiNoise(nn.Module):
         self.sigma = nn.Linear(hidden_dim, hidden_dim)
         
         # Init = 0 (Base)
-        self._init_near_zero(self.mu)
-        self._init_near_zero(self.sigma)
-        self.mu_fixed = None 
-        self.sigma_fixed = None
+        self._init_zero(self.mu)
+        self._init_zero(self.sigma)
+
         # --- History Storage (CPU) ---
         # Lưu các "Task Vectors" (chính là bộ weight của từng task sau khi train)
         self.history_mu = []    
         self.history_sigma = [] 
-
-    # def _init_zero(self, module):
-    #     torch.nn.init.constant_(module.weight, 0.)
-    #     torch.nn.init.constant_(module.bias, 0.)
-
-    def _init_near_zero(self, module, scale=1e-4):
+        self.register_buffer('basis', torch.empty(hidden_dim, 0))
+        
+        # Buffers tạm để tính Covariance (Chỉ dùng khi Scouting)
+        self.register_buffer('cur_matrix', torch.zeros(hidden_dim, hidden_dim))
+        self.register_buffer('n_cur_matrix', torch.tensor(0, dtype=torch.long))
+    def _init_zero(self, module, scale=1e-4):
         """
         Khởi tạo trọng số ngẫu nhiên nhưng với biên độ cực nhỏ (Near-Zero).
         Giúp phá vỡ đối xứng (Symmetry Breaking) nhưng vẫn giữ noise ban đầu xấp xỉ 0.
@@ -126,119 +119,86 @@ class InfLoRA_PiNoise(nn.Module):
             nn.init.constant_(module.bias, 0.)
     def update_noise(self):
         """
-        [DUAL PATH LOGIC]
-        Trước khi train task mới:
-        1. Copy trọng số hiện tại sang nhánh Frozen (Fixed).
-        2. Reset trọng số Trainable về 0 (để học Delta).
+        [Bước 2]: Sequential Init.
+        Không reset weight. Giữ nguyên weight (đã merge từ task trước) để train tiếp.
+        Chỉ cần mở khóa gradient.
         """
-        # 1. Tạo bản sao đóng băng (Memory Path)
-        self.mu_fixed = copy.deepcopy(self.mu)
-        self.sigma_fixed = copy.deepcopy(self.sigma)
-        
-        for p in self.mu_fixed.parameters(): p.requires_grad = False
-        for p in self.sigma_fixed.parameters(): p.requires_grad = False
-        
-        # 2. Reset Trainable Path (Learning Path)
-        # Vì đây là Dual Path, nhánh này học phần "thêm vào" (Residual),
-        # nên ta reset nó về 0 chứ không để nó kế thừa giá trị cũ (tránh bị double output).
-        self._init_near_zero(self.mu)
-        self._init_near_zero(self.sigma)
-        
-        # 3. Mở khóa gradient
         for param in self.mu.parameters(): param.requires_grad = True
         for param in self.sigma.parameters(): param.requires_grad = True
-    def unfreeze_noise(self):
-        self.update_noise()
-    def after_task_training(self):
-        """
-        [MERGE STEP]
-        Sau khi train xong, ta gộp Delta (Trainable) vào Memory (Fixed)
-        để tạo thành trọng số thống nhất cho MagMax.
-        """
-        if self.mu_fixed is not None:
-            # W_final = W_fixed + W_delta
-            # Vì W_delta học trên không gian trực giao, việc cộng này ít gây can nhiễu.
-            with torch.no_grad():
-                self.mu.weight.data.add_(self.mu_fixed.weight.data)
-                self.mu.bias.data.add_(self.mu_fixed.bias.data)
-                
-                self.sigma.weight.data.add_(self.sigma_fixed.weight.data)
-                self.sigma.bias.data.add_(self.sigma_fixed.bias.data)
-            
-            # Xóa nhánh fixed để tiết kiệm bộ nhớ
-            self.mu_fixed = None
-            self.sigma_fixed = None
 
-        # --- MagMax Logic (Giữ nguyên) ---
+ 
+    def forward(self, hyper_features, new_forward=False):
+        x_down = hyper_features @ self.w_down
+        
+        # 2. [InfLoRA Step] Thu thập dữ liệu (Scouting)
+        # Chỉ chạy SAU KHI TRAIN xong mỗi task để tính Basis cho tương lai
+        if get_cur_feat:
+            x_flat = x_down.detach().reshape(-1, self.hidden_dim).float()
+            
+            # Tích lũy Covariance Matrix Online
+            batch_n = x_flat.shape[0]
+            if batch_n > 0:
+                batch_corr = torch.mm(x_flat.T, x_flat)
+                total_n = self.n_cur_matrix + batch_n
+                self.cur_matrix = (self.cur_matrix * self.n_cur_matrix + batch_corr) / total_n
+                self.n_cur_matrix = total_n
+
+        # 3. Noise Generation (Single Path)
+        # QUAN TRỌNG: Input đi thẳng vào (x_down), KHÔNG BỊ CHIẾU.
+        # Điều này giúp Acc tăng nhanh, không bị "Sốc Input".
+        noise = self.mu(x_down) + self.sigma(x_down)
+        
+        # 4. Residual Connection
+        return hyper_features + (noise @ self.w_up)
+    def project_grad(self):
+        """
+        [CORE GPM] Chiếu Gradient lên Null Space.
+        Gọi TRƯỚC optimizer.step().
+        """
+        if self.basis.shape[1] == 0: return
+
+        targets = [self.mu, self.sigma]
+        for module in targets:
+            if module.weight.grad is not None:
+                # Grad: [Out, In] | Basis: [In, k]
+                # Chiếu Grad lên Basis: Proj = (Grad @ Basis) @ Basis.T
+                grad_proj = (module.weight.grad @ self.basis) @ self.basis.T
+                
+                # Loại bỏ thành phần trùng khớp với task cũ (Trực giao hóa)
+                module.weight.grad = module.weight.grad - grad_proj
+
+    def after_task_training(self):
+        """Lưu Task Vector và Merge MagMax"""
         mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
         sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
         
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
+
+        # Merge cứng
         self._perform_parameter_magmax()
-
     def _perform_parameter_magmax(self):
-        # (Giữ nguyên logic MagMax cũ của bạn)
         if not self.history_mu: return
-        def merge(history):
-            keys = history[0].keys()
-            merged = {}
-            for k in keys:
-                stacked = torch.stack([d[k] for d in history], dim=0)
-                best = torch.gather(stacked, 0, torch.argmax(torch.abs(stacked), dim=0, keepdim=True)).squeeze(0)
-                merged[k] = best.to(self.w_down.device)
-            return merged
-        self.mu.load_state_dict(merge(self.history_mu))
-        self.sigma.load_state_dict(merge(self.history_sigma))
-    def forward(self, x, get_cur_feat=False):
-        x_down = x @ self.w_down
 
-        # --- Step 1: Thu thập dữ liệu (trên input gốc) ---
-        if get_cur_feat:
-            x_flat = x_down.detach().reshape(-1, self.hidden_dim).float()
-            batch_corr = torch.mm(x_flat.T, x_flat) 
-            total = self.n_cur_matrix + x_flat.shape[0]
-            self.cur_matrix = (self.cur_matrix * self.n_cur_matrix + batch_corr) / total
-            self.n_cur_matrix = total
+        def merge_state_dicts(history_list):
+            keys = history_list[0].keys()
+            merged_dict = {}
+            for key in keys:
+                stacked_params = torch.stack([d[key] for d in history_list], dim=0)
+                # Max Magnitude Selection
+                magnitudes = torch.abs(stacked_params)
+                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
+                best_param = torch.gather(stacked_params, 0, max_indices).squeeze(0)
+                merged_dict[key] = best_param.to(self.w_down.device)
+            return merged_dict
 
-        # --- DUAL PATH FORWARD ---
-        
-        # Nhánh 1: Frozen Path (Luôn chạy trên input gốc đầy đủ)
-        # Giúp giữ tri thức cũ không bị sốc
-        noise_fixed = 0
-        if self.mu_fixed is not None:
-            with torch.no_grad():
-                noise_fixed = self.mu_fixed(x_down) + self.sigma_fixed(x_down)
+        self.mu.load_state_dict(merge_state_dicts(self.history_mu))
+        self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
 
-        # Nhánh 2: Trainable Path (Chạy trên input đã chiếu trực giao)
-        x_train = x_down
-        if self.basis.shape[1] > 0 and self.training:
-            # Chiếu input để tìm phần dư mới: x_safe = x - Px
-            proj = (x_down @ self.basis) @ self.basis.T
-            x_residual = x_down - proj 
-        
-            norm_original = torch.norm(x_down, dim=-1, keepdim=True)
-            norm_residual = torch.norm(x_residual, dim=-1, keepdim=True)
-            
-            # Scale factor: Kéo residual to bằng original
-            scaler = norm_original / (norm_residual + 1e-6)
-            
-            # Chặn scaler không cho quá lớn (tránh nổ gradient với noise)
-            scaler = torch.clamp(scaler, max=10.0) 
-            
-            x_train = x_residual * scaler
-
-        # Học trên không gian đã được cân bằng năng lượng
-        noise_train = self.mu(x_train) + self.sigma(x_train)
-
-        # Tổng hợp
-        total_noise = noise_fixed + noise_train
-
-        return x + (total_noise @ self.w_up)
-    def forward_new(self, hyper_features):
-        return self.forward(hyper_features)
+    # Tương thích ngược
+    def forward_new(self, hyper_features): return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
-    
+    def unfreeze_noise(self): self.update_noise()
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
@@ -589,7 +549,6 @@ class VisionTransformer(nn.Module):
             global_pool: Literal['', 'avg', 'token', 'map'] = 'token',
             embed_dim: int = 768,
             depth: int = 12,
-            hidden_dim = 384,
             num_heads: int = 12,
             mlp_ratio: float = 4.,
             qkv_bias: bool = True,
@@ -713,7 +672,7 @@ class VisionTransformer(nn.Module):
             )
             for i in range(depth)])
         self.noise_maker = nn.Sequential(*[
-            InfLoRA_PiNoise(768, 768, args['hidden_dim']) for i in range(depth)
+            PiNoise(768, 768, args['hidden_dim']) for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
@@ -733,12 +692,6 @@ class VisionTransformer(nn.Module):
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
-        self.layer_num = depth
-        self.noise_maker = nn.ModuleList([
-            InfLoRA_PiNoise(embed_dim, embed_dim, hidden_dim=hidden_dim) 
-            for _ in range(depth)
-        ])
-        self.embed_dim = embed_dim
 
     def init_weights(self, mode: Literal['jax', 'jax_nlhb', 'moco', ''] = '') -> None:
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
@@ -867,35 +820,97 @@ class VisionTransformer(nn.Module):
         if return_prefix_tokens:
             return tuple(zip(outputs, prefix_tokens))
         return tuple(outputs)
+    def update_GPM(self, threshold=0.965):
+        """
+        Tính toán SVD và cập nhật Basis.
+        """
+        print(f"--> [GPM] Calculating Orthogonal Basis (Threshold={threshold})...")
+        updated_layers = 0
+        
+        for module in self.noise_maker:
+            R = module.cur_matrix.float()
+            if R.sum() == 0: continue 
 
-    def forward_features(self, x: torch.Tensor, get_cur_feat = False) -> torch.Tensor:
+            # 1. Eigen-decomposition (Symmetric matrix)
+            try:
+                S, U = torch.linalg.eigh(R) 
+                S = S.flip(0) 
+                U = U.flip(1)
+            except:
+                U, S, V = torch.linalg.svd(R)
+
+            # 2. Select Rank k
+            s_sq = S.abs()
+            s_sum = torch.sum(s_sq)
+            if s_sum == 0: continue
+            
+            s_cum = torch.cumsum(s_sq, dim=0) / s_sum
+            k = torch.searchsorted(s_cum, threshold).item() + 1
+            max_k = int(R.shape[0] * 0.95) # Cap at 95%
+            k = min(k, max_k)
+            
+            if k == 0: continue
+
+            # 3. Modified Gram-Schmidt (Orthogonality check)
+            new_basis = U[:, :k] 
+            
+            if module.basis.shape[1] > 0:
+                projection = torch.matmul(module.basis, torch.matmul(module.basis.T, new_basis))
+                new_basis_residual = new_basis - projection
+                norms = torch.norm(new_basis_residual, dim=0)
+                valid_indices = norms > 1e-5
+                
+                if valid_indices.sum() > 0:
+                    new_basis_clean = new_basis_residual[:, valid_indices]
+                    new_basis_clean = new_basis_clean / norms[valid_indices]
+                    module.basis = torch.cat((module.basis, new_basis_clean), dim=1)
+            else:
+                module.basis = new_basis
+
+            updated_layers += 1
+            # Reset buffers
+            module.cur_matrix.zero_()
+            module.n_cur_matrix.zero_()
+            
+        print(f"--> [GPM] Updated basis for {updated_layers} layers.")
+
+    def project_grads(self):
+        """Trigger projection in all layers"""
+        for module in self.noise_maker:
+            module.project_grad()
+    def forward_features(self, x: torch.Tensor, new_forward: bool = False, get_cur_feat: bool = False) -> torch.Tensor:
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
 
-        for i, blk in enumerate(self.blocks):
-            x = blk(x)
-            # Truyền cờ get_cur_feat xuống Noise Module
-            x = self.noise_maker[i](x, get_cur_feat=get_cur_feat)
-            
+        for i in range(len(self.blocks)):
+            # ViT Block
+            blk_out = self.blocks[i](x)
+            # PiNoise Injection
+            if new_forward:
+                x = self.noise_maker[i].forward_new(blk_out)
+            else:
+                x = self.noise_maker[i](blk_out, get_cur_feat=get_cur_feat)
+                
         x = self.norm(x)
         return x
-
     def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
-        if self.global_pool == 'avg':
-            # Giả sử token đầu là CLS, lấy avg các token sau
-            x = x[:, 1:].mean(dim=1)
-        elif self.global_pool == 'token':
-            x = x[:, 0]
+        if self.attn_pool is not None:
+            x = self.attn_pool(x)
+        elif self.global_pool == 'avg':
+            x = x[:, self.num_prefix_tokens:].mean(dim=1)
+        elif self.global_pool:
+            x = x[:, 0]  # class token
+        x = self.fc_norm(x)
+        x = self.head_drop(x)
+        return x if pre_logits else self.head(x)
+
+    def forward(self, x: torch.Tensor, new_forward: bool = False, get_cur_feat: bool = False) -> torch.Tensor:
+        x = self.forward_features(x, new_forward=new_forward, get_cur_feat=get_cur_feat)
+        x = self.forward_head(x)
         return x
 
-    def forward(self, x: torch.Tensor, get_cur_feat=False):
-        x = self.forward_features(x, get_cur_feat=get_cur_feat)
-        x = self.forward_head(x)
-        # --- [FIX ISSUE 1a] Return Tensor features ---
-        # Trả về Tensor [B, Dim] để MiNbaseNet xử lý tiếp (vào Buffer -> Classifier)
-        return x
 def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
     """ ViT weight initialization, original timm impl (for reproducibility) """
     if isinstance(module, nn.Linear):
