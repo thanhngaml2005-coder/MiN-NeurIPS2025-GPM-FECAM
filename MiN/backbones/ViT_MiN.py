@@ -25,7 +25,17 @@ from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm,
     trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, use_fused_attn, \
     get_act_layer, get_norm_layer, LayerType
 from timm.models._builder import build_model_with_cfg
-from timm.models._registry import register_model, generate_default_cfgs, named_apply
+from timm.models._registry import register_model, generate_default_cfgs
+
+# [FIX IMPORT ERROR] Tự định nghĩa lại named_apply để tránh lỗi version timm
+def named_apply(fn, module, name='', depth_first=True, include_root=False):
+    if not depth_first and include_root:
+        fn(module=module, name=name)
+    for child_name, child_module in module.named_children():
+        child_name = '.'.join((name, child_name)) if name else child_name
+        named_apply(fn=fn, module=child_module, name=child_name, depth_first=depth_first, include_root=True)
+    if depth_first and include_root:
+        fn(module=module, name=name)
 
 __all__ = ['VisionTransformer']
 
@@ -54,7 +64,7 @@ class PiNoise(nn.Module):
 
         self.hidden_dim = hidden_dim
 
-        # --- 2. Trainable Parts (Noise Generator) ---
+        # --- 2. Trainable Parts (Noise Generator - Single Path) ---
         # Đây là phần duy nhất được học
         self.mu = nn.Linear(hidden_dim, hidden_dim)
         self.sigma = nn.Linear(hidden_dim, hidden_dim)
@@ -88,7 +98,6 @@ class PiNoise(nn.Module):
         for param in self.mu.parameters(): param.requires_grad = True
         for param in self.sigma.parameters(): param.requires_grad = True
 
-    # [FIXED HERE] Thêm keyword get_cur_feat=False
     def forward(self, hyper_features, get_cur_feat=False):
         # 1. Down-projection (Fixed)
         x_down = hyper_features @ self.w_down
@@ -166,7 +175,8 @@ class PiNoise(nn.Module):
         self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
 
     # Tương thích ngược
-    def forward_new(self, hyper_features): return self.forward(hyper_features)
+    def forward_new(self, hyper_features): 
+        return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
     def unfreeze_noise(self): self.update_noise()
 
@@ -450,7 +460,7 @@ class VisionTransformer(nn.Module):
             s_cum = torch.cumsum(s_sq, dim=0) / s_sum
             k = torch.searchsorted(s_cum, threshold).item() + 1
             
-            # Safety Cap: Không bao giờ lấy quá 95% số chiều
+            # Safety Cap: Không bao giờ lấy quá 95% số chiều (để chừa đường cho task sau)
             max_k = int(R.shape[0] * 0.95)
             k = min(k, max_k)
             
@@ -586,7 +596,6 @@ class VisionTransformer(nn.Module):
             if new_forward: # Tương thích code cũ
                 x = self.noise_maker[i].forward_new(blk_out)
             else:
-                # [CRITICAL] Đây là nơi gọi xuống PiNoise
                 x = self.noise_maker[i](blk_out, get_cur_feat=get_cur_feat)
                 
         x = self.norm(x)
@@ -608,28 +617,6 @@ class VisionTransformer(nn.Module):
         x = self.forward_head(x)
         return x
 
-# ... (Các hàm helper init weights giữ nguyên) ...
-def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
-    if isinstance(module, nn.Linear):
-        trunc_normal_(module.weight, std=.02)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-    elif hasattr(module, 'init_weights'):
-        module.init_weights()
-
-def get_init_weights_vit(mode: str = 'jax', head_bias: float = 0.0) -> None:
-    if 'jax' in mode:
-        return partial(init_weights_vit_jax, head_bias=head_bias)
-    elif 'moco' in mode:
-        return init_weights_vit_moco
-    else:
-        return init_weights_vit_timm
-
-# Helper functions _load_weights, checkpoint_filter_fn, _convert_openai_clip, etc. 
-# PLEASE KEEP THE ORIGINAL HELPER FUNCTIONS FROM THE FILE YOU PROVIDED. 
-# DO NOT DELETE THEM AS THEY ARE NEEDED FOR LOADING PRETRAINED WEIGHTS.
-# (Due to length limits, I assume they are already in your file. 
-# Just make sure to paste the classes PiNoise, VisionTransformer above them)
 
 def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
     """ ViT weight initialization, original timm impl (for reproducibility) """
