@@ -15,8 +15,6 @@ from torch.utils.data import WeightedRandomSampler
 from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
-
-# Dùng Autocast cho nhẹ (nhưng optimizer vẫn là SGD như config)
 from torch.amp import autocast, GradScaler
 
 class MinNet(object):
@@ -28,7 +26,6 @@ class MinNet(object):
         self.device = args['device']
         self.num_workers = args["num_workers"]
 
-        # [LẤY CONFIG GỐC]
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
         self.init_weight_decay = args["init_weight_decay"]
@@ -97,7 +94,7 @@ class MinNet(object):
         return targets
 
     # =========================================================================
-    # TASK 0
+    # TASK 0 (Quy trình 3 bước)
     # =========================================================================
     def init_train(self, data_manger):
         self.cur_task += 1
@@ -106,9 +103,7 @@ class MinNet(object):
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
-        # Loader cho SGD (Batch to)
         train_loader_noise = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
-        # Loader cho Analytic (Batch nhỏ - 64 như config)
         train_loader_analytic = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
@@ -124,7 +119,7 @@ class MinNet(object):
         self.logger.info(">>> Step 1: Analytic Warm-up...")
         self.fit_fc(train_loader_analytic)
 
-        # STEP 2: Train BiLORA Noise (Dùng SGD như config)
+        # STEP 2: Train BiLORA Noise
         self.logger.info(">>> Step 2: Training BiLORA Noise...")
         self.run(train_loader_noise)
 
@@ -141,7 +136,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # TASK > 0
+    # TASK > 0 (Quy trình 3 bước)
     # =========================================================================
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -183,7 +178,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # ANALYTIC FITTING
+    # ANALYTIC FITTING (FIXED BUG 'fc')
     # =========================================================================
     def fit_fc(self, train_loader):
         self._network.eval()
@@ -194,7 +189,10 @@ class MinNet(object):
         for _ in prog_bar:
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets_onehot = F.one_hot(targets, num_classes=self._network.fc.out_features).float()
+                
+                # [FIXED HERE]: Dùng normal_fc.out_features để lấy số class hiện tại
+                num_classes = self._network.normal_fc.out_features
+                targets_onehot = F.one_hot(targets, num_classes=num_classes).float()
                 
                 with autocast('cuda', enabled=False):
                     self._network.fit(inputs, targets_onehot)
@@ -213,11 +211,11 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        # 1. Freeze All
+        # Freeze All
         for param in self._network.parameters():
             param.requires_grad = False
             
-        # 2. Unfreeze BiLORA
+        # Unfreeze BiLORA
         if self.cur_task == 0:
             self._network.init_unfreeze()
         else:
@@ -226,10 +224,8 @@ class MinNet(object):
         params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
         if not params: return
 
-        # 3. GET OPTIMIZER TỪ CONFIG (SGD)
-        # Hàm get_optimizer trong utils/training_tool.py sẽ tự đọc args['optimizer_type'] = 'sgd'
+        # Optimizer (SGD từ config)
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
-        # GET SCHEDULER TỪ CONFIG (STEP)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
         self._network.train()
@@ -250,7 +246,6 @@ class MinNet(object):
 
                 self.scaler.scale(loss).backward()
                 
-                # [SAFETY] Vẫn giữ clip grad để BiLORA ko bị NaN với SGD
                 self.scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 
