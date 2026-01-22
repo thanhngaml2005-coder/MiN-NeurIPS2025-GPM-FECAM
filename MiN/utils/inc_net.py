@@ -103,7 +103,7 @@ class MiNbaseNet(nn.Module):
             del self.normal_fc
             self.normal_fc = new_fc
         else:
-            nn.init.constant_(new_fc.weight, 0.)
+            nn.init.kaiming_normal_(new_fc.weight, mode='fan_out', nonlinearity='relu')
             if new_fc.bias is not None:
                 nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
