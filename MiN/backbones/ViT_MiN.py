@@ -1,3 +1,28 @@
+""" Vision Transformer (ViT) in PyTorch
+
+A PyTorch implement of Vision Transformers as described in:
+
+'An Image Is Worth 16 x 16 Words: Transformers for Image Recognition at Scale'
+    - https://arxiv.org/abs/2010.11929
+
+`How to train your ViT? Data, Augmentation, and Regularization in Vision Transformers`
+    - https://arxiv.org/abs/2106.10270
+
+`FlexiViT: One Model for All Patch Sizes`
+    - https://arxiv.org/abs/2212.08013
+
+The official jax code is released and available at
+  * https://github.com/google-research/vision_transformer
+  * https://github.com/google-research/big_vision
+
+Acknowledgments:
+  * The paper authors for releasing code and weights, thanks!
+  * I fixed my class token impl based on Phil Wang's https://github.com/lucidrains/vit-pytorch
+  * Simple transformer style inspired by Andrej Karpathy's https://github.com/karpathy/minGPT
+  * Bert reference code checks against Huggingface Transformers and Tensorflow Bert
+
+Hacked together by / Copyright 2020, Ross Wightman
+"""
 import copy
 import logging
 import math
@@ -14,7 +39,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.jit import Final
-import torch.fft # [QUAN TRỌNG] Thư viện Fast Fourier Transform
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
@@ -22,121 +46,12 @@ from timm.layers import PatchEmbed, Mlp, DropPath, AttentionPoolLatent, RmsNorm,
     trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, use_fused_attn, \
     get_act_layer, get_norm_layer, LayerType
 
-__all__ = ['VisionTransformer'] 
+__all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to this
+
 
 _logger = logging.getLogger(__name__)
 
-# =============================================================================
-# [NEW CLASS] BiLORA_Linear với Frequency-MagMax
-# =============================================================================
-class BiLORA_Linear(nn.Module):
-    def __init__(self, in_features, out_features, k=2000): 
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.k = k 
-        
-        # 1. Trọng số gốc
-        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.bias = nn.Parameter(torch.Tensor(out_features))
-        
-        # 2. Global Memory (Vẫn giữ Complex vì đây là Buffer, không phải Parameter train)
-        self.freq_h = out_features
-        self.freq_w = (in_features // 2) + 1
-        self.register_buffer('global_freq_weight', torch.zeros((self.freq_h, self.freq_w), dtype=torch.cfloat))
-        
-        # 3. Task hiện tại
-        self.active_mask = None   
-        self.active_params = None 
-        
-        self.reset_parameters()
-        
-        self.weight.requires_grad = False
-        self.bias.requires_grad = False
 
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def new_task(self):
-        """Khởi tạo task mới"""
-        device = self.weight.device
-        
-        # A. Sinh Mask
-        total_freqs = self.freq_h * self.freq_w
-        indices = torch.randperm(total_freqs)[:self.k].to(device)
-        self.active_mask = indices
-        
-        # B. Sinh Parameter mới (FIX: Dùng Float32 shape (k, 2))
-        # Thay vì complex64, ta dùng float32 với chiều cuối = 2 (Real, Imag)
-        # Điều này đánh lừa Scaler rằng đây là tensor thực bình thường.
-        self.active_params = nn.Parameter(torch.zeros(self.k, 2, dtype=torch.float32, device=device))
-        
-        # Init normal
-        nn.init.normal_(self.active_params, 0, 0.002)
-
-    def perform_magmax_merge(self):
-        if self.active_params is None or self.active_mask is None:
-            return
-
-        with torch.no_grad():
-            # [TRICK] Chuyển đổi từ (k, 2) Float -> (k) Complex ngay trước khi merge
-            # view_as_complex yêu cầu input tensor phải có dimension cuối là 2
-            params_complex = torch.view_as_complex(self.active_params)
-            
-            # 1. Tạo bản đồ tần số
-            current_task_dense = torch.zeros_like(self.global_freq_weight).view(-1)
-            
-            # Fix lỗi device mismatch (nếu có)
-            mask = self.active_mask.to(self.global_freq_weight.device)
-            params_complex = params_complex.to(self.global_freq_weight.device)
-            
-            current_task_dense[mask] = params_complex
-            current_task_dense = current_task_dense.view(self.freq_h, self.freq_w)
-
-            # 2. So sánh độ lớn
-            global_mag = self.global_freq_weight.abs()
-            current_mag = current_task_dense.abs()
-            
-            # 3. MagMax Update
-            update_mask = (current_mag > global_mag)
-            self.global_freq_weight[update_mask] = current_task_dense[update_mask]
-            
-            self.active_params = None
-            self.active_mask = None
-
-    def get_delta_weight(self):
-        # 1. Lấy kiến thức toàn cục
-        total_freq = self.global_freq_weight.clone()
-        
-        # 2. Cộng thêm tín hiệu đang học
-        if self.active_params is not None and self.active_mask is not None:
-             flat_freq = total_freq.view(-1)
-             
-             # [TRICK] Chuyển đổi Float(k, 2) -> Complex(k) on-the-fly
-             params_complex = torch.view_as_complex(self.active_params)
-             
-             # Đảm bảo cùng device
-             mask = self.active_mask.to(flat_freq.device)
-             params_complex = params_complex.to(flat_freq.device)
-             
-             flat_freq.index_add_(0, mask, params_complex)
-             total_freq = flat_freq.view(self.freq_h, self.freq_w)
-
-        # 3. Inverse FFT
-        delta_w = torch.fft.irfft2(total_freq, s=(self.out_features, self.in_features))
-        
-        scale = math.sqrt(self.out_features * self.in_features)
-        return delta_w * scale
-
-    def forward(self, x):
-        base_out = F.linear(x, self.weight, self.bias)
-        delta_w = self.get_delta_weight()
-        delta_out = F.linear(x, delta_w)
-        return base_out + delta_out
 class Noise_weigh(nn.Module):
     def __init__(self, init_value=1.):
         super().__init__()
@@ -149,49 +64,173 @@ class Noise_weigh(nn.Module):
 import torch
 import torch.nn as nn
 import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# =========================================================================
+# [UPDATED] BILORA MODULE: NEAR-ZERO INIT & MAGMAX
+# =========================================================================
+class BiLORA_Linear(nn.Module):
+    def __init__(self, in_features, out_features, k=1500):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.k = k
+        
+        # Kích thước miền tần số
+        self.freq_h = out_features
+        self.freq_w = in_features // 2 + 1
+        
+        # 1. Global Freq Weight: Lưu trữ kiến thức tích lũy (Merged)
+        self.register_buffer('global_freq_weight', torch.zeros((self.freq_h, self.freq_w), dtype=torch.cfloat))
+        
+        # 2. Active Params: Tham số train cho task hiện tại
+        # Dạng vector thưa (Sparse) kích thước k
+        self.active_params = nn.Parameter(torch.zeros(k, dtype=torch.cfloat))
+        self.register_buffer('active_indices', torch.zeros(k, dtype=torch.long))
+        
+        self.is_initialized = False
+
+    def init_zero(self, scale=1e-4):
+        """
+        [THEO YÊU CẦU CỦA BẠN]: Near-Zero Initialization.
+        Khởi tạo ngẫu nhiên nhưng scale cực nhỏ để xấp xỉ 0.
+        """
+        # Khởi tạo ngẫu nhiên cho phần thực và ảo
+        # Dùng normal_ thay vì kaiming vì active_params là vector 1D, không phải ma trận weight đầy đủ
+        nn.init.normal_(self.active_params.real, mean=0.0, std=0.02)
+        nn.init.normal_(self.active_params.imag, mean=0.0, std=0.02)
+        
+        # Scale nhỏ lại (Near Zero)
+        with torch.no_grad():
+            self.active_params.data *= scale
+
+    def new_task(self):
+        """
+        [Start New Task]
+        1. Chọn k vị trí tần số ngẫu nhiên mới.
+        2. Reset active_params về trạng thái Near-Zero.
+        """
+        total_freqs = self.freq_h * self.freq_w
+        
+        # 1. Chọn vị trí ngẫu nhiên
+        indices = torch.randperm(total_freqs)[:self.k].to(self.global_freq_weight.device)
+        self.active_indices.copy_(indices)
+        
+        # 2. Reset Active Params (Near Zero)
+        self.init_zero() 
+        self.active_params.requires_grad = True
+        self.is_initialized = True
+
+    def forward(self, x):
+        # 1. Tái tạo trọng số: Global (Cũ) + Active (Mới)
+        current_freq_weight = self.global_freq_weight.clone()
+        
+        if self.is_initialized:
+            # Scatter add: Cộng dồn nhiễu mới vào nền tảng cũ
+            flat_weight = current_freq_weight.view(-1)
+            flat_weight.scatter_add_(0, self.active_indices, self.active_params)
+            current_freq_weight = flat_weight.view(self.freq_h, self.freq_w)
+            
+        # 2. IFFT (Frequency -> Spatial)
+        spatial_weight = torch.fft.irfft2(current_freq_weight, s=(self.out_features, self.in_features))
+        
+        # 3. Linear Projection
+        return F.linear(x, spatial_weight)
+
+    def merge_task(self):
+        """
+        [MAGMAX MERGING]
+        So sánh Element-wise Magnitude giữa (Global cũ) và (Task mới).
+        """
+        if not self.is_initialized: return
+
+        with torch.no_grad():
+            # 1. Tạo ma trận update thưa
+            update_matrix = torch.zeros_like(self.global_freq_weight).view(-1)
+            update_matrix.scatter_(0, self.active_indices, self.active_params)
+            update_matrix = update_matrix.view(self.freq_h, self.freq_w)
+            
+            # 2. Trọng số của Task hiện tại = Global cũ + Phần mới học
+            task_freq_weight = self.global_freq_weight + update_matrix
+            
+            # 3. MagMax: So sánh độ lớn (Magnitude)
+            mag_task = torch.abs(task_freq_weight)
+            mag_global = torch.abs(self.global_freq_weight)
+            
+            # Mask: Vị trí nào Task mới mạnh hơn thì lấy
+            mask = mag_task > mag_global
+            
+            # Update Global
+            self.global_freq_weight[:] = torch.where(mask, task_freq_weight, self.global_freq_weight)
+            
+            # 4. Freeze Active (Dọn dẹp)
+            self.init_zero() # Reset về near zero
+            self.active_params.requires_grad = False
+
 
 class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=384):
+    def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
         
-        # Projection Layers (Giữ nguyên)
+        # --- Shared Fixed Parts (Giữ nguyên) ---
+        self.MLP = nn.Linear(in_dim, out_dim)
+        torch.nn.init.constant_(self.MLP.weight, 0)
+        torch.nn.init.constant_(self.MLP.bias, 0)
+
         self.w_down = nn.Parameter(torch.empty((in_dim, hidden_dim)))
         nn.init.xavier_uniform_(self.w_down) 
         self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
         nn.init.xavier_uniform_(self.w_up)
 
-        self.hidden_dim = hidden_dim
-        self.act = nn.GELU()
-
-        # [REPLACEMENT] Thay Linear thường bằng BiLORA_Linear
-        # k=1000 đến 2000 là mức an toàn cho hidden_dim=384
-        # Nó tương đương ~2-5% tham số, rất nhẹ.
+        # --- Trainable Parts (BiLORA) ---
+        # k=1500, hidden_dim=192 (Mặc định)
         self.mu = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
         self.sigma = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
+        
+        # Init lần đầu
+        self.init_zero()
+
+    def init_zero(self):
+        # Gọi vào hàm near-zero init của BiLORA
+        self.mu.init_zero()
+        self.sigma.init_zero()
 
     def update_noise(self):
-        """Kích hoạt Task mới"""
+        # Bắt đầu task mới
         self.mu.new_task()
         self.sigma.new_task()
 
-    def after_task_training(self):
-        """Kích hoạt Merge sau khi train"""
-        self.mu.perform_magmax_merge()
-        self.sigma.perform_magmax_merge()
+    def after_task_training(self): 
+        # Merge MagMax
+        self.mu.merge_task()
+        self.sigma.merge_task()
 
     def forward(self, hyper_features, new_forward=False):
-        # Pipeline: Down -> (Mu + Sigma) -> Up
+        # Down-project
         x_down = hyper_features @ self.w_down
         
-        noise = self.mu(x_down) + self.sigma(x_down)
+        # BiLORA Forward
+        mu = self.mu(x_down)
+        sigma = self.sigma(x_down)
         
-        return hyper_features + (noise @ self.w_up)
+        # Reparameterization
+        epsilon = torch.randn_like(mu)
+        noise = epsilon * sigma + mu 
+        
+        # Up-project & Residual
+        return self.MLP(hyper_features) + (noise @ self.w_up) + hyper_features
     
-    # Hàm tương thích ngược
-    def forward_new(self, hyper_features, **kwargs):
-        return self.forward(hyper_features)
-    def init_weight_noise(self, prototypes): pass
-    def unfreeze_noise(self): self.update_noise()
+    # Helpers
+    def unfreeze_noise(self):
+        self.mu.active_params.requires_grad = True
+        self.sigma.active_params.requires_grad = True
+        
+    def forward_new(self, x): return self.forward(x)
+    def init_weight_noise(self, p): pass
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 

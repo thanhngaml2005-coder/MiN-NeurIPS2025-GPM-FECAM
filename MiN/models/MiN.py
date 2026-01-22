@@ -7,20 +7,17 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import copy
-import gc  # Để dọn rác bộ nhớ
+import gc
 import os
 
 from utils.inc_net import MiNbaseNet
 from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
-# Mixed Precision
+# Dùng Autocast cho nhẹ (nhưng optimizer vẫn là SGD như config)
 from torch.amp import autocast, GradScaler
-
-EPSILON = 1e-8
 
 class MinNet(object):
     def __init__(self, args, loger):
@@ -31,6 +28,7 @@ class MinNet(object):
         self.device = args['device']
         self.num_workers = args["num_workers"]
 
+        # [LẤY CONFIG GỐC]
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
         self.init_weight_decay = args["init_weight_decay"]
@@ -43,17 +41,12 @@ class MinNet(object):
 
         self.init_class = args["init_class"]
         self.increment = args["increment"]
-
-        self.buffer_size = args["buffer_size"]
-        self.buffer_batch = args["buffer_batch"]
-        self.gamma = args['gamma']
         self.fit_epoch = args["fit_epochs"]
+        self.buffer_batch = args["buffer_batch"]
 
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        self.class_acc = []
-        self.task_acc = []
         
         self.scaler = GradScaler('cuda')
 
@@ -67,312 +60,21 @@ class MinNet(object):
             self.known_class = self.init_class
         else:
             self.known_class += self.increment
-
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
         eval_res = self.eval_task(test_loader)
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
-        self.logger.info('total acc: {}'.format(self.total_acc))
-        self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
-        print('total acc: {}'.format(self.total_acc))
-        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        self.logger.info(f"Total Acc: {self.total_acc} | Avg: {np.mean(self.total_acc):.2f}")
         del test_set
 
-    def save_check_point(self, path_name):
-        torch.save(self._network.state_dict(), path_name)
-
-    def compute_test_acc(self, test_loader):
-        model = self._network.eval()
-        correct, total = 0, 0
-        device = self.device
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(device)
-                outputs = model(inputs)
-                logits = outputs["logits"]
-                predicts = torch.max(logits, dim=1)[1]
-                correct += (predicts.cpu() == targets).sum()
-                total += len(targets)
-        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-
-    @staticmethod
-    def cat2order(targets, datamanger):
-        for i in range(len(targets)):
-            targets[i] = datamanger.map_cat2order(targets[i])
-        return targets
-
-    def init_train(self, data_manger):
-        # --- TASK 0 ---
-        self.cur_task += 1
-        train_list, test_list, train_list_name = data_manger.get_task_list(0)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
-
-        train_set = data_manger.get_task_data(source="train", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        self.test_loader = test_loader
-
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = True
-
-        self._network.update_fc(self.init_class)
-        
-        # [STEP 1] Kích hoạt BiLORA (Sinh Mask & Params)
-        self._network.update_noise()
-        
-        self._clear_gpu()
-        
-        # [STEP 2] Training Loop
-        self.run(train_loader)
-        
-        # [STEP 3] MagMax Merge trong miền tần số
-        self._network.after_task_magmax_merge()
-        
-        self._clear_gpu()
-        
-        # [STEP 4] Analytic Classifier Fit
-        # Dùng buffer_batch lớn để fit RLS
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-        self.fit_fc(train_loader, test_loader)
-
-        # Refit (Optional - Tăng độ chính xác)
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
-
-        self.re_fit(train_loader, test_loader)
-        
-        del train_set, test_set
-        self._clear_gpu()
-
-    def increment_train(self, data_manger):
-        # --- INCREMENTAL TASKS ---
-        self.cur_task += 1
-        train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
-
-        train_set = data_manger.get_task_data(source="train", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        self.test_loader = test_loader
-
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
-
-        self.fit_fc(train_loader, test_loader)
-
-        self._network.update_fc(self.increment)
-
-        # [STEP 1] Kích hoạt BiLORA cho task mới
-        self._network.update_noise()
-        
-        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
-        
-        self._clear_gpu()
-
-        # [STEP 2] Training Loop
-        self.run(train_loader)
-        
-        # [STEP 3] MagMax Merge
-        self._network.after_task_magmax_merge()
-        self._clear_gpu()
-
-        del train_set
-
-        # [STEP 4] Re-fit Analytic Classifier
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                    num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                    num_workers=self.num_workers)
-
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
-
-        self.re_fit(train_loader, test_loader)
-
-        del train_set, test_set
-        self._clear_gpu()
-
-    def fit_fc(self, train_loader, test_loader):
-        self._network.eval()
-        self._network.to(self.device)
-
-        prog_bar = tqdm(range(self.fit_epoch))
-        for _, epoch in enumerate(prog_bar):
-            self._network.to(self.device)
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets = torch.nn.functional.one_hot(targets)
-                # Analytic Fit -> KHÔNG dùng Autocast ở đây (đã handle trong inc_net)
-                self._network.fit(inputs, targets)
-            
-            info = "Task {} --> Update Analytical Classifier!".format(
-                self.cur_task,
-            )
-            self.logger.info(info)
-            prog_bar.set_description(info)
-            self._clear_gpu()
-
-    def re_fit(self, train_loader, test_loader):
-        self._network.eval()
-        self._network.to(self.device)
-        prog_bar = tqdm(train_loader)
-        for i, (_, inputs, targets) in enumerate(prog_bar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            targets = torch.nn.functional.one_hot(targets)
-            self._network.fit(inputs, targets)
-
-            info = "Task {} --> Reupdate Analytical Classifier!".format(
-                self.cur_task,
-            )
-            
-            self.logger.info(info)
-            prog_bar.set_description(info)
-        self._clear_gpu()
-
-    def run(self, train_loader):
-        if self.cur_task == 0:
-            epochs = self.init_epochs
-            lr = self.init_lr
-            weight_decay = self.init_weight_decay
-            patience = 10 # Task 0 cần kiên nhẫn hơn chút
-        else:
-            epochs = self.epochs 
-            lr = self.lr 
-            weight_decay = self.weight_decay
-            patience = 5  # Các task sau nếu 5 epoch ko giảm thì dừng luôn
-
-        # Setup Early Stopping vars
-        best_loss = float('inf')
-        patience_counter = 0
-        min_delta = 1e-4 # Mức giảm tối thiểu để được coi là "có cải thiện"
-
-        for param in self._network.parameters():
-            param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
-            param.requires_grad = True
-            
-        if self.cur_task == 0:
-            self._network.init_unfreeze()
-        else:
-            self._network.unfreeze_noise()
-            
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
-        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
-        scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
-
-        prog_bar = tqdm(range(epochs))
-        self._network.train()
-        self._network.to(self.device)
-        
-        for _, epoch in enumerate(prog_bar):
-            losses = 0.0
-            correct, total = 0, 0
-
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                optimizer.zero_grad(set_to_none=True) 
-
-                with autocast('cuda', enabled=True):
-                    if self.cur_task > 0:
-                        with torch.no_grad():
-                            outputs1 = self._network(inputs, new_forward=False)
-                            logits1 = outputs1['logits']
-                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
-                        logits_final = logits2
-                    else:
-                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
-                        logits_final = logits
-
-                self.scaler.scale(loss).backward()
-                self.scaler.step(optimizer)
-                self.scaler.update()
-                
-                losses += loss.item()
-
-                _, preds = torch.max(logits_final, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-                
-                del inputs, targets, loss, logits_final
-
-            scheduler.step()
-            train_acc = 100. * correct / total
-            avg_loss = losses / len(train_loader)
-
-            info = "Task {} --> Epoch {}/{} | Loss {:.3f} | Acc {:.2f} | Patience {}/{}".format(
-                self.cur_task, epoch + 1, epochs, avg_loss, train_acc, patience_counter, patience
-            )
-            self.logger.info(info)
-            prog_bar.set_description(info)
-            
-            if epoch % 5 == 0:
-                self._clear_gpu()
-
-            # ==========================================
-            # [EARLY STOPPING LOGIC]
-            # ==========================================
-            if avg_loss < best_loss - min_delta:
-                best_loss = avg_loss
-                patience_counter = 0 # Reset bộ đếm nếu loss giảm
-            else:
-                patience_counter += 1 # Tăng bộ đếm nếu loss không giảm
-                
-            if patience_counter >= patience:
-                print(f"\n[Early Stopping] Loss didn't improve for {patience} epochs. Stop training at Epoch {epoch+1}.")
-                self.logger.info(f"[Early Stopping] Triggered at Epoch {epoch+1}")
-                break
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        # [ADDED] no_grad
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                
                 outputs = model(inputs)
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
@@ -382,9 +84,183 @@ class MinNet(object):
         task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
         return {
             "all_class_accy": class_info['all_accy'],
-            "class_accy": class_info['class_accy'],
-            "class_confusion": class_info['class_confusion_matrices'],
-            "task_accy": task_info['all_accy'],
-            "task_confusion": task_info['task_confusion_matrices'],
-            "all_task_accy": task_info['task_accy'],
+            "task_confusion": task_info['task_confusion_matrices']
         }
+    
+    def save_check_point(self, path_name):
+        torch.save(self._network.state_dict(), path_name)
+    
+    @staticmethod
+    def cat2order(targets, datamanger):
+        for i in range(len(targets)):
+            targets[i] = datamanger.map_cat2order(targets[i])
+        return targets
+
+    # =========================================================================
+    # TASK 0
+    # =========================================================================
+    def init_train(self, data_manger):
+        self.cur_task += 1
+        train_list, test_list, _ = data_manger.get_task_list(0)
+        
+        train_set = data_manger.get_task_data(source="train", class_list=train_list)
+        train_set.labels = self.cat2order(train_set.labels, data_manger)
+        
+        # Loader cho SGD (Batch to)
+        train_loader_noise = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
+        # Loader cho Analytic (Batch nhỏ - 64 như config)
+        train_loader_analytic = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+
+        if self.args['pretrained']:
+            for param in self._network.backbone.parameters():
+                param.requires_grad = False
+                
+        self._network.update_fc(self.init_class)
+        self._network.update_noise() 
+        self._network.to(self.device)
+        self._clear_gpu()
+
+        # STEP 1: Analytic Warm-up
+        self.logger.info(">>> Step 1: Analytic Warm-up...")
+        self.fit_fc(train_loader_analytic)
+
+        # STEP 2: Train BiLORA Noise (Dùng SGD như config)
+        self.logger.info(">>> Step 2: Training BiLORA Noise...")
+        self.run(train_loader_noise)
+
+        # STEP 3: Merge & Refit
+        self.logger.info(">>> Step 3: MagMax Merge & Refit...")
+        self._network.after_task_magmax_merge()
+        
+        del train_set
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
+        train_loader_refit = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        
+        self.fit_fc(train_loader_refit)
+        self._clear_gpu()
+
+    # =========================================================================
+    # TASK > 0
+    # =========================================================================
+    def increment_train(self, data_manger):
+        self.cur_task += 1
+        train_list, test_list, _ = data_manger.get_task_list(self.cur_task)
+
+        train_set = data_manger.get_task_data(source="train", class_list=train_list)
+        train_set.labels = self.cat2order(train_set.labels, data_manger)
+
+        train_loader_noise = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        train_loader_analytic = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        
+        if self.args['pretrained']:
+            for param in self._network.backbone.parameters():
+                param.requires_grad = False
+                
+        self._network.update_fc(self.increment) 
+        self._network.update_noise()
+        self._network.to(self.device)
+        self._clear_gpu()
+
+        # STEP 1
+        self.logger.info(">>> Step 1: Analytic Update...")
+        self.fit_fc(train_loader_analytic)
+
+        # STEP 2
+        self.logger.info(">>> Step 2: Training BiLORA Noise...")
+        self.run(train_loader_noise)
+
+        # STEP 3
+        self.logger.info(">>> Step 3: MagMax Merge & Refit...")
+        self._network.after_task_magmax_merge()
+        
+        del train_set
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
+        train_loader_refit = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        
+        self.fit_fc(train_loader_refit)
+        self._clear_gpu()
+
+    # =========================================================================
+    # ANALYTIC FITTING
+    # =========================================================================
+    def fit_fc(self, train_loader):
+        self._network.eval()
+        for param in self._network.parameters(): 
+            param.requires_grad = False
+            
+        prog_bar = tqdm(range(self.fit_epoch), desc="Analytic Fitting")
+        for _ in prog_bar:
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                targets_onehot = F.one_hot(targets, num_classes=self._network.fc.out_features).float()
+                
+                with autocast('cuda', enabled=False):
+                    self._network.fit(inputs, targets_onehot)
+            self._clear_gpu()
+
+    # =========================================================================
+    # TRAIN LOOP (SGD)
+    # =========================================================================
+    def run(self, train_loader):
+        if self.cur_task == 0:
+            epochs = self.init_epochs
+            lr = self.init_lr
+            weight_decay = self.init_weight_decay
+        else:
+            epochs = self.epochs
+            lr = self.lr
+            weight_decay = self.weight_decay
+
+        # 1. Freeze All
+        for param in self._network.parameters():
+            param.requires_grad = False
+            
+        # 2. Unfreeze BiLORA
+        if self.cur_task == 0:
+            self._network.init_unfreeze()
+        else:
+            self._network.unfreeze_noise()
+            
+        params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
+        if not params: return
+
+        # 3. GET OPTIMIZER TỪ CONFIG (SGD)
+        # Hàm get_optimizer trong utils/training_tool.py sẽ tự đọc args['optimizer_type'] = 'sgd'
+        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
+        # GET SCHEDULER TỪ CONFIG (STEP)
+        scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
+
+        self._network.train()
+        self._network.to(self.device)
+        
+        prog_bar = tqdm(range(epochs), desc=f"Training Noise T{self.cur_task}")
+        for epoch in prog_bar:
+            losses = 0.0
+            
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                
+                optimizer.zero_grad(set_to_none=True)
+
+                with autocast('cuda'):
+                    outputs = self._network.forward_normal_fc(inputs)
+                    loss = F.cross_entropy(outputs['logits'], targets.long())
+
+                self.scaler.scale(loss).backward()
+                
+                # [SAFETY] Vẫn giữ clip grad để BiLORA ko bị NaN với SGD
+                self.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                
+                self.scaler.step(optimizer)
+                self.scaler.update()
+                
+                losses += loss.item()
+
+            scheduler.step()
+            prog_bar.set_description(f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f}")
+            
+            if epoch % 5 == 0:
+                self._clear_gpu()
