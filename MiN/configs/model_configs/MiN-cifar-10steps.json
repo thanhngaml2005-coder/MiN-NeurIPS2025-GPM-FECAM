@@ -9,7 +9,7 @@
   "optimizer_type": "sgd",
   "scheduler_type": "step",
   "init_epochs": 20,
-  "init_lr": 0.001,
+  "init_lr": 0.01,
   "init_batch_size": 128,
   "init_weight_decay": 5e-4,
   "epochs": 10,
