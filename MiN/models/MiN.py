@@ -125,7 +125,7 @@ class MinNet(object):
 
         # STEP 1: Analytic Warm-up
         self.logger.info(">>> Step 1: Analytic Warm-up...")
-        #self.fit_fc(train_loader_analytic)
+        self.fit_fc(train_loader_analytic)
 
         # STEP 2: Train BiLORA Noise
         self.logger.info(">>> Step 2: Training BiLORA Noise...")
@@ -168,7 +168,7 @@ class MinNet(object):
 
         # STEP 1: Analytic Update
         self.logger.info(">>> Step 1: Analytic Update...")
-        #self.fit_fc(train_loader_analytic)
+        self.fit_fc(train_loader_analytic)
 
         # STEP 2: Train Noise
         self.logger.info(">>> Step 2: Training BiLORA Noise...")
