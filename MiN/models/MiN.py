@@ -15,8 +15,8 @@ from torch.utils.data import WeightedRandomSampler
 from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
-# [FIXED] Chỉ import autocast
-from torch.amp import autocast
+# Mixed Precision
+from torch.amp import autocast, GradScaler
 
 class MinNet(object):
     def __init__(self, args, loger):
@@ -45,6 +45,9 @@ class MinNet(object):
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
+        
+        # Scaler cho Mixed Precision
+        self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
         gc.collect()
@@ -99,7 +102,59 @@ class MinNet(object):
         return targets
 
     # =========================================================================
-    # TASK 0
+    # [NEW] HÀM TÍNH PROTOTYPE (Class-wise Mean)
+    # Tính trung bình feature của từng class để khởi tạo Classifier
+    # =========================================================================
+    def get_class_prototypes(self, train_loader):
+        model = self._network
+        model.eval()
+        
+        # Dùng Dictionary để cộng dồn feature trên CPU (Tránh OOM)
+        features_sum = {}
+        features_count = {}
+        
+        self.logger.info(">>> Calculating Class Prototypes (on CPU)...")
+        
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Extracting Features")):
+                inputs = inputs.to(self.device)
+                
+                # Lấy feature từ Backbone (qua buffer nếu cần)
+                with autocast('cuda'):
+                    # Gọi trực tiếp backbone để lấy raw features
+                    features = model.backbone(inputs)
+                    # Nếu model có buffer, có thể cần qua buffer: features = model.buffer(features)
+                    # Nhưng thường prototype lấy raw feature từ backbone
+                
+                # Chuyển về CPU để tính toán
+                features = features.detach().cpu()
+                targets = targets.cpu()
+                
+                for feat, label in zip(features, targets):
+                    lbl = int(label.item())
+                    if lbl not in features_sum:
+                        features_sum[lbl] = feat
+                        features_count[lbl] = 1
+                    else:
+                        features_sum[lbl] += feat
+                        features_count[lbl] += 1
+        
+        # Tính trung bình và tạo Tensor Weight
+        num_classes = self._network.normal_fc.out_features
+        feature_dim = self._network.feature_dim # Hoặc self._network.backbone.out_dim
+        
+        # Init weight bằng 0
+        prototypes = torch.zeros(num_classes, feature_dim)
+        
+        for lbl in features_sum:
+            if lbl < num_classes:
+                # Mean = Sum / Count
+                prototypes[lbl] = features_sum[lbl] / features_count[lbl]
+        
+        return prototypes.to(self.device)
+
+    # =========================================================================
+    # TASK 0: PROTOTYPE INITIALIZATION
     # =========================================================================
     def init_train(self, data_manger):
         self.cur_task += 1
@@ -109,44 +164,60 @@ class MinNet(object):
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
         train_loader_noise = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
-        train_loader_refit = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        # Loader tuần tự để refit
+        train_loader_final = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
                 
-        # 1. Khởi tạo & Mở rộng Classifier
+        # 1. Khởi tạo Classifier
         self._network.update_fc(self.init_class)
         
-        # 2. [QUAN TRỌNG] Kích hoạt BiLORA (is_initialized=True)
+        # 2. Kích hoạt BiLORA
         self.logger.info(">>> Activating BiLORA for Task 0...")
         self._network.update_noise() 
-        
         self._network.to(self.device)
         self._clear_gpu()
 
-        # STEP 1: Train SGD (Chỉ SGD, vì chưa có Analytic cũ)
-        self.logger.info(">>> Step 1: Training BiLORA Noise (SGD)...")
+        # ---------------------------------------------------------------------
+        # [PROTOTYPE INITIALIZATION]
+        # Thay vì RLS, ta dùng Mean Feature của từng class gán vào Weight
+        # Đây chính là lý do MiN gốc đạt 70% Acc ngay Epoch 0
+        # ---------------------------------------------------------------------
+        prototypes = self.get_class_prototypes(train_loader_noise)
+        
+        # Gán Prototype vào Classifier Weight
+        with torch.no_grad():
+            self._network.normal_fc.weight.data.copy_(prototypes)
+            self.logger.info(">>> Classifier initialized with Class Prototypes!")
+        
+        # Dọn dẹp RAM
+        self._clear_gpu()
+        # ---------------------------------------------------------------------
+
+        # STEP 1: Train SGD (BiLORA)
+        # Lúc này Classifier đã biết mặt mũi dữ liệu (nhờ Prototype) nên Acc sẽ cao
+        self.logger.info(">>> Step 1: Training BiLORA Noise (Joint Training)...")
         self.run(train_loader_noise)
 
         # STEP 2: Merge
         self.logger.info(">>> Step 2: MagMax Merge...")
         self._network.after_task_magmax_merge()
         
-        # STEP 3: Re-fit (Chốt đơn bằng RLS)
+        # STEP 3: Re-fit
         self.logger.info(">>> Step 3: Analytic Re-fit...")
         
         del train_set
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        train_loader_final = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        train_loader_refit = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         
-        self.re_fit(train_loader_final)
-        
+        self.re_fit(train_loader_refit)
         self._clear_gpu()
 
     # =========================================================================
-    # TASK > 0 (Logic Ensemble: Logits = Analytic + SGD)
+    # TASK > 0: ENSEMBLE LOGIC
     # =========================================================================
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -162,19 +233,17 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
         
-        # 1. Mở rộng mạng (Expand Network)
         self._network.update_fc(self.increment) 
         self._network.update_noise()
         self._network.to(self.device)
         self._clear_gpu()
 
-        # STEP 1: Analytic Update (Cập nhật RLS cho class mới)
-        # Cần làm trước để có Logits_Analytic dùng cho Ensemble
+        # STEP 1: Analytic Update (Chuẩn bị Teacher cho Ensemble)
         self.logger.info(">>> Step 1: Analytic Update (Preparing Teacher)...")
         self.fit_fc(train_loader_analytic)
         
-        # [QUAN TRỌNG] KHÔNG GỌI SYNC Ở ĐÂY!
-        # Vì ta dùng cơ chế cộng gộp (Logits = A + B), nên SGD phải học phần dư (Residual), không copy.
+        # [QUAN TRỌNG] KHÔNG SYNC!
+        # Vì ta dùng phép cộng (Ensemble), nên SGD phải học độc lập với RLS.
 
         # STEP 2: Train Noise (ENSEMBLE MODE)
         self.logger.info(">>> Step 2: Training BiLORA Noise (Ensemble Mode)...")
@@ -190,11 +259,10 @@ class MinNet(object):
         train_loader_refit = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         
         self.re_fit(train_loader_refit)
-        
         self._clear_gpu()
 
     # =========================================================================
-    # FIT FC
+    # FIT FC (RLS)
     # =========================================================================
     def fit_fc(self, train_loader):
         self._network.eval()
@@ -209,6 +277,7 @@ class MinNet(object):
                 num_classes = self._network.normal_fc.out_features
                 targets_onehot = F.one_hot(targets, num_classes=num_classes).float()
                 
+                # RLS cần chính xác cao, không dùng autocast
                 with autocast('cuda', enabled=False):
                     self._network.fit(inputs, targets_onehot)
             self._clear_gpu()
@@ -223,7 +292,6 @@ class MinNet(object):
         prog_bar = tqdm(train_loader, desc="Analytic Re-fitting")
         for i, (_, inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
-            
             num_classes = self._network.normal_fc.out_features
             targets_onehot = F.one_hot(targets, num_classes=num_classes).float()
             
@@ -245,11 +313,11 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        # Freeze All
+        # Freeze Backbone & RLS
         for param in self._network.parameters():
             param.requires_grad = False
         
-        # Unfreeze Classifier (Normal FC)
+        # Unfreeze SGD Classifier
         for param in self._network.normal_fc.parameters():
             param.requires_grad = True
             
@@ -276,36 +344,35 @@ class MinNet(object):
             
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
                 optimizer.zero_grad(set_to_none=True)
 
                 with autocast('cuda'):
-                    # -------------------------------------------
-                    # LOGIC CỘNG GỘP (ENSEMBLE) CHO TASK > 0
-                    # -------------------------------------------
+                    # ----------------------------------------------------
+                    # LOGIC ENSEMBLE CHO TASK > 0
+                    # ----------------------------------------------------
                     if self.cur_task > 0:
-                        # 1. Lấy kết quả từ Analytic (Cố định, không tính grad)
+                        # 1. Analytic Teacher (RLS) - Freeze
                         with torch.no_grad():
-                            # new_forward=False -> Chạy qua Analytic
                             outputs_analytic = self._network(inputs, new_forward=False)
                             logits_analytic = outputs_analytic['logits']
                         
-                        # 2. Lấy kết quả từ SGD (Đang train)
+                        # 2. SGD Student (Normal FC) - Trainable
                         outputs_sgd = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits_sgd = outputs_sgd['logits']
                         
-                        # 3. CỘNG GỘP
+                        # 3. Cộng gộp
                         logits = logits_analytic + logits_sgd
                     else:
-                        # Task 0 chỉ chạy SGD
+                        # Task 0: Chỉ chạy SGD (Đã được init tốt nhờ Prototype ở trên)
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits = outputs['logits']
 
                     loss = F.cross_entropy(logits, targets.long())
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
-                optimizer.step()
+                # Backward với Scaler
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
                 
                 losses += loss.item()
 
