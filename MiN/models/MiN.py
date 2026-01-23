@@ -103,6 +103,9 @@ class MinNet(object):
     # =========================================================================
     # TASK 0
     # =========================================================================
+    # =========================================================================
+    # TASK 0: TRAIN -> FIT -> REFIT (Theo yêu cầu của bạn)
+    # =========================================================================
     def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, _ = data_manger.get_task_list(0)
@@ -110,9 +113,10 @@ class MinNet(object):
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
-        # Loader
         train_loader_noise = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
-        train_loader_analytic = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        
+        # [QUAN TRỌNG] Vẫn cần loader này cho bước Re-fit cuối cùng
+        train_loader_refit = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
@@ -123,27 +127,34 @@ class MinNet(object):
         self._network.to(self.device)
         self._clear_gpu()
 
-        # STEP 1: Analytic Warm-up
-        self.logger.info(">>> Step 1: Analytic Warm-up...")
-        self.fit_fc(train_loader_analytic)
-        self._network.sync_analytic_to_normal()
-        # STEP 2: Train BiLORA Noise
-        self.logger.info(">>> Step 2: Training BiLORA Noise...")
+        # [REMOVED] Bỏ bước Analytic Warm-up và Sync đầu vào
+        # self.logger.info(">>> Step 1: Analytic Warm-up...")
+        # self.fit_fc(train_loader_analytic)
+        # self._network.sync_analytic_to_normal()
+
+        # STEP 1: Train BiLORA Noise (Chạy ngay SGD)
+        self.logger.info(">>> Step 1: Training BiLORA Noise (SGD)...")
+        
+        # [LƯU Ý] Vì bỏ Warm-up, Classifier đang là Random.
+        # Ta cần đảm bảo trong hàm run(), Classifier được update hoặc Noise đủ mạnh để học.
         self.run(train_loader_noise)
 
-        # STEP 3: Merge & Refit
-        self.logger.info(">>> Step 3: MagMax Merge & Refit...")
+        # STEP 2: Merge 
+        self.logger.info(">>> Step 2: MagMax Merge...")
         self._network.after_task_magmax_merge()
         
+        # STEP 3: Re-fit (Chốt đơn bằng RLS)
+        self.logger.info(">>> Step 3: Analytic Re-fit...")
+        
         del train_set
+        # Dùng train_no_aug cho chuẩn xác
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        train_loader_refit = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        train_loader_final = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         
-        self.re_fit(train_loader_refit)
+        self.re_fit(train_loader_final)
         
         self._clear_gpu()
-
     # =========================================================================
     # TASK > 0
     # =========================================================================
