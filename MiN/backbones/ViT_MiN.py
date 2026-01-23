@@ -93,19 +93,16 @@ class BiLORA_Linear(nn.Module):
         
         self.is_initialized = False
 
-    def init_zero(self, scale=1e-4):
-        """
-        [THEO YÊU CẦU CỦA BẠN]: Near-Zero Initialization.
-        Khởi tạo ngẫu nhiên nhưng scale cực nhỏ để xấp xỉ 0.
-        """
-        # Khởi tạo ngẫu nhiên cho phần thực và ảo
-        # Dùng normal_ thay vì kaiming vì active_params là vector 1D, không phải ma trận weight đầy đủ
-        nn.init.normal_(self.active_params.real, mean=0.0, std=0.02)
-        nn.init.normal_(self.active_params.imag, mean=0.0, std=0.02)
+    def init_zero(self):
+        # [CRITICAL FIX]
+        # Phải là ZERO TUYỆT ĐỐI. Không dùng normal_ * 1e-4.
+        # Nếu có bất kỳ giá trị nào khác 0, nó sẽ làm hỏng feature của Backbone ngay lập tức.
+        nn.init.constant_(self.active_params, 0) 
         
-        # Scale nhỏ lại (Near Zero)
-        with torch.no_grad():
-            self.active_params.data *= scale
+        # Reset các tham số khác nếu cần
+        if self.is_initialized:
+             self.active_indices.zero_()
+             self.is_initialized = False # Reset trạng thái về chưa kích hoạt
 
     def new_task(self):
         """
