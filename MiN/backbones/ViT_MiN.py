@@ -140,6 +140,12 @@ class PiNoise(nn.Module):
         """
         if len(self.generators) == 0: return x
 
+        # [FIX 1] Import autocast cục bộ để xử lý lỗi mixed precision
+        try:
+            from torch.amp import autocast
+        except ImportError:
+            from torch.cuda.amp import autocast
+
         # 1. Biến đổi Fourier (F): Chuyển sang miền tần số
         # rfft tự động xử lý tính đối xứng Hermitian
         x_freq = torch.fft.rfft(x, dim=-1) # [B, N, freq_dim] (Complex)
@@ -163,26 +169,41 @@ class PiNoise(nn.Module):
             epsilon = torch.randn_like(mu)
             theta_val = epsilon * sigma + mu 
             
-            # d. Tái tạo số phức từ output MLP
-            theta_complex = torch.complex(theta_val[..., :self.hidden_dim], 
-                                          theta_val[..., self.hidden_dim:])
-            
-            # e. Đặt nhiễu vào bản đồ tần số đầy đủ (Sparse Update)
-            full_freq_noise = torch.zeros_like(x_freq)
-            full_freq_noise.index_add_(-1, indices, theta_complex)
-            
-            generated_noises_freq.append(full_freq_noise)
+            # [FIX 2 - QUAN TRỌNG]: Xử lý số phức trong môi trường an toàn (FP32)
+            # Tắt Autocast đoạn này để tránh tạo ra ComplexHalf gây lỗi index_add_
+            with autocast(enabled=False):
+                # d. Tái tạo số phức từ output MLP
+                # Ép kiểu .float() (FP32) cho các thành phần thực/ảo
+                real_part = theta_val[..., :self.hidden_dim].float()
+                imag_part = theta_val[..., self.hidden_dim:].float()
+                
+                theta_complex = torch.complex(real_part, imag_part)
+                
+                # e. Đặt nhiễu vào bản đồ tần số đầy đủ (Sparse Update)
+                # full_freq_noise cần đảm bảo cùng kiểu với theta_complex
+                # Nếu x_freq là FP16 (ComplexHalf), ta ép full_freq_noise lên FP32
+                full_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
+                
+                # Giờ cả 2 đều là ComplexFloat (FP32) -> Cộng OK
+                full_freq_noise.index_add_(-1, indices, theta_complex)
+                
+                generated_noises_freq.append(full_freq_noise)
 
         # 3. Trộn nhiễu (MIN logic)
         weights = F.softmax(self.mix_weights, dim=0)
-        mixed_freq_noise = torch.zeros_like(x_freq)
+        
+        # [FIX 3]: Khởi tạo mixed_freq_noise với kiểu ComplexFloat (FP32)
+        mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
+        
         for i, noise in enumerate(generated_noises_freq):
+            # noise và mixed_freq_noise đều là FP32 nên cộng tốt
             mixed_freq_noise += noise * weights[i]
 
         # 4. Biến đổi ngược (F^H): Chuyển về miền không gian
         # irfft đảm bảo output là số thực (Real)
         out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
         
+        # Cộng lại vào x (x có thể là FP16, out_noise là FP32 -> PyTorch tự broadcast)
         return x + out_noise
 
     # Các hàm hỗ trợ giữ nguyên
