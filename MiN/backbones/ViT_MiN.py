@@ -207,8 +207,8 @@ class PiNoise(nn.Module):
 
         # --- Trainable Parts (BiLORA) ---
         # k=1500, hidden_dim=192 (Mặc định)
-        self.mu = BiLORA_Linear(hidden_dim, hidden_dim, k=4000)
-        self.sigma = BiLORA_Linear(hidden_dim, hidden_dim, k=4000)
+        self.mu = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
+        self.sigma = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
         
         # Init lần đầu
         self.init_zero()
