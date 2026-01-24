@@ -98,7 +98,9 @@ class BiLORA_Linear(nn.Module):
         total_freqs = self.freq_h * self.freq_w
         
         # 1. Chọn vị trí ngẫu nhiên
-        indices = torch.randperm(total_freqs)[:self.k].to(self.global_freq_weight.device)
+        #indices = torch.randperm(total_freqs)[:self.k].to(self.global_freq_weight.device)
+        # Thay dòng randperm bằng dòng này:
+        indices = torch.randint(0, total_freqs, (self.k,)).to(self.global_freq_weight.device)
         self.active_indices.copy_(indices)
         
         # 2. Reset Active Params
