@@ -166,9 +166,7 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
         
-        # 1. Warmup Analytic
-        self.logger.info(">>> Analytic Fitting (Warmup)...")
-        self.fit_fc(train_loader_fit)
+        
 
         # 2. Expand & Train Noise
         self._network.update_fc(self.increment)
@@ -176,6 +174,9 @@ class MinNet(object):
         self._network.to(self.device)
         self._clear_gpu()
 
+        # 1. Warmup Analytic
+        self.logger.info(">>> Analytic Fitting (Warmup)...")
+        self.fit_fc(train_loader_fit)
         self.logger.info(">>> Training BiLORA Noise (SGD)...")
         self.run(train_loader_noise)
 
