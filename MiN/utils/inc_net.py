@@ -190,104 +190,99 @@ class MiNbaseNet(nn.Module):
         features = features.to(self.weight) 
         return features @ self.weight
 
+    
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Thuật toán Recursive Least Squares (RLS).
-        Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
+        Phiên bản Fix lỗi Toán học & Tối ưu bộ nhớ:
+        1. Fix: Dùng P_K để update Weight (Chuẩn công thức Woodbury).
+        2. Fix: Thứ tự del biến hợp lý.
+        3. Tối ưu: Dùng FP32 triệt để.
         """
-        # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
+        # 1. Feature Extraction (Cho phép Autocast đoạn này cho nhẹ)
+        try:
+            from torch.amp import autocast
+        except ImportError:
+            from torch.cuda.amp import autocast
+
         with autocast(enabled=True): 
-            X = self.backbone(X)  # Output này có thể là FP16
-            
-        # 2. CHUYỂN SANG FP32 ĐỂ TÍNH TOÁN RLS (Để không lỗi Complex/Mismatch)
-        # Từ đây trở đi, ta tắt autocast và làm việc hoàn toàn trên FP32
+            X = self.backbone(X)
+        
+        # 2. Tính toán RLS (Bắt buộc FP32 & Tắt Autocast)
         with autocast(enabled=False):
-            # 1. Feature Extraction & Expansion
+            # [Quan Trọng] Ép kiểu FP32 và tách khỏi graph
             X = X.detach().float()
-            X = self.buffer(X)
+            
+            # Qua Random Buffer (đảm bảo buffer trả về float32)
+            X = self.buffer(X).float()
             
             # Đưa về cùng device
             device = self.weight.device
             X = X.to(device)
             Y = Y.to(device).float()
 
-            # --- Expand Classifier (Logic cũ) ---
+            # --- Expand Classifier ---
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
                 tail = torch.zeros((self.weight.shape[0], increment_size), dtype=torch.float32, device=device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
-                del tail # Xóa ngay
+                del tail 
             elif num_targets < self.weight.shape[1]:
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size), dtype=torch.float32, device=device)
                 Y = torch.cat((Y, tail), dim=1)
-                del tail # Xóa ngay
+                del tail 
 
-            # --- BẮT ĐẦU TÍNH TOÁN TIẾT KIỆM RAM ---
+            # --- TÍNH TOÁN RLS ---
             
-            # Bước 1: Tính ma trận dự đoán P = R * X^T
-            # Shape: (Feature, Feature) @ (Feature, Batch) -> (Feature, Batch)
+            # B1: P = R * X^T (Shape: Feature x Batch)
             P = self.R @ X.T
             
-            # Bước 2: Tính Term = I + X * P
-            # Shape: (Batch, Feature) @ (Feature, Batch) -> (Batch, Batch)
-            # [TỐI ƯU]: Không tạo ma trận I riêng lẻ tốn RAM
-            term = X @ P 
+            # B2: Term = I + X * P (Shape: Batch x Batch)
+            # Tận dụng biến X để tính term giúp tiết kiệm RAM
+            term = X @ P
             
-            # Cộng trực tiếp Identity vào đường chéo (In-place operation)
-            term.diagonal().add_(1.0) 
+            # Cộng Identity và Jitter vào đường chéo (In-place)
+            term.diagonal().add_(1.0 + 1e-5)
             
-            # Ép đối xứng (Symmetrize)
+            # Ép đối xứng
             term = 0.5 * (term + term.T)
             
-            # Thêm jitter vào đường chéo (In-place)
-            term.diagonal().add_(1e-5)
-
-            # Bước 3: Nghịch đảo K = inv(term)
+            # B3: K = inv(term) (Shape: Batch x Batch)
             try:
                 K = torch.linalg.inv(term)
             except:
+                # Fallback về CPU nếu GPU lỗi singular
                 K = torch.linalg.inv(term.cpu()).to(device)
             
-            # [DỌN DẸP 1]: Xóa term ngay lập tức vì không dùng nữa
-            del term
-            # torch.cuda.empty_cache() # Có thể bật nếu cực kỳ thiếu RAM
+            del term # Xóa ngay sau khi có K
             
-            # Bước 4: Cập nhật R = R - P * K * P^T
-            # Tính K_PT = K @ P.T -> (Batch, Feature)
-            # P là (Feature, Batch), K là (Batch, Batch)
-            # P_K = P @ K -> (Feature, Batch)
+            # B4: Tính Kalman Gain: P_K = P * K (Shape: Feature x Batch)
+            # Đây là biến quan trọng nhất dùng để update cả R và Weight
             P_K = P @ K
 
-            # R_update = P_K @ P.T -> (Feature, Feature)
-            # Update trực tiếp: R -= R_update
+            # B5: Cập nhật Covariance Matrix: R = R - P_K * P^T
+            # R_update = P_K @ P.T
             self.R -= P_K @ P.T
-
-            # [DỌN DẸP 2]: Xóa biến trung gian
-            del P_K
             
-            # Bước 5: Cập nhật Weight = W + P * (Y - X * W)
-            # Tính Residual: Y - X @ W
+            # [DỌN DẸP 1]: Xóa P vì không dùng nữa (P_K đã chứa thông tin cần thiết)
+            del P 
+
+            # B6: Cập nhật Weight: W = W + P_K * (Y - X * W)
+            # Tính Residual
             residual = Y - (X @ self.weight)
             
-            # Weight += P @ residual
-            # Lưu ý: P lúc này = R_old @ X.T. 
-            # Theo công thức chuẩn Woodbury thì dùng R_new hay R_old đều hội tụ về cùng nghiệm,
-            # nhưng dùng R_new (đã update) thì dùng công thức khác.
-            # Ở đây ta dùng P cũ (tương ứng R cũ) là đúng công thức Sherman-Morrison chuẩn.
-            self.weight += P @ residual
+            # [FIX QUAN TRỌNG]: Dùng P_K thay vì P
+            # P_K chuẩn hóa bước nhảy, giúp thuật toán hội tụ. 
+            # Dùng P sẽ làm giá trị nổ tung (NaN).
+            self.weight += P_K @ residual
             
-            # [DỌN DẸP CUỐI CÙNG]: Xóa sạch mọi thứ
-            del X, Y, P, K, residual
+            # [DỌN DẸP CUỐI CÙNG]
+            del X, Y, K, P_K, residual
             
-            # Bắt buộc gọi dòng này để trả RAM cho PyTorch quản lý
+            # Trả bộ nhớ cho GPU
             torch.cuda.empty_cache()
-    # =========================================================================
-    # [FORWARD PASSES]
-    # =========================================================================
-
     def forward(self, x, new_forward: bool = False):
         """
         Dùng cho Inference/Testing.
