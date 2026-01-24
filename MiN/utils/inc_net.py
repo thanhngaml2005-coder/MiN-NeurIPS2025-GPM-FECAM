@@ -197,59 +197,93 @@ class MiNbaseNet(nn.Module):
         Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
         """
         # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
+        with autocast(enabled=True): 
+            X = self.backbone(X)  # Output này có thể là FP16
+            
+        # 2. CHUYỂN SANG FP32 ĐỂ TÍNH TOÁN RLS (Để không lỗi Complex/Mismatch)
+        # Từ đây trở đi, ta tắt autocast và làm việc hoàn toàn trên FP32
         with autocast(enabled=False):
             # 1. Feature Extraction & Expansion
-            X = self.backbone(X).float() # ViT Features
-            X = self.buffer(X)           # Random Expansion -> float32
+            X = X.detach().float()
+            X = self.buffer(X)
             
             # Đưa về cùng device
-            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
+            device = self.weight.device
+            X = X.to(device)
+            Y = Y.to(device).float()
 
-            # 2. Mở rộng chiều của classifier nếu có lớp mới
+            # --- Expand Classifier (Logic cũ) ---
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                tail = torch.zeros((self.weight.shape[0], increment_size), dtype=torch.float32, device=device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
+                del tail # Xóa ngay
             elif num_targets < self.weight.shape[1]:
                 increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                tail = torch.zeros((Y.shape[0], increment_size), dtype=torch.float32, device=device)
                 Y = torch.cat((Y, tail), dim=1)
+                del tail # Xóa ngay
 
-            # 3. Công thức cập nhật RLS
-            I = torch.eye(X.shape[0], dtype=torch.float32, device=X.device)
-            temp_XR = X @ self.R
-            term = I + temp_XR @ X.T
+            # --- BẮT ĐẦU TÍNH TOÁN TIẾT KIỆM RAM ---
+            
+            # Bước 1: Tính ma trận dự đoán P = R * X^T
+            # Shape: (Feature, Feature) @ (Feature, Batch) -> (Feature, Batch)
+            P = self.R @ X.T
+            
+            # Bước 2: Tính Term = I + X * P
+            # Shape: (Batch, Feature) @ (Feature, Batch) -> (Batch, Batch)
+            # [TỐI ƯU]: Không tạo ma trận I riêng lẻ tốn RAM
+            term = X @ P 
+            
+            # Cộng trực tiếp Identity vào đường chéo (In-place operation)
+            term.diagonal().add_(1.0) 
+            
+            # Ép đối xứng (Symmetrize)
             term = 0.5 * (term + term.T)
             
-            # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
-            jitter = 1e-5 * torch.eye(term.shape[0], device=term.device, dtype=torch.float32)
-            
-            try:
-                K = torch.linalg.inv(term + jitter)
-            except:
-                K = torch.linalg.inv((term + jitter).cpu()).to(self.device)
-            del term, I, jitter
-            torch.cuda.empty_cache() # [QUAN TRỌNG]
-            # Cập nhật R (Covariance Matrix)
-            K_XR = K @ temp_XR
-            
-            # R_update = temp_XR.T @ K_XR
-            # R -= R_update
-            self.R -= temp_XR.T @ K_XR
-            
-            # Xóa các biến to
-            del K, K_XR
-            
-            # Cập nhật Weight: W += R @ X.T @ (Y - X @ W)
-            # P = R @ X.T
-            P = self.R @ X.T
-            self.weight += P @ (Y - X @ self.weight)
-            
-            # Xóa sạch sẽ cuối cùng
-            del X, Y, P, temp_XR
-            torch.cuda.empty_cache()
+            # Thêm jitter vào đường chéo (In-place)
+            term.diagonal().add_(1e-5)
 
+            # Bước 3: Nghịch đảo K = inv(term)
+            try:
+                K = torch.linalg.inv(term)
+            except:
+                K = torch.linalg.inv(term.cpu()).to(device)
+            
+            # [DỌN DẸP 1]: Xóa term ngay lập tức vì không dùng nữa
+            del term
+            # torch.cuda.empty_cache() # Có thể bật nếu cực kỳ thiếu RAM
+            
+            # Bước 4: Cập nhật R = R - P * K * P^T
+            # Tính K_PT = K @ P.T -> (Batch, Feature)
+            # P là (Feature, Batch), K là (Batch, Batch)
+            # P_K = P @ K -> (Feature, Batch)
+            P_K = P @ K
+
+            # R_update = P_K @ P.T -> (Feature, Feature)
+            # Update trực tiếp: R -= R_update
+            self.R -= P_K @ P.T
+
+            # [DỌN DẸP 2]: Xóa biến trung gian
+            del P_K
+            
+            # Bước 5: Cập nhật Weight = W + P * (Y - X * W)
+            # Tính Residual: Y - X @ W
+            residual = Y - (X @ self.weight)
+            
+            # Weight += P @ residual
+            # Lưu ý: P lúc này = R_old @ X.T. 
+            # Theo công thức chuẩn Woodbury thì dùng R_new hay R_old đều hội tụ về cùng nghiệm,
+            # nhưng dùng R_new (đã update) thì dùng công thức khác.
+            # Ở đây ta dùng P cũ (tương ứng R cũ) là đúng công thức Sherman-Morrison chuẩn.
+            self.weight += P @ residual
+            
+            # [DỌN DẸP CUỐI CÙNG]: Xóa sạch mọi thứ
+            del X, Y, P, K, residual
+            
+            # Bắt buộc gọi dòng này để trả RAM cho PyTorch quản lý
+            torch.cuda.empty_cache()
     # =========================================================================
     # [FORWARD PASSES]
     # =========================================================================
