@@ -64,200 +64,136 @@ class Noise_weigh(nn.Module):
 import torch
 import torch.nn as nn
 import copy
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
-# =========================================================================
-# [UPDATED] BILORA MODULE: NEAR-ZERO INIT & MAGMAX
-# =========================================================================
-class BiLORA_Linear(nn.Module):
-    def __init__(self, in_features, out_features, k=1500):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.k = k
-        self.out_shape = (out_features, in_features) 
-        self.freq_h = out_features
-        self.freq_w = in_features // 2 + 1
-        
-        self.register_buffer('global_freq_weight', torch.zeros((self.freq_h, self.freq_w), dtype=torch.cfloat))
-        
-        self.active_params = nn.Parameter(torch.zeros(k, dtype=torch.cfloat))
-        self.register_buffer('active_indices', torch.zeros(k, dtype=torch.long))
-        
-        self.is_initialized = False
-
-    def init_zero(self):
-        # [FIXED] Chỉ reset giá trị tham số, KHÔNG ĐỤNG VÀO INDICES
-        nn.init.constant_(self.active_params, 0)
-        # Xóa bỏ đoạn if self.is_initialized... gây lỗi
-
-    def new_task(self):
-        total_freqs = self.freq_h * self.freq_w
-        
-        # 1. Chọn vị trí ngẫu nhiên
-        #indices = torch.randperm(total_freqs)[:self.k].to(self.global_freq_weight.device)
-        # Thay dòng randperm bằng dòng này:
-        indices = torch.randint(0, total_freqs, (self.k,)).to(self.global_freq_weight.device)
-        self.active_indices.copy_(indices)
-        
-        # 2. Reset Active Params
-        self.init_zero() 
-        
-        # 3. Kích hoạt train
-        self.active_params.requires_grad = True
-        self.is_initialized = True # Đặt cờ True sau cùng
-
-    def forward(self, x):
-        # 1. Global Weight
-        current_freq_weight = self.global_freq_weight.clone()
-        
-        # 2. Active Params
-        if self.is_initialized:
-            delta_weight = torch.zeros_like(current_freq_weight)
-            delta_flat = delta_weight.view(-1)
-            delta_flat.scatter_add_(0, self.active_indices, self.active_params)
-            delta_weight = delta_flat.view_as(delta_weight)
-            current_freq_weight = current_freq_weight + delta_weight
-
-        # 3. Hermitian Symmetry
-        current_freq_weight[..., 0, 0] = current_freq_weight[..., 0, 0].real + 0j
-        if self.out_shape[0] % 2 == 0:
-             current_freq_weight[..., self.freq_h//2, 0] = current_freq_weight[..., self.freq_h//2, 0].real + 0j
-        if self.out_shape[1] % 2 == 0:
-             current_freq_weight[..., 0, -1] = current_freq_weight[..., 0, -1].real + 0j
-             if self.out_shape[0] % 2 == 0:
-                 current_freq_weight[..., self.freq_h//2, -1] = current_freq_weight[..., self.freq_h//2, -1].real + 0j
-
-        # 4. IRFFT & Linear
-        spatial_weight = torch.fft.irfft2(current_freq_weight, s=self.out_shape, norm='ortho')
-        return F.linear(x, spatial_weight)
-
-    # def merge_task(self):
-    #     if not self.is_initialized: return
-
-    #     with torch.no_grad():
-    #         update_matrix = torch.zeros_like(self.global_freq_weight).view(-1)
-    #         update_matrix.scatter_(0, self.active_indices, self.active_params)
-    #         update_matrix = update_matrix.view(self.freq_h, self.freq_w)
-            
-    #         task_freq_weight = self.global_freq_weight + update_matrix
-            
-    #         mag_task = torch.abs(task_freq_weight)
-    #         mag_global = torch.abs(self.global_freq_weight)
-            
-    #         mask = mag_task > mag_global
-    #         self.global_freq_weight[:] = torch.where(mask, task_freq_weight, self.global_freq_weight)
-            
-    #         # Reset cho task sau
-    #         self.init_zero()
-    #         self.active_params.requires_grad = False
-    #         # self.is_initialized = False # Có thể giữ True hoặc False tùy logic, nhưng an toàn nhất là để nguyên
-    # ép đx 
-    def merge_task(self):
-        if not self.is_initialized: return
-
-        with torch.no_grad():
-            update_matrix = torch.zeros_like(self.global_freq_weight).view(-1)
-            update_matrix.scatter_(0, self.active_indices, self.active_params)
-            update_matrix = update_matrix.view(self.freq_h, self.freq_w)
-            
-            task_freq_weight = self.global_freq_weight + update_matrix
-            
-            # MagMax Logic
-            mag_task = torch.abs(task_freq_weight)
-            mag_global = torch.abs(self.global_freq_weight)
-            mask = mag_task > mag_global
-            
-            # Cập nhật Global
-            self.global_freq_weight[:] = torch.where(mask, task_freq_weight, self.global_freq_weight)
-            
-            # [FIX QUAN TRỌNG]: ÉP ĐỐI XỨNG NGAY SAU KHI MERGE
-            # Để đảm bảo Global Weight luôn "sạch" phần ảo tại các điểm đặc biệt
-            self.global_freq_weight[..., 0, 0] = self.global_freq_weight[..., 0, 0].real + 0j
-            
-            if self.out_shape[0] % 2 == 0:
-                 self.global_freq_weight[..., self.freq_h//2, 0] = \
-                     self.global_freq_weight[..., self.freq_h//2, 0].real + 0j
-            
-            if self.out_shape[1] % 2 == 0:
-                 self.global_freq_weight[..., 0, -1] = \
-                     self.global_freq_weight[..., 0, -1].real + 0j
-                 
-                 if self.out_shape[0] % 2 == 0:
-                     self.global_freq_weight[..., self.freq_h//2, -1] = \
-                         self.global_freq_weight[..., self.freq_h//2, -1].real + 0j
-            
-            # Reset cho task sau
-            self.init_zero()
-            self.active_params.requires_grad = False
+# [START CHANGE] - Thay thế toàn bộ class PiNoise cũ bằng class này
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
         
-        # --- Shared Fixed Parts (Giữ nguyên) ---
-        self.MLP = nn.Linear(in_dim, out_dim)
-        torch.nn.init.constant_(self.MLP.weight, 0)
-        torch.nn.init.constant_(self.MLP.bias, 0)
-
-        self.w_down = nn.Parameter(torch.empty((in_dim, hidden_dim)))
-        nn.init.xavier_uniform_(self.w_down) 
-        self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
-        nn.init.xavier_uniform_(self.w_up)
-
-        # --- Trainable Parts (BiLORA) ---
-        # k=1500, hidden_dim=192 (Mặc định)
-        self.mu = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
-        self.sigma = BiLORA_Linear(hidden_dim, hidden_dim, k=1500)
+        self.in_dim = in_dim
+        # hidden_dim ở đây đóng vai trò là k (Sparsity) trong BiLoRA
+        self.hidden_dim = hidden_dim 
         
-        # Init lần đầu
-        self.init_zero()
-
-    def init_zero(self):
-        # Gọi vào hàm near-zero init của BiLORA
-        self.mu.init_zero()
-        self.sigma.init_zero()
-
-    def update_noise(self):
-        # Bắt đầu task mới
-        self.mu.new_task()
-        self.sigma.new_task()
-
-    def after_task_training(self): 
-        # Merge MagMax
-        self.mu.merge_task()
-        self.sigma.merge_task()
-
-    def forward(self, hyper_features, new_forward=False):
-        # 1. Down-project
-        x_down = hyper_features @ self.w_down
+        # [BiLoRA Logic]: Sử dụng Real FFT (rfft)
+        # Kích thước miền tần số thực (chỉ giữ phần tần số dương để đảm bảo đối xứng Hermitian)
+        self.freq_dim = in_dim // 2 + 1
         
-        # 2. BiLORA Forward (Lấy Mean và Variance)
-        mu = self.mu(x_down)
-        sigma = self.sigma(x_down)
+        self.act = nn.GELU()
+
+        # Mỗi task có 1 generator riêng (tương ứng Theta_t) và 1 bộ chỉ số riêng (S_t)
+        self.generators = nn.ModuleList([]) 
+        self.task_indices = []
         
-        # [FIX LOGIC]: Kiểm tra chế độ training
-        if self.training:
-            # Nếu đang Train: Cần sự đa dạng -> Cộng nhiễu
-            epsilon = torch.randn_like(mu)
-            noise = epsilon * sigma + mu 
+        # Trọng số trộn nhiễu (của phương pháp MIN)
+        self.mix_weights = nn.Parameter(torch.tensor([], dtype=torch.float32))
+        
+        self.current_task_id = -1
+
+    def _get_random_indices(self, max_idx, num_select):
+        """Chọn k chỉ số ngẫu nhiên trong không gian tần số (Mask S_t)"""
+        indices = torch.randperm(max_idx)[:num_select]
+        return indices.sort()[0]
+
+    def expand_new_task(self):
+        """Mở rộng cho task mới: Tạo Mask S_t và Generator Theta_t"""
+        self.current_task_id += 1
+        device = self.mix_weights.device if self.mix_weights.numel() > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # 1. Tạo Mask S_t: Chọn k tần số
+        new_indices = self._get_random_indices(self.freq_dim, self.hidden_dim).to(device)
+        self.task_indices.append(new_indices)
+
+        # 2. Khởi tạo Theta_t (2 MLP: mu và sigma)
+        # Input size = k * 2 (do số phức tách thành Thực + Ảo)
+        input_size = self.hidden_dim * 2
+        
+        new_gen = nn.ModuleDict({
+            'mu': nn.Linear(input_size, input_size),
+            'sigma': nn.Linear(input_size, input_size)
+        }).to(device)
+
+        # Khởi tạo trọng số về 0 (để nhiễu ban đầu = 0)
+        nn.init.constant_(new_gen['mu'].weight, 0.)
+        nn.init.constant_(new_gen['mu'].bias, 0.)
+        nn.init.constant_(new_gen['sigma'].weight, 0.)
+        nn.init.constant_(new_gen['sigma'].bias, 0.)
+
+        self.generators.append(new_gen)
+
+        # Đóng băng các task cũ (Freeze old tasks)
+        for i, gen in enumerate(self.generators):
+            if i < self.current_task_id:
+                for param in gen.parameters(): param.requires_grad = False
+            else:
+                for param in gen.parameters(): param.requires_grad = True
+        
+        # Cập nhật trọng số trộn (Mix weights)
+        new_w = torch.tensor([1.0], device=device)
+        if self.current_task_id == 0:
+            self.mix_weights = nn.Parameter(new_w)
         else:
-            # Nếu đang Eval/Fit RLS: Cần sự ổn định -> Chỉ lấy Mean (mu)
-            # Bỏ qua phần nhiễu (epsilon * sigma)
-            noise = mu 
-            
-        # 3. Up-project & Residual
-        return self.MLP(hyper_features) + (noise @ self.w_up) + hyper_features
-    # Helpers
-    def unfreeze_noise(self):
-        self.mu.active_params.requires_grad = True
-        self.sigma.active_params.requires_grad = True
-        
-    def forward_new(self, x): return self.forward(x)
-    def init_weight_noise(self, p): pass
+            self.mix_weights = nn.Parameter(torch.cat([self.mix_weights, new_w]))
 
+    def forward(self, x, new_forward=False):
+        """
+        Quy trình BiLoRA: x -> RFFT -> Chọn k tần số -> MLP sinh nhiễu -> IRFFT -> x + noise
+        """
+        if len(self.generators) == 0: return x
+
+        # 1. Biến đổi Fourier (F): Chuyển sang miền tần số
+        # rfft tự động xử lý tính đối xứng Hermitian
+        x_freq = torch.fft.rfft(x, dim=-1) # [B, N, freq_dim] (Complex)
+
+        generated_noises_freq = []
+
+        # 2. Sinh nhiễu trên miền tần số (S . Theta)
+        for task_id, gen in enumerate(self.generators):
+            indices = self.task_indices[task_id]
+            
+            # a. Lấy đặc trưng tại k tần số đã chọn
+            x_selected = x_freq[..., indices] # [B, N, k]
+            
+            # b. Đưa vào MLP (Input: Real nối với Imag)
+            x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1) # [B, N, 2k]
+            
+            mu = gen['mu'](x_mlp_in)
+            sigma = gen['sigma'](x_mlp_in)
+            
+            # c. Reparameterization (Tạo nhiễu)
+            epsilon = torch.randn_like(mu)
+            theta_val = epsilon * sigma + mu 
+            
+            # d. Tái tạo số phức từ output MLP
+            theta_complex = torch.complex(theta_val[..., :self.hidden_dim], 
+                                          theta_val[..., self.hidden_dim:])
+            
+            # e. Đặt nhiễu vào bản đồ tần số đầy đủ (Sparse Update)
+            full_freq_noise = torch.zeros_like(x_freq)
+            full_freq_noise.index_add_(-1, indices, theta_complex)
+            
+            generated_noises_freq.append(full_freq_noise)
+
+        # 3. Trộn nhiễu (MIN logic)
+        weights = F.softmax(self.mix_weights, dim=0)
+        mixed_freq_noise = torch.zeros_like(x_freq)
+        for i, noise in enumerate(generated_noises_freq):
+            mixed_freq_noise += noise * weights[i]
+
+        # 4. Biến đổi ngược (F^H): Chuyển về miền không gian
+        # irfft đảm bảo output là số thực (Real)
+        out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
+        
+        return x + out_noise
+
+    # Các hàm hỗ trợ giữ nguyên
+    def forward_new(self, hyper_features): return self.forward(hyper_features)
+    def update_noise(self): self.expand_new_task()
+    def unfreeze_noise(self):
+        if self.current_task_id >= 0:
+            for param in self.generators[self.current_task_id].parameters():
+                param.requires_grad = True
+    def after_task_training(self): pass
+# [END CHANGE]
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
@@ -729,8 +665,11 @@ class VisionTransformer(nn.Module):
                 mlp_layer=mlp_layer,
             )
             for i in range(depth)])
+        hidden_dim = args['hidden_dim'] if args and 'hidden_dim' in args else 192
+        
+        # 2. Khởi tạo PiNoise với embed_dim động (thay vì số cứng 768)
         self.noise_maker = nn.Sequential(*[
-            PiNoise(768, 768, args['hidden_dim']) for i in range(depth)
+            PiNoise(embed_dim, embed_dim, hidden_dim=hidden_dim) for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
