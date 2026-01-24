@@ -211,20 +211,25 @@ class PiNoise(nn.Module):
         self.sigma.merge_task()
 
     def forward(self, hyper_features, new_forward=False):
-        # Down-project
+        # 1. Down-project
         x_down = hyper_features @ self.w_down
         
-        # BiLORA Forward
+        # 2. BiLORA Forward (Lấy Mean và Variance)
         mu = self.mu(x_down)
         sigma = self.sigma(x_down)
         
-        # Reparameterization
-        epsilon = torch.randn_like(mu)
-        noise = epsilon * sigma + mu 
-        
-        # Up-project & Residual
+        # [FIX LOGIC]: Kiểm tra chế độ training
+        if self.training:
+            # Nếu đang Train: Cần sự đa dạng -> Cộng nhiễu
+            epsilon = torch.randn_like(mu)
+            noise = epsilon * sigma + mu 
+        else:
+            # Nếu đang Eval/Fit RLS: Cần sự ổn định -> Chỉ lấy Mean (mu)
+            # Bỏ qua phần nhiễu (epsilon * sigma)
+            noise = mu 
+            
+        # 3. Up-project & Residual
         return self.MLP(hyper_features) + (noise @ self.w_up) + hyper_features
-    
     # Helpers
     def unfreeze_noise(self):
         self.mu.active_params.requires_grad = True
