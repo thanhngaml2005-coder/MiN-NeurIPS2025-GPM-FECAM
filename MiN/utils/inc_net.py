@@ -218,21 +218,37 @@ class MiNbaseNet(nn.Module):
 
             # 3. Công thức cập nhật RLS
             I = torch.eye(X.shape[0], dtype=torch.float32, device=X.device)
-            
-            term = I + X @ self.R @ X.T
+            temp_XR = X @ self.R
+            term = I + temp_XR @ X.T
             term = 0.5 * (term + term.T)
             
             # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
             jitter = 1e-5 * torch.eye(term.shape[0], device=term.device, dtype=torch.float32)
             
-            # Fix: Dùng linalg.inv thay vì torch.inverse (ổn định hơn)
-            K = torch.linalg.inv(term + jitter)
-            
+            try:
+                K = torch.linalg.inv(term + jitter)
+            except:
+                K = torch.linalg.inv((term + jitter).cpu()).to(self.device)
+            del term, I, jitter
+            torch.cuda.empty_cache() # [QUAN TRỌNG]
             # Cập nhật R (Covariance Matrix)
-            self.R -= self.R @ X.T @ K @ X @ self.R
+            K_XR = K @ temp_XR
             
-            # Cập nhật Trọng số Classifier
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+            # R_update = temp_XR.T @ K_XR
+            # R -= R_update
+            self.R -= temp_XR.T @ K_XR
+            
+            # Xóa các biến to
+            del K, K_XR
+            
+            # Cập nhật Weight: W += R @ X.T @ (Y - X @ W)
+            # P = R @ X.T
+            P = self.R @ X.T
+            self.weight += P @ (Y - X @ self.weight)
+            
+            # Xóa sạch sẽ cuối cùng
+            del X, Y, P, temp_XR
+            torch.cuda.empty_cache()
 
     # =========================================================================
     # [FORWARD PASSES]
