@@ -146,15 +146,18 @@ class MiNbaseNet(nn.Module):
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].update_noise()
 
-    def after_task_magmax_merge(self):
-        """
-        Gọi sau khi kết thúc Task.
-        Kích hoạt việc LƯU (Save) và TRỘN (Merge) tham số theo MagMax.
-        """
-        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        for j in range(self.backbone.layer_num):
-            # Hàm này nằm trong PiNoise
-            self.backbone.noise_maker[j].after_task_training()
+    def after_task_training(self):
+        # Lặp qua các layer
+        for i in range(self.layer_num):
+             # Lấy trọng số cần merge (Ví dụ: trọng số của Attention hoặc MLP)
+             # Giả sử bạn muốn merge trọng số của lớp Linear trong block i
+             # Tùy thuộc BiLoRA bạn gắn vào đâu (qkv, proj, hay fc1, fc2)
+             
+             # Ví dụ: Merge cho lớp qkv của Attention
+             target_w = self.blocks[i].attn.qkv.weight 
+             
+             # Gọi hàm MagMax của PiNoise
+             self.noise_maker[i].after_task_training(target_w)
 
     def unfreeze_noise(self):
         """Chỉ mở khóa gradient cho các module Noise (cho các task > 0)"""

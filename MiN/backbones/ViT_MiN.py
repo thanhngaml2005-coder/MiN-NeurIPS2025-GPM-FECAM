@@ -66,31 +66,39 @@ import torch.nn as nn
 import copy
 
 # [START CHANGE] - Thay thế toàn bộ class PiNoise cũ bằng class này
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
         
         self.in_dim = in_dim
-        # hidden_dim ở đây đóng vai trò là k (Sparsity) trong BiLoRA
-        self.hidden_dim = hidden_dim 
+        self.hidden_dim = hidden_dim # Sparsity k
         
-        # [BiLoRA Logic]: Sử dụng Real FFT (rfft)
-        # Kích thước miền tần số thực (chỉ giữ phần tần số dương để đảm bảo đối xứng Hermitian)
+        # [BiLoRA Logic]: Real FFT
         self.freq_dim = in_dim // 2 + 1
         
         self.act = nn.GELU()
 
-        # Mỗi task có 1 generator riêng (tương ứng Theta_t) và 1 bộ chỉ số riêng (S_t)
+        # Generators và Indices
         self.generators = nn.ModuleList([]) 
         self.task_indices = []
         
-        # Trọng số trộn nhiễu (của phương pháp MIN)
+        # Mix weights
         self.mix_weights = nn.Parameter(torch.tensor([], dtype=torch.float32))
         
         self.current_task_id = -1
+        
+        # --- [MAGMAX STORAGE] ---
+        # Lưu trữ trọng số gốc của Task 0 (W_0)
+        self.w0 = None 
+        # Lưu trữ Vector tổng hợp có Magnitude lớn nhất (Accumulated Task Vector)
+        self.magmax_vector = None
 
     def _get_random_indices(self, max_idx, num_select):
-        """Chọn k chỉ số ngẫu nhiên trong không gian tần số (Mask S_t)"""
         indices = torch.randperm(max_idx)[:num_select]
         return indices.sort()[0]
 
@@ -99,20 +107,17 @@ class PiNoise(nn.Module):
         self.current_task_id += 1
         device = self.mix_weights.device if self.mix_weights.numel() > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # 1. Tạo Mask S_t: Chọn k tần số
+        # 1. Tạo Mask S_t
         new_indices = self._get_random_indices(self.freq_dim, self.hidden_dim).to(device)
         self.task_indices.append(new_indices)
 
-        # 2. Khởi tạo Theta_t (2 MLP: mu và sigma)
-        # Input size = k * 2 (do số phức tách thành Thực + Ảo)
+        # 2. Khởi tạo Theta_t
         input_size = self.hidden_dim * 2
-        
         new_gen = nn.ModuleDict({
             'mu': nn.Linear(input_size, input_size),
             'sigma': nn.Linear(input_size, input_size)
         }).to(device)
 
-        # Khởi tạo trọng số về 0 (để nhiễu ban đầu = 0)
         nn.init.constant_(new_gen['mu'].weight, 0.)
         nn.init.constant_(new_gen['mu'].bias, 0.)
         nn.init.constant_(new_gen['sigma'].weight, 0.)
@@ -120,14 +125,14 @@ class PiNoise(nn.Module):
 
         self.generators.append(new_gen)
 
-        # Đóng băng các task cũ (Freeze old tasks)
+        # Freeze old tasks
         for i, gen in enumerate(self.generators):
             if i < self.current_task_id:
                 for param in gen.parameters(): param.requires_grad = False
             else:
                 for param in gen.parameters(): param.requires_grad = True
         
-        # Cập nhật trọng số trộn (Mix weights)
+        # Cập nhật Mix weights
         new_w = torch.tensor([1.0], device=device)
         if self.current_task_id == 0:
             self.mix_weights = nn.Parameter(new_w)
@@ -140,81 +145,106 @@ class PiNoise(nn.Module):
         """
         if len(self.generators) == 0: return x
 
-        # [FIX 1] Import autocast cục bộ để xử lý lỗi mixed precision
+        # Import autocast cục bộ
         try:
             from torch.amp import autocast
         except ImportError:
             from torch.cuda.amp import autocast
 
-        # 1. Biến đổi Fourier (F): Chuyển sang miền tần số
-        # rfft tự động xử lý tính đối xứng Hermitian
+        # 1. FFT
         x_freq = torch.fft.rfft(x, dim=-1) # [B, N, freq_dim] (Complex)
 
         generated_noises_freq = []
 
-        # 2. Sinh nhiễu trên miền tần số (S . Theta)
+        # 2. Sinh nhiễu
         for task_id, gen in enumerate(self.generators):
             indices = self.task_indices[task_id]
             
-            # a. Lấy đặc trưng tại k tần số đã chọn
-            x_selected = x_freq[..., indices] # [B, N, k]
-            
-            # b. Đưa vào MLP (Input: Real nối với Imag)
-            x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1) # [B, N, 2k]
+            x_selected = x_freq[..., indices]
+            x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
             
             mu = gen['mu'](x_mlp_in)
             sigma = gen['sigma'](x_mlp_in)
             
-            # c. Reparameterization (Tạo nhiễu)
             epsilon = torch.randn_like(mu)
             theta_val = epsilon * sigma + mu 
             
-            # [FIX 2 - QUAN TRỌNG]: Xử lý số phức trong môi trường an toàn (FP32)
-            # Tắt Autocast đoạn này để tránh tạo ra ComplexHalf gây lỗi index_add_
+            # [FIX]: Xử lý số phức với Autocast tắt + Ép kiểu FP32
             with autocast('cuda', enabled=False):
-                # d. Tái tạo số phức từ output MLP
-                # Ép kiểu .float() (FP32) cho các thành phần thực/ảo
                 real_part = theta_val[..., :self.hidden_dim].float()
                 imag_part = theta_val[..., self.hidden_dim:].float()
                 
                 theta_complex = torch.complex(real_part, imag_part)
                 
-                # e. Đặt nhiễu vào bản đồ tần số đầy đủ (Sparse Update)
-                # full_freq_noise cần đảm bảo cùng kiểu với theta_complex
-                # Nếu x_freq là FP16 (ComplexHalf), ta ép full_freq_noise lên FP32
                 full_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-                
-                # Giờ cả 2 đều là ComplexFloat (FP32) -> Cộng OK
                 full_freq_noise.index_add_(-1, indices, theta_complex)
                 
                 generated_noises_freq.append(full_freq_noise)
 
-        # 3. Trộn nhiễu (MIN logic)
+        # 3. Trộn nhiễu
         weights = F.softmax(self.mix_weights, dim=0)
-        
-        # [FIX 3]: Khởi tạo mixed_freq_noise với kiểu ComplexFloat (FP32)
         mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
         
         for i, noise in enumerate(generated_noises_freq):
-            # noise và mixed_freq_noise đều là FP32 nên cộng tốt
             mixed_freq_noise += noise * weights[i]
 
-        # 4. Biến đổi ngược (F^H): Chuyển về miền không gian
-        # irfft đảm bảo output là số thực (Real)
+        # 4. iFFT
         out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
         
-        # Cộng lại vào x (x có thể là FP16, out_noise là FP32 -> PyTorch tự broadcast)
         return x + out_noise
 
-    # Các hàm hỗ trợ giữ nguyên
-    def forward_new(self, hyper_features): return self.forward(hyper_features)
+    # --- [MAGMAX MERGING LOGIC] ---
+    def after_task_training(self, target_weight: torch.Tensor):
+        """
+        Thực hiện MagMax Merging trên trọng số Backbone (target_weight).
+        
+        Định nghĩa MagMax:
+        - Task Vector (t) = W_t - W_0
+        - W_new = W_0 + MaxMagnitude(Task Vectors)
+        
+        Args:
+            target_weight (Tensor): Trọng số của lớp Linear/Attention cần merge (ví dụ: qkv.weight)
+        """
+        # Nếu là Task 0: Chỉ cần lưu lại W_0 làm mốc (Baseline)
+        if self.current_task_id == 0:
+            print(f"--> [MagMax] Saving Task 0 Baseline (Shape: {target_weight.shape})")
+            self.w0 = target_weight.detach().clone()
+            # Khởi tạo vector tích lũy MagMax ban đầu là 0
+            self.magmax_vector = torch.zeros_like(self.w0)
+            return
+
+        # Nếu là Task > 0: Thực hiện MagMax
+        if self.w0 is None:
+            raise ValueError("MagMax Error: W0 chưa được lưu! Hãy chạy Task 0 trước.")
+
+        print(f"--> [MagMax] Merging Task {self.current_task_id} using Task Vector logic...")
+
+        with torch.no_grad():
+            # 1. Tính Task Vector hiện tại: tau_t = W_t - W_0
+            current_w = target_weight.detach()
+            current_task_vector = current_w - self.w0
+            
+            # 2. So sánh Magnitude với vector tích lũy (Running MagMax)
+            # Tạo mask những vị trí mà vector mới có độ lớn (trị tuyệt đối) lớn hơn vector cũ
+            mask = torch.abs(current_task_vector) > torch.abs(self.magmax_vector)
+            
+            # 3. Cập nhật MagMax Vector: 
+            # Tại vị trí mask=True, lấy giá trị mới. Vị trí False giữ nguyên giá trị cũ.
+            self.magmax_vector = torch.where(mask, current_task_vector, self.magmax_vector)
+            
+            # 4. Merge ngược lại vào Backbone: W_new = W_0 + MagMax_Vector
+            # Điều này đảm bảo Backbone luôn chứa các đặc trưng "mạnh nhất" từ tất cả các task
+            target_weight.copy_(self.w0 + self.magmax_vector)
+            
+        # 
+
+    # Các hàm hỗ trợ
     def update_noise(self): self.expand_new_task()
     def unfreeze_noise(self):
         if self.current_task_id >= 0:
+            # Unfreeze logic
             for param in self.generators[self.current_task_id].parameters():
                 param.requires_grad = True
-    def after_task_training(self): pass
-# [END CHANGE]
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
