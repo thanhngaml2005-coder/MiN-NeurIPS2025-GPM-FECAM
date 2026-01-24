@@ -93,8 +93,12 @@ class MiNbaseNet(nn.Module):
             old_nb_output = self.normal_fc.out_features
             with torch.no_grad():
                 new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
+                
                 if new_fc.bias is not None and self.normal_fc.bias is not None:
                      new_fc.bias[:old_nb_output] = self.normal_fc.bias.data
+                nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
+                if new_fc.bias is not None:
+                    nn.init.constant_(new_fc.bias[old_nb_output:], 0.)
             del self.normal_fc
             self.normal_fc = new_fc
         else:
