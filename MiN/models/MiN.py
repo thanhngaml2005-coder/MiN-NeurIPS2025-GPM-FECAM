@@ -224,7 +224,7 @@ class MinNet(object):
             lr = self.init_lr
             weight_decay = self.init_weight_decay
         else:
-            epochs = epoch
+            epochs = self.epochs
             lr = self.lr
             weight_decay = self.weight_decay
 
