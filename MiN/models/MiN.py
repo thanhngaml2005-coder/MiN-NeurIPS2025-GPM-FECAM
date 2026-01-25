@@ -158,7 +158,7 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-        self.check_rls_quality()
+        #self.check_rls_quality()
         del train_set, test_set
         self._clear_gpu()
 
@@ -216,7 +216,7 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-        self.check_rls_quality()
+        #self.check_rls_quality()
         del train_set, test_set
         self._clear_gpu()
 
