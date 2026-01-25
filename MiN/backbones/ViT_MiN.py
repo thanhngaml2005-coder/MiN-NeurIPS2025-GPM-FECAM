@@ -62,13 +62,6 @@ class Noise_weigh(nn.Module):
 
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import init
-import copy
-
-
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=None):
         super(PiNoise, self).__init__()
@@ -99,10 +92,26 @@ class PiNoise(nn.Module):
         self.history_sigma = []
 
     def reset_parameters(self):
-        init.constant_(self.mu.weight, 0.)
-        init.constant_(self.mu.bias, 0.)
-        init.constant_(self.sigma.weight, 0.)
-        init.constant_(self.sigma.bias, 0.)
+        """
+        Warm-start strategy:
+        - Task 0: Kaiming init
+        - Task 1+: Giữ merged weights + exploration noise
+        """
+        if self.current_task_id == 0:
+            init.kaiming_normal_(self.mu.weight, nonlinearity='relu')
+            init.constant_(self.mu.bias, 0.)
+            init.kaiming_normal_(self.sigma.weight, nonlinearity='relu')
+            init.constant_(self.sigma.bias, 1e-2)
+        else:
+            # Warm-start từ merged generator
+            # Weights đã được merge trong after_task_training()
+            # Chỉ thêm noise nhỏ để exploration
+            with torch.no_grad():
+                for param in self.mu.parameters():
+                    param.add_(torch.randn_like(param) * 0.01)
+                for param in self.sigma.parameters():
+                    param.add_(torch.randn_like(param) * 0.01)
+            print(f"🔄 Task {self.current_task_id}: Warm-started from Merged")
 
     def _get_spectral_mask(self, task_id):
         """
@@ -156,50 +165,41 @@ class PiNoise(nn.Module):
         if not self.history_mu: return
 
         def merge_logic(history_list):
-            # history_list[0] là Task 0 (Base Model)
             base_state = history_list[0]
             keys = base_state.keys()
             merged_dict = {}
 
             for key in keys:
-                # 1. Tính Task Vectors = Param_t - Param_0
                 task_vectors = torch.stack([d[key] - base_state[key] for d in history_list], dim=0)
-                
-                # 2. Tìm vị trí có biến động mạnh nhất (Highest Magnitude)
                 magnitudes = torch.abs(task_vectors)
                 max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                
-                # 3. Lấy Vector biến động xịn nhất và cộng ngược vào Base
                 best_delta = torch.gather(task_vectors, 0, max_indices).squeeze(0)
                 merged_dict[key] = base_state[key] + best_delta
-                
             return merged_dict
+
+        # ✅ GỌI HÀM VÀ LOAD WEIGHTS
+        merged_mu = merge_logic(self.history_mu)
+        merged_sigma = merge_logic(self.history_sigma)
+        
+        # ✅ Load vào model
+        self.mu.load_state_dict(merged_mu)
+        self.sigma.load_state_dict(merged_sigma)
+        
+        print(f"✅ [MagMax] Merged {len(self.history_mu)} tasks into Main Generator")
 
     # --- FORWARD PASS VỚI SPECTRAL MASKING ---
     def forward(self, x, new_forward=False):
         if len(self.task_indices) == 0: return x
         
-        try:
-            from torch.amp import autocast
-        except ImportError:
-            from torch.cuda.amp import autocast
-
-        # Step 1: Chuyển sang miền tần số
+        device = x.device # Lấy device một lần
         x_freq = torch.fft.rfft(x, dim=-1)
-        generated_noises_freq = []
         
-        # Training: 1 task | Eval: All tasks
-        loop_range = [self.current_task_id] if self.training else range(len(self.task_indices))
-
-        for task_id in loop_range:
-            indices = self.task_indices[task_id].to(x.device)
-            
-            # Step 2: Apply Mask Mt lên input
-            # Mạng chỉ nhìn thấy 10% dải tần số được cấp
+        if self.training:
+            indices = self.task_indices[self.current_task_id].to(device)
             x_selected = x_freq[..., indices]
+            # Mapping real/imag
             x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
             
-            # Chạy qua MLP (MLP train full nhưng gradient chỉ đi qua indices này)
             mu_out = self.mu(x_mlp_in)
             sigma_out = self.sigma(x_mlp_in)
             
@@ -207,29 +207,46 @@ class PiNoise(nn.Module):
             epsilon = torch.randn_like(mu_out)
             theta_val = epsilon * sigma_out + mu_out
             
-            # Tái tạo số phức cho nhiễu
-            with autocast('cuda', enabled=False):
+            # Khôi phục số phức (Tắt autocast để đảm bảo độ chính xác IFFT)
+            with torch.amp.autocast('cuda', enabled=False):
                 real_part = theta_val[..., :self.mlp_dim].float()
                 imag_part = theta_val[..., self.mlp_dim:].float()
                 theta_complex = torch.complex(real_part, imag_part)
                 
-                # Step 2: Mt ⊙ epsilon_hat
-                # Nhiễu chỉ tồn tại trong mask tần số được cấp
                 full_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
+                # index_add_ giúp giữ gradient tốt hơn trong training
                 full_freq_noise.index_add_(-1, indices, theta_complex)
-                generated_noises_freq.append(full_freq_noise)
-
-        if not generated_noises_freq: return x
+            
+            out_noise = torch.fft.irfft(full_freq_noise, n=self.in_dim, dim=-1)
+            return x + out_noise
         
-        # Trộn nhiễu (Summation)
-        mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-        for noise in generated_noises_freq:
-            mixed_freq_noise.add_(noise)
+        else:
+            # Eval: Kết hợp tất cả tri thức
+            mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
+            
+            for task_id in range(len(self.task_indices)):
+                indices = self.task_indices[task_id].to(device)
+                x_selected = x_freq[..., indices]
+                x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
+                
+                # Generator này đã được MagMax Merge
+                mu_out = self.mu(x_mlp_in)
+                sigma_out = self.sigma(x_mlp_in)
+                epsilon = torch.randn_like(mu_out)
+                theta_val = epsilon * sigma_out + mu_out
+                
+                with torch.amp.autocast('cuda', enabled=False):
+                    real_part = theta_val[..., :self.mlp_dim].float()
+                    imag_part = theta_val[..., self.mlp_dim:].float()
+                    theta_complex = torch.complex(real_part, imag_part)
+                    
+                    # Dùng index_copy_ để ghi đè vùng overlap bằng giá trị của chuyên gia cuối
+                    # Điều này ngăn chặn việc cộng dồn biên độ nhiễu
+                    mixed_freq_noise.index_copy_(-1, indices, theta_complex)
 
-        # Step 3: IFFT về không gian gốc
-        out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
-        return x + out_noise
-    # Thêm đoạn này vào bên trong class PiNoise
+            out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
+            return x + out_noise
+    
     def unfreeze_noise(self):
         """Mở khóa gradient cho các tham số của Generator (mu và sigma)"""
         for param in self.mu.parameters(): 

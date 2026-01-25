@@ -306,7 +306,7 @@ class MinNet(object):
                     if self.cur_task > 0:
                         # [FIX LOGIC NOISE]:
                         # B1: Lấy Logits1 (Kiến thức cũ) từ MAIN Generator (đã merge)
-                        self._network.eval() 
+                        #self._network.eval() 
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']

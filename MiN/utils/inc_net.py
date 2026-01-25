@@ -153,9 +153,6 @@ class MiNbaseNet(nn.Module):
         Sửa đổi: Chuyển sang Eval Mode để ép PiNoise dùng Generator đã Merge (Main),
         tránh việc RLS học nhầm trên Generator tạm thời (Temp).
         """
-        # 1. Lưu trạng thái training cũ và CHUYỂN SANG EVAL
-        training_state = self.training 
-        self.eval() 
         
         try:
             # 2. Feature Extraction (Bật Autocast để nhanh)
@@ -214,8 +211,7 @@ class MiNbaseNet(nn.Module):
                 torch.cuda.empty_cache()
         
         finally:
-            # 4. Trả lại trạng thái cũ (Train mode) để code bên ngoài chạy tiếp nếu cần
-            self.train(training_state)
+            pass
 
     def forward(self, x, new_forward: bool = False):
         if new_forward:
