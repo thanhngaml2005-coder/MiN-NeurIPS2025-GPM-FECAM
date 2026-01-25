@@ -93,7 +93,7 @@ class PiNoise(nn.Module):
         - Task 0: Kaiming init
         - Task 1+: Giữ merged weights + exploration noise
         """
-        if self.current_task_id == 0:
+        if self.current_task_id <= 0:
             init.kaiming_normal_(self.mu.weight, nonlinearity='relu')
             init.constant_(self.mu.bias, 0.)
             init.kaiming_normal_(self.sigma.weight, nonlinearity='relu')
@@ -174,6 +174,7 @@ class PiNoise(nn.Module):
             return merged_dict
 
         # ✅ GỌI HÀM VÀ LOAD WEIGHTS
+        print(f"🔄 [MagMax] Merging {len(self.history_mu)} task generators...")
         merged_mu = merge_logic(self.history_mu)
         merged_sigma = merge_logic(self.history_sigma)
         
