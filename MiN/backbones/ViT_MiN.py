@@ -88,14 +88,14 @@ class PiNoise(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-    if self.current_task_id <= 0:
-        # Giảm std của Kaiming xuống rất nhỏ
-        init.normal_(self.mu.weight, std=0.001) 
-        init.constant_(self.mu.bias, 0.)
-        # Sigma cũng phải rất nhỏ để không làm nổ nhiễu
-        init.constant_(self.sigma.weight, 1e-4) 
-        init.constant_(self.sigma.bias, 1e-4)
-            
+        if self.current_task_id <= 0:
+            # Giảm std của Kaiming xuống rất nhỏ
+            init.normal_(self.mu.weight, std=0.001) 
+            init.constant_(self.mu.bias, 0.)
+            # Sigma cũng phải rất nhỏ để không làm nổ nhiễu
+            init.constant_(self.sigma.weight, 1e-4) 
+            init.constant_(self.sigma.bias, 1e-4)
+                
         else:
             # ============ TASK N (N > 0) ============
             # Warm-start: Thêm exploration noise nhỏ
