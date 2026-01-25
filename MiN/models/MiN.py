@@ -229,7 +229,7 @@ class MinNet(object):
             self._network.to(self.device)
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class).float()
+                targets = torch.nn.functional.one_hot(targets)
                 self._network.fit(inputs, targets)
             
             info = "Task {} --> Update Analytical Classifier!".format(
@@ -245,7 +245,7 @@ class MinNet(object):
         prog_bar = tqdm(train_loader)
         for i, (_, inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
-            targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class).float()
+            targets = torch.nn.functional.one_hot(targets)
             self._network.fit(inputs, targets)
 
             info = "Task {} --> Reupdate Analytical Classifier!".format(

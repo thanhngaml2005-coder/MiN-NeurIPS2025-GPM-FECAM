@@ -191,7 +191,10 @@ class MiNbaseNet(nn.Module):
                     diff = num_targets - current_outputs
                     tail = torch.zeros((self.weight.shape[0], diff), dtype=torch.float32, device=device)
                     self.weight = torch.cat((self.weight, tail), dim=1)
-                
+                elif num_targets < self.out_features:
+                    increment_size = self.out_features - num_targets
+                    tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                    Y = torch.cat((Y, tail), dim=1)
                 # --- RLS CORE ---
                 # P = R * X^T
                 P = self.R @ X_feat.T
