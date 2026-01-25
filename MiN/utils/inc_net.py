@@ -198,14 +198,12 @@ class MiNbaseNet(nn.Module):
 
                 # Tự động mở rộng Classifier (Weight matrix)
                 num_targets = Y.shape[1]
-                current_outputs = self.weight.shape[1]
-                
-                if num_targets > current_outputs:
-                    diff = num_targets - current_outputs
-                    tail = torch.zeros((self.weight.shape[0], diff), dtype=torch.float32, device=device)
+                if num_targets > self.weight.shape[1]:
+                    increment_size = num_targets - self.weight.shape[1]
+                    tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
                     self.weight = torch.cat((self.weight, tail), dim=1)
-                elif num_targets < self.out_features:
-                    increment_size = self.out_features - num_targets
+                elif num_targets < self.weight.shape[1]:
+                    increment_size = self.weight.shape[1] - num_targets
                     tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
                     Y = torch.cat((Y, tail), dim=1)
                 # --- RLS CORE ---
