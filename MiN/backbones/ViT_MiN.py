@@ -105,18 +105,42 @@ class PiNoise(nn.Module):
                 for param in self.sigma.parameters():
                     param.add_(torch.randn_like(param) * 0.0001)
 
-    def _get_spectral_mask(self, task_id):
-        # ... (Giữ nguyên logic của bạn) ...
-        overlap_size = int(self.freq_dim * 0.02)
-        step = self.k - overlap_size
-        end_idx = self.freq_dim - (task_id * step)
-        start_idx = end_idx - self.k
-        if start_idx < 0:
-            start_idx = 0
-            end_idx = self.k
-            print(f"⚠️ Warning: Task {task_id} chạm đáy Low-freq.")
-        return torch.arange(start_idx, end_idx).long()
+    # def _get_spectral_mask(self, task_id):
+    #     # ... (Giữ nguyên logic của bạn) ...
+    #     overlap_size = int(self.freq_dim * 0.02)
+    #     step = self.k - overlap_size
+    #     end_idx = self.freq_dim - (task_id * step)
+    #     start_idx = end_idx - self.k
+    #     if start_idx < 0:
+    #         start_idx = 0
+    #         end_idx = self.k
+    #         print(f"⚠️ Warning: Task {task_id} chạm đáy Low-freq.")
+    #     return torch.arange(start_idx, end_idx).long()
 
+    # Phiên bản An toàn (Fixed Size)
+    def _get_spectral_mask(self, task_id):
+        anchor_idx = int(self.freq_dim * 0.10)
+        max_tasks = 10 # Giả định hệ thống hỗ trợ tốt 10 task
+        
+        # Tạo danh sách tất cả các index khả dụng
+        available = torch.arange(anchor_idx, self.freq_dim)
+        
+        # Lấy mẫu kiểu răng lược
+        indices = available[task_id % max_tasks :: max_tasks]
+        
+        # Cắt hoặc Pad để đảm bảo kích thước luôn khớp với self.k ban đầu
+        # Giả sử self.k được tính là int(self.freq_dim * 0.1) trong __init__
+        target_k = int(self.freq_dim * 0.1) 
+        
+        if len(indices) > target_k:
+            indices = indices[:target_k]
+        elif len(indices) < target_k:
+            # Nếu thiếu (do chia không đều), ta lặp lại các phần tử đầu để lấp đầy
+            # (Hoặc chấp nhận thừa thãi bộ nhớ MLP một chút)
+            padding = indices[:target_k - len(indices)]
+            indices = torch.cat([indices, padding])
+            
+        return indices.long()
     def expand_new_task(self):
         self.current_task_id += 1
         device = self.mu.weight.device
