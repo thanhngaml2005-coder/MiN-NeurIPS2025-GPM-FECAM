@@ -80,7 +80,7 @@ class PiNoise(nn.Module):
 
         # 🌟 3. PHẢI KHỞI TẠO CÁC BIẾN QUẢN LÝ TRƯỚC KHI RESET
         self.task_indices = [] 
-        self.current_task_id = 0 # Khởi tạo là 0 cho task đầu tiên
+        self.current_task_id = -1 # Khởi tạo là 0 cho task đầu tiên
         self.history_mu = []
         self.history_sigma = []
         
