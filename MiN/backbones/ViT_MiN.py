@@ -51,7 +51,7 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 
 _logger = logging.getLogger(__name__)
 
-
+import torch.nn.init as init
 class Noise_weigh(nn.Module):
     def __init__(self, init_value=1.):
         super().__init__()
