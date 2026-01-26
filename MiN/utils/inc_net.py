@@ -413,16 +413,27 @@ class MiNbaseNet(nn.Module):
     
     def forward(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
-        hyper_features = hyper_features.double() 
+        
+        # [FIX OOM]: Bỏ .double(), dùng .float() hoặc giữ nguyên nếu backbone đã trả về float
+        hyper_features = hyper_features.float() 
+        
+        # Buffer bây giờ nhận float32 -> Chạy rất nhanh và nhẹ
         proj_features = self.buffer(hyper_features)
-        proj_features = proj_features.float()
+        
+        # Đảm bảo đầu ra khớp với Classifier Weight
         logits = self.forward_fc(proj_features)
         return {'logits': logits}
 
     def forward_normal_fc(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
-        hyper_features = hyper_features.double()
+        
+        # [FIX OOM]: Bỏ .double(), dùng .float()
+        hyper_features = hyper_features.float()
+        
+        # Qua Buffer
         hyper_features = self.buffer(hyper_features)
+        
+        # Qua Normal FC
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
