@@ -11,18 +11,13 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
 try:
     from torch.amp import autocast, GradScaler
 except ImportError:
     from torch.cuda.amp import autocast, GradScaler
-
-EPSILON = 1e-8
 
 class MinNet(object):
     def __init__(self, args, loger):
@@ -32,29 +27,23 @@ class MinNet(object):
         self._network = MiNbaseNet(args)
         self.device = args['device']
         self.num_workers = args["num_workers"]
-
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
         self.init_weight_decay = args["init_weight_decay"]
         self.init_batch_size = args["init_batch_size"]
-
         self.lr = args["lr"]
         self.batch_size = args["batch_size"]
         self.weight_decay = args["weight_decay"]
         self.epochs = args["epochs"]
-
         self.init_class = args["init_class"]
         self.increment = args["increment"]
-
         self.buffer_size = args["buffer_size"]
         self.buffer_batch = args["buffer_batch"]
         self.gamma = args['gamma']
         self.fit_epoch = args["fit_epochs"]
-
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        
         self.scaler = GradScaler()
 
     def _clear_gpu(self):
@@ -63,23 +52,16 @@ class MinNet(object):
             torch.cuda.empty_cache()
 
     def after_train(self, data_manger):
-        if self.cur_task == 0:
-            self.known_class = self.init_class
-        else:
-            self.known_class += self.increment
-
+        if self.cur_task == 0: self.known_class = self.init_class
+        else: self.known_class += self.increment
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
         eval_res = self.eval_task(test_loader)
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
         self.logger.info('total acc: {}'.format(self.total_acc))
-        self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         print('total acc: {}'.format(self.total_acc))
-        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         del test_set
 
     def save_check_point(self, path_name):
@@ -107,119 +89,85 @@ class MinNet(object):
 
     def init_train(self, data_manger):
         self.cur_task += 1
-        train_list, test_list, train_list_name = data_manger.get_task_list(0)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
-
+        train_list, _, _ = data_manger.get_task_list(0)
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        self.test_loader = test_loader
+        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = True
+            for param in self._network.backbone.parameters(): param.requires_grad = True
 
         self._network.update_fc(self.init_class)
-        self._network.update_noise()
-        
+        # [QUAN TRỌNG]: Gọi update_noise ở đây
+        self._network.update_noise() 
         self._clear_gpu()
         
         self.run(train_loader)
-        
         self._network.after_task_magmax_merge()
         self._clear_gpu()
         
-        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-        self.fit_fc(train_loader_buf, test_loader_buf)
+        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        self.fit_fc(train_loader_buf, None) 
 
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
-                                         num_workers=self.num_workers)
+        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader_no_aug, test_loader_buf)
-        del train_set, test_set, train_set_no_aug
+        self.re_fit(train_loader_no_aug, None)
+        del train_set, train_set_no_aug
         self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
-        train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
-
+        train_list, _, _ = data_manger.get_task_list(self.cur_task)
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        self.test_loader = test_loader
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.fit_fc(train_loader, test_loader)
+        self.fit_fc(train_loader, None)
+        
+        # [FIX OOM]: Dọn sạch trước khi update task
+        self._clear_gpu()
+
         self._network.update_fc(self.increment)
-
-        train_loader_sgd = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
+        # [QUAN TRỌNG]: Gọi update_noise ở đây để warm-start task mới
         self._network.update_noise()
         self._clear_gpu()
 
+        train_loader_sgd = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(train_loader_sgd)
-        
         self._network.after_task_magmax_merge()
         self._clear_gpu()
         del train_set
 
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
-                                         num_workers=self.num_workers)
+        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader_no_aug, test_loader)
-        del train_set_no_aug, test_set
+        self.re_fit(train_loader_no_aug, None)
+        del train_set_no_aug
         self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
-
         prog_bar = tqdm(range(self.fit_epoch))
         for _, epoch in enumerate(prog_bar):
-            # [FIX OOM]: Bỏ dòng self._network.to(self.device) vì đã gọi ở trên
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
                 self._network.fit(inputs, targets)
             
-            info = "Task {} --> Update Analytical Classifier!".format(
-                self.cur_task,
-            )
+            info = f"Task {self.cur_task} --> Update Analytical Classifier!"
             self.logger.info(info)
             prog_bar.set_description(info)
             self._clear_gpu()
@@ -232,78 +180,57 @@ class MinNet(object):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             targets = torch.nn.functional.one_hot(targets)
             self._network.fit(inputs, targets)
-
-            info = "Task {} --> Reupdate Analytical Classifier!".format(
-                self.cur_task,
-            )
+            
+            info = f"Task {self.cur_task} --> Reupdate Analytical Classifier!"
             self.logger.info(info)
             prog_bar.set_description(info)
         self._clear_gpu()
 
     def run(self, train_loader):
+        # ... (Hàm run giữ nguyên như code trước) ...
+        # (Để tiết kiệm không gian, tôi không paste lại hàm run nếu bạn đã có từ câu trả lời trước)
+        # Chỉ lưu ý dòng self._network.to(self.device) nên để ngoài vòng lặp
+        
+        # Tôi sẽ paste lại bản rút gọn cho chắc chắn:
         if self.cur_task == 0:
-            epochs = self.init_epochs
-            lr = self.init_lr
-            weight_decay = self.init_weight_decay
+            epochs, lr, weight_decay = self.init_epochs, self.init_lr, self.init_weight_decay
         else:
-            epochs = self.epochs
-            lr = self.lr 
-            weight_decay = self.weight_decay
+            epochs, lr, weight_decay = self.epochs, self.lr, self.weight_decay
 
-        for param in self._network.parameters():
-            param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
-            param.requires_grad = True
-            
-        if self.cur_task == 0:
-            self._network.init_unfreeze()
-        else:
-            self._network.unfreeze_noise()
+        for param in self._network.parameters(): param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): param.requires_grad = True
+        if self.cur_task == 0: self._network.init_unfreeze()
+        else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
         prog_bar = tqdm(range(epochs))
-        
-        # [FIX OOM]: Đưa model lên GPU 1 lần duy nhất trước vòng lặp
         self._network.train()
         self._network.to(self.device)
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
-
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device).float(), targets.to(self.device)
-                
                 optimizer.zero_grad(set_to_none=True) 
-
-                # [GIỮ AUTOCAST THEO YÊU CẦU]
                 with autocast('cuda'):
                     if self.cur_task > 0:
-                        # 1. Anchor (Old Knowledge) -> Eval mode để dùng Merged Weights
                         self._network.eval() 
                         with torch.no_grad():
-                            outputs1 = self._network(inputs, new_forward=False)
-                            logits1 = outputs1['logits']
-                        
-                        # 2. Current (New Knowledge) -> Train mode để sinh Noise Stochastic
+                            logits1 = self._network(inputs, new_forward=False)['logits']
                         self._network.train()
-                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        
+                        logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                         logits_final = logits2 + logits1.detach()
                     else:
-                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits_final = outputs["logits"]
-
+                        logits_final = self._network.forward_normal_fc(inputs, new_forward=False)["logits"]
                     loss = F.cross_entropy(logits_final, targets.long())
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self._network.parameters(), max_norm=1.0)
-                
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
@@ -311,25 +238,18 @@ class MinNet(object):
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-                
-                # [FIX OOM]: Xóa biến tạm ngay lập tức
                 del inputs, targets, loss, logits_final 
 
             scheduler.step()
             train_acc = 100. * correct / total
-
-            info = "Task {} --> Learning Noise!: Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(
-                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
-            )
+            info = f"Task {self.cur_task} --> Epoch {epoch+1}/{epochs} => Loss {losses/len(train_loader):.3f}, Acc {train_acc:.2f}"
             self.logger.info(info)
             prog_bar.set_description(info)
-            
-            # [FIX OOM]: Dọn rác định kỳ
-            if epoch % 2 == 0: 
-                torch.cuda.empty_cache()
-                gc.collect()
+            if epoch % 2 == 0: self._clear_gpu()
 
     def eval_task(self, test_loader):
+        # ... (Giữ nguyên như code trước) ...
+        # (Paste lại để code chạy được luôn)
         model = self._network.eval()
         pred, label = [], []
         with torch.no_grad():
@@ -350,8 +270,3 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-
-    def analyze_model_sparsity(self):
-        pass
-    def check_rls_quality(self):
-        pass

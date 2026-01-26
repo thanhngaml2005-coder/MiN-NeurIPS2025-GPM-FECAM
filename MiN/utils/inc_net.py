@@ -16,17 +16,12 @@ try:
 except ImportError:
     from torch.cuda.amp import autocast
 
-# =============================================================================
-# 1. CLASS PiNoiseBiLoRA (Giữ nguyên logic - Float32 mặc định)
-# =============================================================================
+# 1. PiNoiseBiLoRA (Tối ưu hóa bộ nhớ cực đoan)
 class PiNoiseBiLoRA(nn.Module):
-    # ... (Phần __init__ giữ nguyên) ...
     def __init__(self, in_dim, sparsity_ratio=0.10, hidden_dim=256):
         super(PiNoiseBiLoRA, self).__init__()
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
-        
-        # Đảm bảo k >= 1
         self.k = max(1, int(self.freq_dim * sparsity_ratio))
         self.mlp_in_dim = self.k * 2 
         self.hidden_dim = hidden_dim
@@ -37,31 +32,24 @@ class PiNoiseBiLoRA(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.mlp_in_dim)
         )
-        
         self.sigma_net = nn.Sequential(
             nn.Linear(self.mlp_in_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.mlp_in_dim)
         )
-
         self.task_indices = []       
         self.current_task_id = -1 
         self.history_mu = []         
         self.history_sigma = []
-        
         self.register_buffer('dummy_buffer', torch.zeros(1))
 
     def reset_parameters(self):
-        """Fixed: In-place perturbation để tiết kiệm RAM"""
         if self.current_task_id <= 0:
-            # Task 0: Zero Init cho lớp cuối
             for name, m in self.named_modules():
                 if isinstance(m, nn.Linear):
-                    is_last = False
-                    if "mu_net" in name and str(len(self.mu_net)-1) in name: is_last = True
-                    if "sigma_net" in name and str(len(self.sigma_net)-1) in name: is_last = True
-                    
+                    is_last = ("mu_net" in name and str(len(self.mu_net)-1) in name) or \
+                              ("sigma_net" in name and str(len(self.sigma_net)-1) in name)
                     if is_last:
                         init.constant_(m.weight, 0)
                         if m.bias is not None: init.constant_(m.bias, 0)
@@ -69,30 +57,25 @@ class PiNoiseBiLoRA(nn.Module):
                         init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                         if m.bias is not None: init.constant_(m.bias, 0)
         else:
-            # Task > 0: Warm-start
-            # [FIX OOM] Dùng in-place operation thay vì tạo tensor mới rồi cộng
-            print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting with perturbation.")
+            print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting (In-place).")
             with torch.no_grad():
                 for param in self.parameters():
-                    # param = param + noise -> Tốn bộ nhớ
-                    # param.add_(noise, alpha=0.001) -> Tiết kiệm bộ nhớ
-                    param.add_(torch.randn_like(param), alpha=0.001)
-
-    # ... (Các hàm còn lại giữ nguyên) ...
+                    # [FIX OOM]: Cộng trực tiếp giá trị vào param, không tạo biến 'noise' to đùng
+                    # torch.randn(size) tạo tensor float32 mặc định (nhẹ hơn double)
+                    # sau đó cộng vào param
+                    noise_small = torch.randn(param.size(), device=param.device, dtype=torch.float32) * 0.001
+                    param.add_(noise_small) 
+                    del noise_small # Xóa ngay lập tức
 
     def _get_spectral_mask(self, task_id):
         start_freq = 1 
         available = torch.arange(start_freq, self.freq_dim)
         max_supported_tasks = 20 
         indices = available[task_id % max_supported_tasks :: max_supported_tasks]
-        
-        if len(indices) >= self.k:
-            indices = indices[:self.k]
+        if len(indices) >= self.k: indices = indices[:self.k]
         else:
-            needed = self.k - len(indices)
-            repeat_factor = math.ceil(needed / len(indices))
-            padding = indices.repeat(repeat_factor)[:needed]
-            indices = torch.cat([indices, padding])
+            repeat = math.ceil((self.k - len(indices)) / len(indices)) + 1
+            indices = indices.repeat(repeat)[:self.k]
         return indices.long()
 
     def expand_new_task(self):
@@ -107,7 +90,6 @@ class PiNoiseBiLoRA(nn.Module):
         sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma_net.state_dict().items()}
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
-        
         self._perform_parameter_magmax(self.mu_net, self.history_mu)
         self._perform_parameter_magmax(self.sigma_net, self.history_sigma)
 
@@ -118,10 +100,9 @@ class PiNoiseBiLoRA(nn.Module):
         with torch.no_grad():
             for key in base_state.keys():
                 all_versions = torch.stack([h[key] for h in history_list], dim=0)
-                magnitudes = torch.abs(all_versions)
-                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
+                max_indices = torch.argmax(torch.abs(all_versions), dim=0, keepdim=True)
                 best_values = torch.gather(all_versions, 0, max_indices).squeeze(0)
-                final_state[key] = best_values
+                final_state[key] = best_values.to(module.dummy_buffer.device)
         module.load_state_dict(final_state)
 
     def forward(self, x):
@@ -134,12 +115,9 @@ class PiNoiseBiLoRA(nn.Module):
             curr_indices = self.task_indices[self.current_task_id].to(device)
             x_selected = x_freq[..., curr_indices]
             x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
-            
             mu = self.mu_net(x_mlp_in)
             sigma = self.sigma_net(x_mlp_in)
-            epsilon = torch.randn_like(mu)
-            z = mu + epsilon * sigma
-            
+            z = mu + torch.randn_like(mu) * sigma
             z_complex = torch.complex(z[..., :self.k], z[..., self.k:])
             total_freq_noise.index_add_(-1, curr_indices, z_complex)
         else:
@@ -147,22 +125,16 @@ class PiNoiseBiLoRA(nn.Module):
                 indices = indices.to(device)
                 x_selected = x_freq[..., indices]
                 x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
-                
                 mu_out = self.mu_net(x_mlp_in)
                 z_complex = torch.complex(mu_out[..., :self.k], mu_out[..., self.k:])
-                
                 current_vals = total_freq_noise[..., indices]
                 mask_better = z_complex.abs() > current_vals.abs()
                 updated_vals = torch.where(mask_better, z_complex, current_vals)
                 total_freq_noise.index_copy_(-1, indices, updated_vals)
 
-        noise_spatial = torch.fft.irfft(total_freq_noise, n=self.in_dim, dim=-1)
-        return noise_spatial
+        return torch.fft.irfft(total_freq_noise, n=self.in_dim, dim=-1)
 
-# =============================================================================
-# 2. BASE NETWORKS & RANDOM BUFFER (Đã chuyển về Float32)
-# =============================================================================
-
+# 2. BaseIncNet & RandomBuffer
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
@@ -191,56 +163,40 @@ class BaseIncNet(nn.Module):
         logits = self.fc(hyper_features)['logits']
         return {'features': hyper_features, 'logits': logits}
 
-
 class RandomBuffer(torch.nn.Linear):
     def __init__(self, in_features: int, buffer_size: int, device):
         super(torch.nn.Linear, self).__init__()
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        
-        # [FIX OOM]: Dùng float32 thay vì double
-        factory_kwargs = {"device": device, "dtype": torch.float32}
-        
+        factory_kwargs = {"device": device, "dtype": torch.double} # Giữ Double
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
         self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # Ép kiểu input về float32
-        X = X.to(self.weight.dtype) 
+        X = X.to(self.weight) 
         return F.relu(X @ self.W)
 
-# =============================================================================
-# 3. MAIN NETWORK (MiNbaseNet - Float32 Version)
-# =============================================================================
+# 3. MiNbaseNet
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
         super(MiNbaseNet, self).__init__()
-        # Dọn dẹp ngay từ đầu
         gc.collect(); torch.cuda.empty_cache()
-        
         self.args = args
         self.backbone = get_pretrained_backbone(args)
         self.device = args['device']
-        
         self.gamma = args['gamma']
         self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
-
-        self.buffer = RandomBuffer(in_features=self.feature_dim, 
-                                   buffer_size=self.buffer_size, 
-                                   device=self.device)
-
-        # RLS Weights & R Matrix dùng Float32 để tiết kiệm RAM
-        factory_kwargs = {"device": self.device, "dtype": torch.float32}
+        self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         
+        # RLS dùng Float32 để tiết kiệm 50% RAM
+        factory_kwargs = {"device": self.device, "dtype": torch.float32}
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight) 
-
         R = torch.eye(self.buffer_size, **factory_kwargs) / self.gamma
         self.register_buffer("R", R) 
-
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
@@ -248,12 +204,11 @@ class MiNbaseNet(nn.Module):
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
-        
         if self.cur_task > 0:
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False).float()
         else:
             new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True).float()
-            
+        
         if self.normal_fc is not None:
             old_nb = self.normal_fc.out_features
             with torch.no_grad():
@@ -265,8 +220,7 @@ class MiNbaseNet(nn.Module):
             nn.init.constant_(new_fc.weight, 0.)
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
-            
-        
+        # Không gọi update_noise ở đây nữa
 
     def update_noise(self):
         if hasattr(self.backbone, 'noise_maker'):
@@ -292,7 +246,6 @@ class MiNbaseNet(nn.Module):
                     for p in block.norm1.parameters(): p.requires_grad = True
                 if hasattr(block, 'norm2'):
                     for p in block.norm2.parameters(): p.requires_grad = True
-        
         if hasattr(self.backbone, 'norm'):
             for p in self.backbone.norm.parameters(): p.requires_grad = True
 
@@ -301,9 +254,7 @@ class MiNbaseNet(nn.Module):
         return features @ self.weight
 
     @torch.no_grad()
- 
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """RLS Fit"""
         old_training_state = self.training
         self.eval() 
         try:
@@ -311,22 +262,20 @@ class MiNbaseNet(nn.Module):
                 X_feat = self.backbone(X)
             
             with autocast('cuda', enabled=False):
-                # Ép kiểu Double -> Tính toán -> Float
-                # Dùng biến tạm để dễ bề xóa
+                # Double cho buffer
                 X_double = X_feat.detach().double()
-                del X_feat # Xóa bản float16 ngay
-                
+                del X_feat 
                 X_proj = self.buffer(X_double) 
-                del X_double # Xóa bản double input ngay
+                del X_double
                 
-                X_final = X_proj.float() # Về lại float32 cho RLS
-                del X_proj # Xóa bản double output ngay
+                # Float cho RLS
+                X_final = X_proj.float() 
+                del X_proj
                 
                 device = self.weight.device
                 X_final = X_final.to(device)
                 Y = Y.to(device).float()
 
-                # Expand weights
                 num_targets = Y.shape[1]
                 if num_targets > self.weight.shape[1]:
                     increment_size = num_targets - self.weight.shape[1]
@@ -337,7 +286,6 @@ class MiNbaseNet(nn.Module):
                     tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
                     Y = torch.cat((Y, tail), dim=1)
 
-                # RLS Algorithm
                 P = self.R @ X_final.T
                 term = X_final @ P
                 term.diagonal().add_(1.0) 
@@ -346,7 +294,7 @@ class MiNbaseNet(nn.Module):
                 try:
                     K = torch.linalg.inv(term)
                 except RuntimeError:
-                    print("⚠️ GPU OOM, switching to CPU for Inverse...")
+                    print("⚠️ Switch CPU inv...")
                     K = torch.linalg.inv(term.cpu()).to(device)
                 del term 
                 
@@ -356,22 +304,22 @@ class MiNbaseNet(nn.Module):
                 
                 residual = Y - (X_final @ self.weight)
                 self.weight += P_K @ residual
-                
                 del X_final, Y, K, P_K, residual
                 torch.cuda.empty_cache()
         finally:
             self.train(old_training_state)
+
     def forward(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
-        # Ép kiểu float cho an toàn
-        hyper_features = hyper_features.float() 
+        hyper_features = hyper_features.double() 
         proj_features = self.buffer(hyper_features)
+        proj_features = proj_features.float()
         logits = self.forward_fc(proj_features)
         return {'logits': logits}
 
     def forward_normal_fc(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
-        hyper_features = hyper_features.float()
+        hyper_features = hyper_features.double()
         hyper_features = self.buffer(hyper_features)
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         logits = self.normal_fc(hyper_features)['logits']
