@@ -210,7 +210,7 @@ class BaseIncNet(nn.Module):
             'features': hyper_features,
             'logits': logits
         }
-
+# inc_net.py
 
 class RandomBuffer(torch.nn.Linear):
     def __init__(self, in_features: int, buffer_size: int, device):
@@ -218,7 +218,11 @@ class RandomBuffer(torch.nn.Linear):
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        factory_kwargs = {"device": device, "dtype": torch.double}
+        
+        # --- FIX: Đổi torch.double thành torch.float32 ---
+        factory_kwargs = {"device": device, "dtype": torch.float32} 
+        
+        # Khởi tạo buffer với float32
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
         self.reset_parameters()
