@@ -253,13 +253,17 @@ class RandomBuffer(torch.nn.Linear):
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        factory_kwargs = {"device": device, "dtype": torch.double}
+        
+        # [FIX OOM 2]: Dùng Float32 thay vì Double
+        factory_kwargs = {"device": device, "dtype": torch.float32}
+        
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
         self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        X = X.to(self.weight) 
+        # Ép kiểu float32
+        X = X.to(self.weight.dtype) 
         return F.relu(X @ self.W)
 
 class MiNbaseNet(nn.Module):
@@ -272,17 +276,85 @@ class MiNbaseNet(nn.Module):
         self.gamma = args['gamma']
         self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
+        
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         
-        # RLS (Float32)
+        # RLS dùng Float32
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight) 
         R = torch.eye(self.buffer_size, **factory_kwargs) / self.gamma
         self.register_buffer("R", R) 
+        
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
+
+    # ... (Các hàm update_fc, update_noise, unfreeze... giữ nguyên) ...
+
+    @torch.no_grad()
+    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        """
+        RLS Fit: Float32 Only.
+        Không convert sang Double, không tạo bản sao thừa.
+        """
+        old_training_state = self.training
+        self.eval() 
+        try:
+            with autocast('cuda', enabled=True): 
+                X_feat = self.backbone(X)
+            
+            with autocast('cuda', enabled=False):
+                # [FIX OOM 2]: Chỉ dùng Float32
+                X_feat = X_feat.detach().float() # Detach và ép float32
+                
+                # Chiếu qua buffer (Float32 @ Float32 -> Nhẹ nhàng)
+                X_proj = self.buffer(X_feat)
+                
+                # Giải phóng feature gốc ngay
+                del X_feat
+                
+                device = self.weight.device
+                X_final = X_proj.to(device)
+                Y = Y.to(device).float()
+
+                # Expand weights (Giữ nguyên logic)
+                num_targets = Y.shape[1]
+                if num_targets > self.weight.shape[1]:
+                    increment_size = num_targets - self.weight.shape[1]
+                    tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                    self.weight = torch.cat((self.weight, tail), dim=1)
+                elif num_targets < self.weight.shape[1]:
+                    increment_size = self.weight.shape[1] - num_targets
+                    tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                    Y = torch.cat((Y, tail), dim=1)
+
+                # RLS Math (Vẫn dùng Float32)
+                # Tính toán từng bước để dễ xóa biến tạm
+                P = self.R @ X_final.T
+                
+                term = X_final @ P
+                term.diagonal().add_(1.0) 
+                term = 0.5 * (term + term.T)
+                
+                try:
+                    K = torch.linalg.inv(term)
+                except RuntimeError:
+                    print("⚠️ Switch CPU inv...")
+                    K = torch.linalg.inv(term.cpu()).to(device)
+                del term 
+                
+                P_K = P @ K 
+                self.R -= P_K @ P.T
+                del P 
+                
+                residual = Y - (X_final @ self.weight)
+                self.weight += P_K @ residual
+                
+                del X_final, Y, K, P_K, residual
+                torch.cuda.empty_cache()
+        finally:
+            self.train(old_training_state)
 
     def update_fc(self, nb_classes):
         self.cur_task += 1
@@ -338,63 +410,7 @@ class MiNbaseNet(nn.Module):
         features = features.to(self.weight.dtype)
         return features @ self.weight
 
-    @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """RLS Fit Optimized"""
-        old_training_state = self.training
-        self.eval() 
-        try:
-            with autocast('cuda', enabled=True): 
-                X_feat = self.backbone(X)
-            
-            with autocast('cuda', enabled=False):
-                # Double for Buffer
-                X_double = X_feat.detach().double()
-                del X_feat 
-                X_proj = self.buffer(X_double) 
-                del X_double
-                
-                # Float for RLS
-                X_final = X_proj.float() 
-                del X_proj
-                
-                device = self.weight.device
-                X_final = X_final.to(device)
-                Y = Y.to(device).float()
-
-                num_targets = Y.shape[1]
-                if num_targets > self.weight.shape[1]:
-                    increment_size = num_targets - self.weight.shape[1]
-                    tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
-                    self.weight = torch.cat((self.weight, tail), dim=1)
-                elif num_targets < self.weight.shape[1]:
-                    increment_size = self.weight.shape[1] - num_targets
-                    tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-                    Y = torch.cat((Y, tail), dim=1)
-
-                P = self.R @ X_final.T
-                term = X_final @ P
-                term.diagonal().add_(1.0) 
-                term = 0.5 * (term + term.T)
-                
-                try:
-                    K = torch.linalg.inv(term)
-                except RuntimeError:
-                    print("⚠️ Switch CPU inv...")
-                    K = torch.linalg.inv(term.cpu()).to(device)
-                del term 
-                
-                P_K = P @ K 
-                self.R -= P_K @ P.T
-                del P 
-                
-                residual = Y - (X_final @ self.weight)
-                self.weight += P_K @ residual
-                del X_final, Y, K, P_K, residual
-                torch.cuda.empty_cache()
-        finally:
-            self.train(old_training_state)
-
+    
     def forward(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
         hyper_features = hyper_features.double() 
