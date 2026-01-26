@@ -431,116 +431,128 @@ from torch.nn import init
 import torch
 import torch.nn as nn
 import math
-
 class PiNoise(nn.Module):
-    """
-    PiNoise for MiN (BiLoRA-style)
-
-    - 1 PiNoise = 1 task
-    - frequency bands are DISJOINT across tasks
-    - old PiNoise modules are frozen by trainer
-    - NO internal multi-task logic
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        task_id: int,
-        k: int = 16,
-        hidden_dim: int = 128,
-        device: str = "cuda"
-    ):
+    def __init__(self, in_dim):
         super().__init__()
+        self.in_dim = in_dim
+        self.freq_dim = in_dim // 2 + 1
 
-        self.in_dim = in_dim              # e.g. 768
-        self.task_id = task_id            # PROVIDED by MiN / trainer
-        self.k = k
+        # ===== Hyper =====
+        self.k = 16
+        self.mlp_dim = self.k * 2
 
-        # only half spectrum is independent
-        self.n_freq = in_dim // 2
+        # ===== Generator =====
+        self.mu = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.sigma = nn.Linear(self.mlp_dim, self.mlp_dim)
 
-        # ---- disjoint frequency slice ----
-        start = task_id * k
-        end = start + k
-        assert end <= self.n_freq, (
-            f"[PiNoise] Not enough frequencies: "
-            f"task {task_id}, need {end}, max {self.n_freq}"
-        )
-        self.freq_slice = slice(start, end)
+        # ===== Task management =====
+        self.current_task_id = -1
+        self.task_indices = []
 
-        print(f"[PiNoise] Task {task_id} freq {start}–{end-1}")
+        # ===== History for MagMax =====
+        self.history_mu = []
+        self.history_sigma = []
 
-        # ---- generators (ONLY for this task) ----
-        self.mu = nn.Sequential(
-            nn.Linear(k, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, k)
-        )
+        self.reset_parameters(first_init=True)
 
-        self.sigma = nn.Sequential(
-            nn.Linear(k, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, k),
-            nn.Softplus()
-        )
+    # ------------------------------------------------------------------
+    def reset_parameters(self, first_init=False):
+        if first_init:
+            nn.init.normal_(self.mu.weight, std=1e-3)
+            nn.init.constant_(self.mu.bias, 0.)
+            nn.init.constant_(self.sigma.weight, 1e-4)
+            nn.init.constant_(self.sigma.bias, 1e-4)
+        else:
+            # warm-start nhẹ
+            with torch.no_grad():
+                for p in self.mu.parameters():
+                    p.add_(torch.randn_like(p) * 1e-3)
+                for p in self.sigma.parameters():
+                    p.add_(torch.randn_like(p) * 1e-4)
 
-        # ---- up projection ----
-        self.w_up = nn.Parameter(
-            torch.randn(in_dim, in_dim) * 0.02
-        )
+    # ------------------------------------------------------------------
+    def _get_spectral_mask(self, task_id):
+        anchor = int(self.freq_dim * 0.10)
+        max_tasks = 10
+        available = torch.arange(anchor, self.freq_dim)
 
-    # --------------------------------------------------
-    # MiN REQUIRED API (DO NOT REMOVE)
-    # --------------------------------------------------
+        indices = available[task_id % max_tasks :: max_tasks]
 
-    def update_noise(self):
-        """MiN compatibility hook (no-op)."""
-        pass
+        if len(indices) >= self.k:
+            indices = indices[:self.k]
+        else:
+            pad = indices[: self.k - len(indices)]
+            indices = torch.cat([indices, pad])
 
-    def unfreeze_noise(self):
-        """Called by MiN when this task is active."""
-        for p in self.parameters():
-            p.requires_grad = True
+        return indices.long()
 
-    def init_weight_noise(self, prototypes=None):
-        """Optional MiN hook."""
-        pass
+    # ------------------------------------------------------------------
+    def expand_new_task(self):
+        self.current_task_id += 1
+        indices = self._get_spectral_mask(self.current_task_id)
+        self.task_indices.append(indices)
 
-    # --------------------------------------------------
-    # Forward
-    # --------------------------------------------------
+        if self.current_task_id > 0:
+            self.reset_parameters(first_init=False)
 
-    def forward(self, x, hyper_features=None):
-        """
-        x: [B, D]
-        """
-        B, D = x.shape
-        assert D == self.in_dim
+        print(f"[PiNoise] Task {self.current_task_id}, mask={indices[0]}→{indices[-1]}")
 
-        # ---- frequency noise (half spectrum) ----
-        freq_noise = torch.zeros(
-            B, self.n_freq, device=x.device
-        )
+    # ------------------------------------------------------------------
+    def after_task_training(self):
+        self.history_mu.append({k: v.detach().cpu() for k, v in self.mu.state_dict().items()})
+        self.history_sigma.append({k: v.detach().cpu() for k, v in self.sigma.state_dict().items()})
+        self._magmax_merge()
 
-        eps = torch.randn(B, self.k, device=x.device)
+    # ------------------------------------------------------------------
+    def _magmax_merge(self):
+        def magmax(history):
+            base = history[0]
+            merged = {}
+            for k in base:
+                stack = torch.stack([h[k] - base[k] for h in history], dim=0)
+                idx = torch.argmax(stack.abs(), dim=0, keepdim=True)
+                merged[k] = base[k] + torch.gather(stack, 0, idx).squeeze(0)
+            return merged
 
-        freq_noise[:, self.freq_slice] = (
-            self.mu(eps) + eps * self.sigma(eps)
-        )
+        print(f"[MagMax] merging {len(self.history_mu)} tasks")
+        self.mu.load_state_dict(magmax(self.history_mu))
+        self.sigma.load_state_dict(magmax(self.history_sigma))
 
-        # ---- mirror to full spectrum ----
-        full_noise = torch.cat(
-            [freq_noise, freq_noise.flip(dims=[1])],
-            dim=1
-        )[:, :self.in_dim]
+    # ------------------------------------------------------------------
+    def forward(self, x):
+        if self.current_task_id < 0:
+            return x
 
-        noise = full_noise @ self.w_up
+        x_f = torch.fft.rfft(x.float(), dim=-1)
+        total_noise = torch.zeros_like(x_f, dtype=torch.complex64)
 
-        out = x + noise
-        if hyper_features is not None:
-            out = out + hyper_features
+        if self.training:
+            idx = self.task_indices[self.current_task_id].to(x.device)
+            sel = x_f[..., idx]
+            mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
 
-        return out
+            mu = self.mu(mlp_in)
+            sigma = self.sigma(mlp_in)
+            eps = torch.randn_like(mu)
+
+            z = eps * sigma + mu
+            z = torch.complex(z[..., :self.k], z[..., self.k:])
+            total_noise.index_add_(-1, idx, z)
+
+        else:
+            for idx in self.task_indices:
+                idx = idx.to(x.device)
+                sel = x_f[..., idx]
+                mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
+                mu = self.mu(mlp_in)
+                z = torch.complex(mu[..., :self.k], mu[..., self.k:])
+
+                curr = total_noise[..., idx]
+                mask = z.abs() > curr.abs()
+                total_noise.index_copy_(-1, idx, torch.where(mask, z, curr))
+
+        noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
+        return x + noise.to(x.dtype)
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
@@ -1018,11 +1030,7 @@ class VisionTransformer(nn.Module):
         # 2. Khởi tạo PiNoise với embed_dim động (thay vì số cứng 768)
         self.noise_maker = nn.ModuleList([
     PiNoise(
-        in_dim=768,
-        k=16,
-        task_id=0,   # task hiện tại
-        total_tasks=10,
-        device=args['device']
+        in_dim=768
     )
     for _ in range(depth)
 ])
