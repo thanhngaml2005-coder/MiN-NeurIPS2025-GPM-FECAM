@@ -4,24 +4,18 @@ import torch.nn.functional as F
 
 from utils.inc_net import BackboneWithPiNoise
 
-
-class MinNet(nn.Module):
-    """
-    MiN main network
-
-    - backbone: ViT / CNN (timm)
-    - PiNoise handled in BackboneWithNoise
-    - logits = normal_fc(feat + noise)
-    """
-
-    def __init__(self, args):
+class MinNet(object):
+    def __init__(self, args, loger):
         super().__init__()
+        self.args = args
+        self.logger = loger
 
         self.device = args["device"]
         self.backbone_name = args["backbone_name"]
         self.backbone = args["backbone"]          # timm model (built outside)
         self.k = args["k"]                         # freq per task
         self.hidden_dim = args.get("hidden_dim", 128)
+        self.loger = loger
 
         self.num_tasks = args["num_tasks"]
         self.cur_task = 0
