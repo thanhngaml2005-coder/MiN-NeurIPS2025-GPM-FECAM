@@ -176,7 +176,7 @@ class MiNbaseNet(nn.Module):
         Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
         """
         # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
-        with autocast(enabled=False):
+        with autocast('cuda', enabled=False):
             # 1. Feature Extraction & Expansion
             X = self.backbone(X).float() # ViT Features
             X = self.buffer(X)           # Random Expansion -> float32
