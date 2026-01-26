@@ -256,8 +256,6 @@ class PiNoise(nn.Module):
     def freeze_noise(self):
         for param in self.parameters(): param.requires_grad = False
 
-
-
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
