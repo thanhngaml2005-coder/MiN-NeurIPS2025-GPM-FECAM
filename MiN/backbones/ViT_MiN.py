@@ -69,19 +69,35 @@ import math
 import copy
 import gc
 
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import math
+import copy
+import gc
+
 class PiNoise(nn.Module):
-    def __init__(self, in_dim, sparsity_ratio=0.10, hidden_dim=256):
-        """BiLoRA Architecture: Frequency Domain Noise Generation"""
+    def __init__(self, in_dim, sparsity_ratio=0.10, hidden_dim=64):
+        """
+        Phiên bản Fix OOM:
+        1. Ép kiểu Float32 ở đầu vào (Tránh Complex128).
+        2. Hidden Dim cố định nhỏ (64).
+        3. Warm-start không tạo biến tạm.
+        """
         super(PiNoise, self).__init__()
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
         
-        # 1. Config Kích thước (Sparsity)
+        # 1. Config kích thước
         self.k = max(1, int(self.freq_dim * sparsity_ratio))
-        self.mlp_in_dim = self.k * 2 
-        self.hidden_dim = hidden_dim if hidden_dim else self.mlp_in_dim * 2
         
-        # 2. Generator (Shared MLP) thay cho Linear đơn giản cũ
+        # Input MLP = Real + Imag
+        self.mlp_in_dim = self.k * 2 
+        
+        # [FIX 2]: Cố định hidden nhỏ, không dùng công thức nhân đôi
+        self.hidden_dim = hidden_dim 
+        
+        # 2. Generator
         self.mu_net = nn.Sequential(
             nn.Linear(self.mlp_in_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
@@ -95,20 +111,22 @@ class PiNoise(nn.Module):
             nn.Linear(self.hidden_dim, self.mlp_in_dim)
         )
 
-        # 3. Quản lý Task (Running MagMax - Chỉ lưu 1 bản gộp trên CPU)
+        # 3. Quản lý Task
         self.task_indices = []       
         self.current_task_id = -1 
+        
+        # Running MagMax (Chỉ lưu 1 bản gộp trên CPU)
         self.merged_mu_state = None    
         self.merged_sigma_state = None 
         
         self.register_buffer('dummy_buffer', torch.zeros(1))
 
     def reset_parameters(self):
-        """Zero Init cho Task 0, In-place Warm-start cho Task > 0"""
+        """Khởi tạo không tốn RAM tạm"""
         if self.current_task_id <= 0:
+            # Task 0: Zero Init
             for name, m in self.named_modules():
                 if isinstance(m, nn.Linear):
-                    # Tìm layer cuối cùng của MLP
                     is_last = ("mu_net" in name and str(len(self.mu_net)-1) in name) or \
                               ("sigma_net" in name and str(len(self.sigma_net)-1) in name)
                     if is_last:
@@ -118,13 +136,14 @@ class PiNoise(nn.Module):
                         init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                         if m.bias is not None: init.constant_(m.bias, 0)
         else:
+            # Task > 0: Warm-start In-place
             print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting (In-place).")
             with torch.no_grad():
                 for param in self.parameters():
-                    param.add_(torch.randn_like(param), alpha=0.001)
+                    # [FIX 3]: Cộng trực tiếp, không tạo biến noise = ...
+                    param.add_(torch.randn(param.size(), device=param.device) * 0.001)
 
     def _get_spectral_mask(self, task_id):
-        """Comb Sampling Mask"""
         start_freq = 1 
         available = torch.arange(start_freq, self.freq_dim)
         max_supported_tasks = 20 
@@ -133,14 +152,11 @@ class PiNoise(nn.Module):
         if len(indices) >= self.k:
             indices = indices[:self.k]
         else:
-            needed = self.k - len(indices)
-            repeat_factor = math.ceil(needed / len(indices))
-            padding = indices.repeat(repeat_factor)[:needed]
-            indices = torch.cat([indices, padding])
+            repeat = math.ceil((self.k - len(indices)) / len(indices)) + 1
+            indices = indices.repeat(repeat)[:self.k]
         return indices.long()
 
     def expand_new_task(self, target_task_id):
-        """Nhận ID cụ thể để tránh lỗi logic cộng dồn"""
         if target_task_id <= self.current_task_id: return
         self.current_task_id = target_task_id
         
@@ -150,7 +166,7 @@ class PiNoise(nn.Module):
         self.reset_parameters()
 
     def after_task_training(self):
-        """Running MagMax trên CPU (Memory Safe)"""
+        # Merge logic trên CPU
         current_mu = {k: v.detach().cpu().clone() for k, v in self.mu_net.state_dict().items()}
         current_sigma = {k: v.detach().cpu().clone() for k, v in self.sigma_net.state_dict().items()}
         
@@ -172,13 +188,14 @@ class PiNoise(nn.Module):
         return new_merged
 
     def forward(self, x):
-    # [FIX QUAN TRỌNG NHẤT]: Ép về float32 trước khi FFT
-    # Từ complex128 (16 bytes) -> complex64 (8 bytes) => Giảm 50% RAM tức thì
-        
         if len(self.task_indices) == 0: return torch.zeros_like(x)
-        device = x.device
+        
+        # [FIX 1 - QUAN TRỌNG NHẤT]: Ép kiểu Float32 trước khi FFT
+        # Input x đang là Double (từ RandomBuffer) -> Nếu không ép kiểu -> FFT ra Complex128 (Siêu Nặng)
         x_float = x.float() 
-        x_freq = torch.fft.rfft(x_float, dim=-1)
+        
+        device = x.device
+        x_freq = torch.fft.rfft(x_float, dim=-1) # Ra Complex64 (Nhẹ)
         
         total_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
 
@@ -189,29 +206,32 @@ class PiNoise(nn.Module):
             
             mu = self.mu_net(mlp_in)
             sigma = self.sigma_net(mlp_in)
-            z = mu + torch.randn_like(mu) * sigma # Reparameterization
+            z = mu + torch.randn_like(mu) * sigma
             
             z_c = torch.complex(z[..., :self.k], z[..., self.k:])
             total_noise.index_add_(-1, indices, z_c)
         else:
-            # Eval Deterministic
             for indices in self.task_indices:
                 indices = indices.to(device)
                 x_sel = x_freq[..., indices]
                 mlp_in = torch.cat([x_sel.real, x_sel.imag], dim=-1)
-                mu_out = self.mu_net(mlp_in) # Chỉ lấy Mu
+                mu_out = self.mu_net(mlp_in)
                 z_c = torch.complex(mu_out[..., :self.k], mu_out[..., self.k:])
                 
                 curr_vals = total_noise[..., indices]
                 mask = z_c.abs() > curr_vals.abs()
                 total_noise.index_copy_(-1, indices, torch.where(mask, z_c, curr_vals))
 
-        return torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
-    
+        noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
+        
+        # Trả về đúng kiểu dữ liệu (Double) để khớp với mạng chính
+        return noise.to(x.dtype)
+
     def unfreeze_noise(self):
-        for p in self.parameters(): p.requires_grad = True
+        for param in self.parameters(): param.requires_grad = True
 
-
+    def freeze_noise(self):
+        for param in self.parameters(): param.requires_grad = False
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
