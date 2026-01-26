@@ -17,7 +17,6 @@ from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
-# Import Mixed Precision
 try:
     from torch.amp import autocast, GradScaler
 except ImportError:
@@ -55,10 +54,7 @@ class MinNet(object):
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        self.class_acc = []
-        self.task_acc = []
         
-        # Scaler cho Mixed Precision
         self.scaler = GradScaler()
 
     def _clear_gpu(self):
@@ -84,7 +80,6 @@ class MinNet(object):
         self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         print('total acc: {}'.format(self.total_acc))
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        
         del test_set
 
     def save_check_point(self, path_name):
@@ -137,23 +132,17 @@ class MinNet(object):
         
         self._clear_gpu()
         
-        # 1. Train Task 0 (SGD Normal FC + Noise)
         self.run(train_loader)
         
-        # 2. Merge Params
         self._network.after_task_magmax_merge()
-        # self.analyze_model_sparsity()
-        
         self._clear_gpu()
         
-        # 3. Fit RLS (Analytic Classifier)
         train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
         self.fit_fc(train_loader_buf, test_loader_buf)
 
-        # 4. Re-fit (Refinement)
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
@@ -164,7 +153,6 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader_no_aug, test_loader_buf)
-        # self.check_rls_quality()
         del train_set, test_set, train_set_no_aug
         self._clear_gpu()
 
@@ -190,12 +178,9 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # 1. Pre-fit RLS (Dùng tri thức cũ để khởi tạo classifier cho class mới)
         self.fit_fc(train_loader, test_loader)
-
         self._network.update_fc(self.increment)
 
-        # 2. Train Noise (SGD) để sửa lỗi
         train_loader_sgd = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
         self._network.update_noise()
@@ -203,13 +188,10 @@ class MinNet(object):
 
         self.run(train_loader_sgd)
         
-        # 3. Merge Params (MagMax)
         self._network.after_task_magmax_merge()
-        # self.analyze_model_sparsity()
         self._clear_gpu()
         del train_set
 
-        # 4. Re-fit RLS (Dùng Feature đã được tinh chỉnh bởi Noise mới)
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
@@ -220,7 +202,6 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader_no_aug, test_loader)
-        # self.check_rls_quality()
         del train_set_no_aug, test_set
         self._clear_gpu()
 
@@ -230,7 +211,7 @@ class MinNet(object):
 
         prog_bar = tqdm(range(self.fit_epoch))
         for _, epoch in enumerate(prog_bar):
-            self._network.to(self.device)
+            # [FIX OOM]: Bỏ dòng self._network.to(self.device) vì đã gọi ở trên
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
@@ -255,7 +236,6 @@ class MinNet(object):
             info = "Task {} --> Reupdate Analytical Classifier!".format(
                 self.cur_task,
             )
-            
             self.logger.info(info)
             prog_bar.set_description(info)
         self._clear_gpu()
@@ -270,7 +250,6 @@ class MinNet(object):
             lr = self.lr 
             weight_decay = self.weight_decay
 
-        # Freeze Backbone, Unfreeze Noise & Normal FC
         for param in self._network.parameters():
             param.requires_grad = False
         for param in self._network.normal_fc.parameters():
@@ -286,6 +265,8 @@ class MinNet(object):
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
         prog_bar = tqdm(range(epochs))
+        
+        # [FIX OOM]: Đưa model lên GPU 1 lần duy nhất trước vòng lặp
         self._network.train()
         self._network.to(self.device)
 
@@ -298,25 +279,21 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True) 
 
+                # [GIỮ AUTOCAST THEO YÊU CẦU]
                 with autocast('cuda'):
                     if self.cur_task > 0:
-                        # [FIX QUAN TRỌNG]: Khi lấy Anchor (Kiến thức cũ), phải dùng Eval mode 
-                        # để PiNoise dùng MagMax (merged weights) thay vì random noise của task mới.
-                        
-                        # 1. Anchor Prediction (Tri thức cũ ổn định)
+                        # 1. Anchor (Old Knowledge) -> Eval mode để dùng Merged Weights
                         self._network.eval() 
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
                         
-                        # 2. Current Prediction (Tri thức mới đang học - Stochastic)
+                        # 2. Current (New Knowledge) -> Train mode để sinh Noise Stochastic
                         self._network.train()
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
                         
-                        # 3. Residual Learning
                         logits_final = logits2 + logits1.detach()
-
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits_final = outputs["logits"]
@@ -335,17 +312,22 @@ class MinNet(object):
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
+                # [FIX OOM]: Xóa biến tạm ngay lập tức
+                del inputs, targets, loss, logits_final 
+
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
+            info = "Task {} --> Learning Noise!: Epoch {}/{} => Loss {:.3f}, Acc {:.2f}".format(
                 self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
-            if epoch % 5 == 0:
+            # [FIX OOM]: Dọn rác định kỳ
+            if epoch % 2 == 0: 
                 torch.cuda.empty_cache()
+                gc.collect()
 
     def eval_task(self, test_loader):
         model = self._network.eval()
@@ -369,64 +351,7 @@ class MinNet(object):
             "all_task_accy": task_info['task_accy'],
         }
 
-    def analyze_model_sparsity(self, threshold=1e-4):
-        """
-        Phiên bản FIX: Tương thích với PiNoiseBiLoRA (mu_net/sigma_net là Sequential)
-        """
-        print("\n" + "="*50)
-        print("📊 PHÂN TÍCH ĐỘ THƯA (SPARSITY REPORT)")
-        print("="*50)
-
-        # 1. RLS Classifier
-        w_rls = self._network.weight
-        total_rls = w_rls.numel()
-        if total_rls > 0:
-            zero_rls = torch.sum(torch.abs(w_rls) <= threshold).item()
-            sparsity_rls = (zero_rls / total_rls) * 100
-            print(f"🔹 Analytic Classifier (W_rls): Sparsity {sparsity_rls:.2f}%")
-        else:
-            print(f"🔹 Analytic Classifier (W_rls): Empty")
-
-        # 2. PiNoise Modules
-        if not hasattr(self._network.backbone, 'noise_maker'):
-            print("⚠️ Backbone không có 'noise_maker'. Skip.")
-            return
-
-        print(f"\n🔹 PiNoise Modules (Backbone Layers):")
-        total_mu_sparsity = []
-        
-        for i, noise_module in enumerate(self._network.backbone.noise_maker):
-            # Truy cập vào Linear layer đầu tiên trong mu_net (Sequential)
-            # mu_net[0] là Linear(mlp_in, hidden)
-            if hasattr(noise_module, 'mu_net') and isinstance(noise_module.mu_net, torch.nn.Sequential):
-                mu_layer = noise_module.mu_net[0] 
-                if isinstance(mu_layer, torch.nn.Linear):
-                    mu_w = mu_layer.weight.data
-                    zero_mu = torch.sum(torch.abs(mu_w) < threshold).item()
-                    sparsity_mu = (zero_mu / mu_w.numel()) * 100
-                    total_mu_sparsity.append(sparsity_mu)
-                    
-                    if i % 4 == 0:
-                        print(f"   - Layer {i:2d} | mu_net[0] sparsity: {sparsity_mu:.2f}%")
-            else:
-                # Fallback nếu cấu trúc khác
-                pass
-
-        if len(total_mu_sparsity) > 0:
-            avg_sparsity = np.mean(total_mu_sparsity)
-            print("-" * 50)
-            print(f"✅ Trung bình Sparsity của Generator: {avg_sparsity:.2f}%")
-        print("="*50 + "\n")
-
+    def analyze_model_sparsity(self):
+        pass
     def check_rls_quality(self):
-        rls_weight = self._network.weight.data 
-        sparsity = (torch.abs(rls_weight) < 1e-6).float().mean().item() * 100
-        weight_norm = torch.norm(rls_weight).item()
-        class_means = torch.mean(torch.abs(rls_weight), dim=0)
-        class_std = torch.std(class_means).item()
-
-        print(f"--- RLS Quality Check (Task {self.cur_task}) ---")
-        print(f" > Sparsity: {sparsity:.2f}%")
-        print(f" > Weight Norm: {weight_norm:.4f}")
-        print(f" > Class Balance (Std): {class_std:.6f}")
-        print("-" * 35)
+        pass
