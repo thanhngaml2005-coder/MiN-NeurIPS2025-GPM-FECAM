@@ -20,5 +20,6 @@
   "weight_decay": 5e-4,
   "num_workers": 4,
   "buffer_size": 16384,
-  "gamma": 100
+  "gamma": 100,
+  "k": 16
 }
