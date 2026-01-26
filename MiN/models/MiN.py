@@ -11,7 +11,7 @@ class MinNet(object):
         self.logger = loger
 
         self.device = args["device"]
-        self.backbone_name = args["backbone_name"]
+        self.backbone_name = args["backbone_type"]
         self.backbone = args["backbone"]          # timm model (built outside)
         self.k = args["k"]                         # freq per task
         self.hidden_dim = args.get("hidden_dim", 128)
