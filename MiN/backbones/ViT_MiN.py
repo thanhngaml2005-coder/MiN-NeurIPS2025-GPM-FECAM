@@ -1038,7 +1038,13 @@ class VisionTransformer(nn.Module):
         
         # 2. Khởi tạo PiNoise với embed_dim động (thay vì số cứng 768)
         self.noise_maker = nn.Sequential(*[
-           PiNoise(embed_dim, k=16, max_tasks=10, hidden_dim=hidden_dim)
+           PiNoise(
+        d_model=embed_dim,
+        k=16,                 # ví dụ 16
+        max_tasks=10, # CIFAR-100 → 10
+        hidden_dim=hidden_dim,
+        device=args.device
+    )
 
         ])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
