@@ -16,12 +16,15 @@ try:
 except ImportError:
     from torch.cuda.amp import autocast
 
-# 1. PiNoiseBiLoRA (Tối ưu hóa bộ nhớ cực đoan)
+# =============================================================================
+# 1. CLASS PiNoiseBiLoRA (Logic Task ID Tường minh)
+# =============================================================================
 class PiNoiseBiLoRA(nn.Module):
     def __init__(self, in_dim, sparsity_ratio=0.10, hidden_dim=256):
         super(PiNoiseBiLoRA, self).__init__()
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
+        
         self.k = max(1, int(self.freq_dim * sparsity_ratio))
         self.mlp_in_dim = self.k * 2 
         self.hidden_dim = hidden_dim
@@ -32,20 +35,26 @@ class PiNoiseBiLoRA(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.mlp_in_dim)
         )
+        
         self.sigma_net = nn.Sequential(
             nn.Linear(self.mlp_in_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.mlp_in_dim)
         )
+
         self.task_indices = []       
         self.current_task_id = -1 
         self.history_mu = []         
         self.history_sigma = []
+        
         self.register_buffer('dummy_buffer', torch.zeros(1))
 
     def reset_parameters(self):
+        """Khởi tạo dựa trên Task ID hiện tại"""
         if self.current_task_id <= 0:
+            # Task 0: Zero Init
+            print(f"🚀 [PiNoise] Task {self.current_task_id}: Zero Initialization (Clean Start).")
             for name, m in self.named_modules():
                 if isinstance(m, nn.Linear):
                     is_last = ("mu_net" in name and str(len(self.mu_net)-1) in name) or \
@@ -57,32 +66,42 @@ class PiNoiseBiLoRA(nn.Module):
                         init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                         if m.bias is not None: init.constant_(m.bias, 0)
         else:
-            print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting (In-place).")
+            # Task > 0: Warm-start (In-place)
+            print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting with in-place perturbation.")
             with torch.no_grad():
                 for param in self.parameters():
-                    # [FIX OOM]: Cộng trực tiếp giá trị vào param, không tạo biến 'noise' to đùng
-                    # torch.randn(size) tạo tensor float32 mặc định (nhẹ hơn double)
-                    # sau đó cộng vào param
-                    noise_small = torch.randn(param.size(), device=param.device, dtype=torch.float32) * 0.001
-                    param.add_(noise_small) 
-                    del noise_small # Xóa ngay lập tức
+                    param.add_(torch.randn_like(param), alpha=0.001)
 
     def _get_spectral_mask(self, task_id):
         start_freq = 1 
         available = torch.arange(start_freq, self.freq_dim)
         max_supported_tasks = 20 
         indices = available[task_id % max_supported_tasks :: max_supported_tasks]
-        if len(indices) >= self.k: indices = indices[:self.k]
+        
+        if len(indices) >= self.k:
+            indices = indices[:self.k]
         else:
-            repeat = math.ceil((self.k - len(indices)) / len(indices)) + 1
-            indices = indices.repeat(repeat)[:self.k]
+            needed = self.k - len(indices)
+            repeat_factor = math.ceil(needed / len(indices))
+            padding = indices.repeat(repeat_factor)[:needed]
+            indices = torch.cat([indices, padding])
         return indices.long()
 
-    def expand_new_task(self):
-        self.current_task_id += 1
+    def expand_new_task(self, target_task_id):
+        """
+        [FIX]: Nhận target_task_id từ Controller thay vì tự cộng += 1.
+        Điều này ngăn chặn việc gọi lặp dẫn đến sai lệch index.
+        """
+        # Nếu đã ở task này rồi thì không làm gì cả (Idempotent)
+        if target_task_id <= self.current_task_id:
+            return
+
+        self.current_task_id = target_task_id
+        
         device = self.dummy_buffer.device
         new_indices = self._get_spectral_mask(self.current_task_id).to(device)
         self.task_indices.append(new_indices)
+        
         self.reset_parameters()
 
     def after_task_training(self):
@@ -90,6 +109,7 @@ class PiNoiseBiLoRA(nn.Module):
         sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma_net.state_dict().items()}
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
+        
         self._perform_parameter_magmax(self.mu_net, self.history_mu)
         self._perform_parameter_magmax(self.sigma_net, self.history_sigma)
 
@@ -115,6 +135,7 @@ class PiNoiseBiLoRA(nn.Module):
             curr_indices = self.task_indices[self.current_task_id].to(device)
             x_selected = x_freq[..., curr_indices]
             x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
+            
             mu = self.mu_net(x_mlp_in)
             sigma = self.sigma_net(x_mlp_in)
             z = mu + torch.randn_like(mu) * sigma
@@ -127,6 +148,7 @@ class PiNoiseBiLoRA(nn.Module):
                 x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
                 mu_out = self.mu_net(x_mlp_in)
                 z_complex = torch.complex(mu_out[..., :self.k], mu_out[..., self.k:])
+                
                 current_vals = total_freq_noise[..., indices]
                 mask_better = z_complex.abs() > current_vals.abs()
                 updated_vals = torch.where(mask_better, z_complex, current_vals)
@@ -134,7 +156,9 @@ class PiNoiseBiLoRA(nn.Module):
 
         return torch.fft.irfft(total_freq_noise, n=self.in_dim, dim=-1)
 
-# 2. BaseIncNet & RandomBuffer
+# =============================================================================
+# 2. MiNbaseNet (Controller truyền ID)
+# =============================================================================
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
@@ -169,7 +193,7 @@ class RandomBuffer(torch.nn.Linear):
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        factory_kwargs = {"device": device, "dtype": torch.double} # Giữ Double
+        factory_kwargs = {"device": device, "dtype": torch.double}
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
         self.reset_parameters()
@@ -178,7 +202,6 @@ class RandomBuffer(torch.nn.Linear):
         X = X.to(self.weight) 
         return F.relu(X @ self.W)
 
-# 3. MiNbaseNet
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
         super(MiNbaseNet, self).__init__()
@@ -191,7 +214,7 @@ class MiNbaseNet(nn.Module):
         self.feature_dim = self.backbone.out_dim 
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         
-        # RLS dùng Float32 để tiết kiệm 50% RAM
+        # RLS (Float32)
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight) 
@@ -220,12 +243,16 @@ class MiNbaseNet(nn.Module):
             nn.init.constant_(new_fc.weight, 0.)
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
-        # Không gọi update_noise ở đây nữa
+            
+        # Tự động gọi update_noise đúng với cur_task hiện tại
+        self.update_noise()
 
     def update_noise(self):
         if hasattr(self.backbone, 'noise_maker'):
+            print(f"--> [IncNet] Syncing BiLoRA Noise for Task {self.cur_task}")
             for j in range(len(self.backbone.noise_maker)):
-                self.backbone.noise_maker[j].expand_new_task()
+                # [FIX]: Truyền cur_task vào để PiNoise biết chính xác đang ở đâu
+                self.backbone.noise_maker[j].expand_new_task(self.cur_task)
 
     def after_task_magmax_merge(self):
         if hasattr(self.backbone, 'noise_maker'):
@@ -255,6 +282,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        """RLS Fit Optimized"""
         old_training_state = self.training
         self.eval() 
         try:
@@ -262,13 +290,13 @@ class MiNbaseNet(nn.Module):
                 X_feat = self.backbone(X)
             
             with autocast('cuda', enabled=False):
-                # Double cho buffer
+                # Double for Buffer
                 X_double = X_feat.detach().double()
                 del X_feat 
                 X_proj = self.buffer(X_double) 
                 del X_double
                 
-                # Float cho RLS
+                # Float for RLS
                 X_final = X_proj.float() 
                 del X_proj
                 
