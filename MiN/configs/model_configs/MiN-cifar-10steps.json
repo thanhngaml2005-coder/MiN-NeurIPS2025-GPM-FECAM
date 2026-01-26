@@ -19,7 +19,7 @@
   "fit_epochs": 1,
   "weight_decay": 5e-4,
   "num_workers": 4,
-  "hidden_dim": 256,
+  "hidden_dim": 128,
   "buffer_size": 16384,
   "gamma": 100
 }
