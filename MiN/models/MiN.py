@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.inc_net import BackboneWithNoise
+from utils.inc_net import BackboneWithPiNoise
 
 
 class MinNet(nn.Module):
@@ -31,7 +31,7 @@ class MinNet(nn.Module):
         # ===============================
         # Backbone + PiNoise
         # ===============================
-        self.backbone = BackboneWithNoise(
+        self.backbone = BackboneWithPiNoise(
             backbone=self.backbone,
             in_dim=embed_dim,
             k=self.k,
