@@ -62,219 +62,248 @@ class Noise_weigh(nn.Module):
 
 
 
-
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import math
+import copy
 
 class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=None):
+    def __init__(self, in_dim, sparsity_ratio=0.15, hidden_dim=None):
+        """
+        Args:
+            in_dim: Dimension của feature đầu vào (ví dụ: 768 của ViT)
+            sparsity_ratio: Tỷ lệ số lượng tần số được chọn (BiLoRA k)
+        """
         super(PiNoise, self).__init__()
         self.in_dim = in_dim
+        # RFFT output shape: (N // 2) + 1
         self.freq_dim = in_dim // 2 + 1
         
-        # 1. Khởi tạo các thông số kích thước
-        self.k = int(self.freq_dim * 0.1) 
-        self.mlp_dim = self.k 
-        self.act = nn.GELU()
+        # 1. Cấu hình kích thước (Sparsity - BiLoRA k)
+        # [cite_start]k << d^2 giúp giảm parameter drift và tăng tính trực giao [cite: 148, 150]
+        self.k = int(self.freq_dim * sparsity_ratio) 
         
-        # 2. Định nghĩa các Layers
-        input_size = self.mlp_dim * 2 
-        self.mu = nn.Linear(input_size, input_size)
-        self.sigma = nn.Linear(input_size, input_size)
+        # Input cho MLP là (Real + Imag) của k tần số => k * 2
+        self.mlp_in_dim = self.k * 2 
+        self.hidden_dim = hidden_dim if hidden_dim else self.mlp_in_dim * 2
+        
+        # 2. Định nghĩa Noise Generator (Shared MLP)
+        # [cite_start]Thay thế cho cơ chế Down/Up projection của MIN gốc [cite: 669, 670]
+        # Học mapping từ Frequency Features -> Noise Parameters (Mu, Sigma)
+        self.mu_net = nn.Sequential(
+            nn.Linear(self.mlp_in_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.mlp_in_dim)
+        )
+        
+        self.sigma_net = nn.Sequential(
+            nn.Linear(self.mlp_in_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.mlp_in_dim)
+        )
 
-        # 3. Quản lý Task
-        self.task_indices = [] 
+        # 3. Quản lý Task & History (Cho MagMax Merging)
+        self.task_indices = []       # Lưu mask tần số của từng task
         self.current_task_id = -1 
-        self.history_mu = []
+        self.history_mu = []         # Lưu snapshot weights sau mỗi task
         self.history_sigma = []
         
-        # 4. Khởi tạo tham số
-        self.reset_parameters()
+        # Buffer tạm để tính toán nhanh
+        self.register_buffer('dummy_buffer', torch.zeros(1))
 
     def reset_parameters(self):
+        """
+        Chiến lược khởi tạo thông minh:
+        - Task 0: Random nhỏ (xấp xỉ 0).
+        - Task > 0: Warm-start từ kiến thức cũ + Nhiễu nhỏ (Perturbation).
+        """
         if self.current_task_id <= 0:
-            # Khởi tạo siêu nhỏ để tránh nổ Ratio ngay từ đầu
-            init.normal_(self.mu.weight, std=0.001) 
-            init.constant_(self.mu.bias, 0.)
-            init.constant_(self.sigma.weight, 1e-4) 
-            init.constant_(self.sigma.bias, 1e-4)
+            # Init Task 0
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    init.normal_(m.weight, std=0.002) # std nhỏ để noise ban đầu ~ 0
+                    if m.bias is not None:
+                        init.constant_(m.bias, 0)
         else:
-            # Warm-start: Thêm nhiễu cực nhỏ để phá vỡ đối xứng nhưng giữ tri thức cũ
-            print(f"🔄 Task {self.current_task_id}: Warm-started from Merged Generator")
+            # Init Task t > 0: Giữ nguyên weight đã Merge, chỉ thêm noise nhẹ
+            # [cite_start]Giúp thoát khỏi local minima cũ nhưng không mất kiến thức [cite: 536]
+            print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting with perturbation.")
             with torch.no_grad():
-                for param in self.mu.parameters():
-                    param.add_(torch.randn_like(param) * 0.001)
-                for param in self.sigma.parameters():
-                    param.add_(torch.randn_like(param) * 0.0001)
+                for param in self.parameters():
+                    noise = torch.randn_like(param) * 0.01 
+                    param.add_(noise)
 
-    # def _get_spectral_mask(self, task_id):
-    #     # ... (Giữ nguyên logic của bạn) ...
-    #     overlap_size = int(self.freq_dim * 0.02)
-    #     step = self.k - overlap_size
-    #     end_idx = self.freq_dim - (task_id * step)
-    #     start_idx = end_idx - self.k
-    #     if start_idx < 0:
-    #         start_idx = 0
-    #         end_idx = self.k
-    #         print(f"⚠️ Warning: Task {task_id} chạm đáy Low-freq.")
-    #     return torch.arange(start_idx, end_idx).long()
-
-    # Phiên bản An toàn (Fixed Size)
     def _get_spectral_mask(self, task_id):
-        anchor_idx = int(self.freq_dim * 0.10)
-        max_tasks = 10 # Giả định hệ thống hỗ trợ tốt 10 task
+        """
+        Tạo mask tần số trực giao (Comb/Interleaved Sampling).
+        [cite_start]Đảm bảo các task dùng các tần số khác nhau để tránh interference[cite: 35, 122].
+        """
+        start_freq = 1 # Bỏ qua DC component
+        available = torch.arange(start_freq, self.freq_dim)
         
-        # Tạo danh sách tất cả các index khả dụng
-        available = torch.arange(anchor_idx, self.freq_dim)
+        # Giả sử hỗ trợ tốt khoảng 20 tasks
+        max_supported_tasks = 20 
         
         # Lấy mẫu kiểu răng lược
-        indices = available[task_id % max_tasks :: max_tasks]
+        indices = available[task_id % max_supported_tasks :: max_supported_tasks]
         
-        # Cắt hoặc Pad để đảm bảo kích thước luôn khớp với self.k ban đầu
-        # Giả sử self.k được tính là int(self.freq_dim * 0.1) trong __init__
-        target_k = int(self.freq_dim * 0.1) 
-        
-        if len(indices) > target_k:
-            indices = indices[:target_k]
-        elif len(indices) < target_k:
-            # Nếu thiếu (do chia không đều), ta lặp lại các phần tử đầu để lấp đầy
-            # (Hoặc chấp nhận thừa thãi bộ nhớ MLP một chút)
-            padding = indices[:target_k - len(indices)]
+        # Padding hoặc Cut để đảm bảo kích thước luôn là self.k
+        if len(indices) >= self.k:
+            indices = indices[:self.k]
+        else:
+            # Nếu thiếu, lặp lại các index đầu
+            needed = self.k - len(indices)
+            repeat_factor = math.ceil(needed / len(indices))
+            padding = indices.repeat(repeat_factor)[:needed]
             indices = torch.cat([indices, padding])
             
         return indices.long()
+
     def expand_new_task(self):
+        """Gọi hàm này KHI BẮT ĐẦU một task mới"""
         self.current_task_id += 1
-        device = self.mu.weight.device
+        device = self.dummy_buffer.device
+        
+        # 1. Tạo mask tần số cho task mới
         new_indices = self._get_spectral_mask(self.current_task_id).to(device)
         self.task_indices.append(new_indices)
         
-        if self.current_task_id > 0:
-            self.reset_parameters()
-            print(f"--> [PiNoise] Task {self.current_task_id}: Spectral Mask {new_indices[0]}-{new_indices[-1]}")
+        # 2. Reset weight (Warm-start)
+        self.reset_parameters()
+        print(f"--> [PiNoise] Task {self.current_task_id} initialized. Mask size: {len(new_indices)}")
 
-    def update_noise(self):
-        self.expand_new_task()
-
-    # --- MAGMAX MERGE (Giữ nguyên) ---
     def after_task_training(self):
-        # ... (Code cũ của bạn đúng rồi) ...
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        """Gọi hàm này SAU KHI KẾT THÚC một task (trước khi sang task mới)"""
+        # 1. Snapshot weights hiện tại
+        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu_net.state_dict().items()}
+        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma_net.state_dict().items()}
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
-        self._perform_parameter_magmax()
-
-    def _perform_parameter_magmax(self):
-        if not self.history_mu: return
         
-        def merge_logic(history_list):
-            base_state = history_list[0]
-            keys = base_state.keys()
-            merged_dict = {}
-            for key in keys:
-                # 🌟 Weighted MagMax: Ưu tiên Task cũ một chút (Decay 0.95)
-                # Giúp chống quên tốt hơn là công bằng tuyệt đối
-                task_vectors = []
-                for i, d in enumerate(history_list):
-                    delta = d[key] - base_state[key]
-                    # decay = 0.95 ** (len(history_list) - 1 - i) # Bỏ comment nếu muốn dùng decay
-                    task_vectors.append(delta)
-                
-                task_vectors = torch.stack(task_vectors, dim=0)
-                magnitudes = torch.abs(task_vectors)
+        # 2. Thực hiện MagMax Merging để update weight chính
+        print("Performing MagMax Parameter Merging...")
+        self._perform_parameter_magmax(self.mu_net, self.history_mu)
+        self._perform_parameter_magmax(self.sigma_net, self.history_sigma)
+
+    def _perform_parameter_magmax(self, module, history_list):
+        """Gộp trọng số bằng cách lấy giá trị có biên độ lớn nhất (MagMax)"""
+        if not history_list: return
+        base_state = history_list[0]
+        final_state = {}
+        
+        with torch.no_grad():
+            for key in base_state.keys():
+                # Stack weights từ tất cả các task
+                all_versions = torch.stack([h[key] for h in history_list], dim=0)
+                # Chọn weight có độ lớn (abs) lớn nhất tại mỗi vị trí
+                magnitudes = torch.abs(all_versions)
                 max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                best_delta = torch.gather(task_vectors, 0, max_indices).squeeze(0)
-                merged_dict[key] = base_state[key] + best_delta
-            return merged_dict
-
-        print(f"🔄 [MagMax] Merging {len(self.history_mu)} tasks...")
-        merged_mu = merge_logic(self.history_mu)
-        merged_sigma = merge_logic(self.history_sigma)
-        self.mu.load_state_dict(merged_mu)
-        self.sigma.load_state_dict(merged_sigma)
-        print(f"✅ [MagMax] Merged done.")
-
-    # --- FORWARD PASS CHUẨN ---
-    def forward(self, x, new_forward=False):
-        if len(self.task_indices) == 0 or self.current_task_id < 0:
-            return x
+                best_values = torch.gather(all_versions, 0, max_indices).squeeze(0)
+                final_state[key] = best_values
         
+        module.load_state_dict(final_state)
+
+    def forward(self, x):
+        """
+        Input: x (Tensor) [Batch, N, Dim]
+        Output: noise (Tensor) [Batch, N, Dim] - CHỈ TRẢ VỀ NOISE
+        """
+        if len(self.task_indices) == 0:
+            return torch.zeros_like(x)
+
         device = x.device
-        x_freq = torch.fft.rfft(x, dim=-1)
+        # 1. FFT sang miền tần số
+        x_freq = torch.fft.rfft(x, dim=-1) # [B, N, Freq_Dim]
         
-        if self.training:
-            # Training: Stochastic (Có epsilon)
-            indices = self.task_indices[self.current_task_id].to(device)
-            x_selected = x_freq[..., indices]
-            x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
-            
-            mu_out = self.mu(x_mlp_in)
-            sigma_out = self.sigma(x_mlp_in)
-            epsilon = torch.randn_like(mu_out)
-            theta_val = epsilon * sigma_out + mu_out
-            
-            # Tắt Autocast khi gán lại vào Complex để tránh lỗi precision
-            with torch.amp.autocast('cuda', enabled=False):
-                theta_complex = torch.complex(theta_val[..., :self.mlp_dim].float(), 
-                                              theta_val[..., self.mlp_dim:].float())
-                full_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-                full_freq_noise.index_add_(-1, indices, theta_complex)
-            
-            out_noise = torch.fft.irfft(full_freq_noise, n=self.in_dim, dim=-1)
-            return x + out_noise
-        
-        else:
-            # Eval: Deterministic & MagMax Selection
-            mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-            # Map lưu biên độ lớn nhất tại mỗi tần số
-            max_mag_map = torch.zeros_like(x_freq.real) 
+        # Container chứa noise tổng
+        total_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
 
-            for task_id in range(len(self.task_indices)):
-                indices = self.task_indices[task_id].to(device)
+        # === TRAINING PHASE ===
+        if self.training:
+            # Chỉ kích hoạt Mask của Task hiện tại
+            curr_indices = self.task_indices[self.current_task_id].to(device)
+            
+            # Lấy input tại các tần số được chọn
+            x_selected = x_freq[..., curr_indices] # [B, N, k]
+            
+            # Nối Real + Imag để đưa vào MLP
+            x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1) # [B, N, k*2]
+            
+            # [cite_start]Dự đoán Mu và Sigma [cite: 686]
+            mu = self.mu_net(x_mlp_in)
+            sigma = self.sigma_net(x_mlp_in)
+            
+            # Reparameterization Trick: z = mu + sigma * epsilon
+            epsilon = torch.randn_like(mu)
+            z = mu + epsilon * sigma
+            
+            # Chuyển lại về số phức
+            z_complex = torch.complex(z[..., :self.k], z[..., self.k:])
+            
+            # Gán vào container tổng
+            total_freq_noise.index_add_(-1, curr_indices, z_complex)
+
+        # === EVALUATION PHASE (Inference) ===
+        else:
+            # [cite_start]Deterministic & Competitive Selection (Thay cho Noise Mixture) [cite: 697]
+            # Duyệt qua tất cả các task, tại mỗi tần số, chọn task nào sinh ra biên độ lớn nhất
+            
+            for indices in self.task_indices:
+                indices = indices.to(device)
                 x_selected = x_freq[..., indices]
                 x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
                 
-                # Deterministic: Epsilon = 0 -> theta = mu
-                theta_val = self.mu(x_mlp_in) 
+                # Chỉ lấy Mean (Mu), không cộng noise ngẫu nhiên
+                mu_out = self.mu_net(x_mlp_in)
+                z_complex = torch.complex(mu_out[..., :self.k], mu_out[..., self.k:])
                 
-                with torch.amp.autocast('cuda', enabled=False):
-                    theta_complex = torch.complex(theta_val[..., :self.mlp_dim].float(), 
-                                                  theta_val[..., self.mlp_dim:].float())
-                    
-                    # 1. Tính biên độ của nhiễu task hiện tại
-                    curr_mag = torch.abs(theta_complex)
-                    
-                    # 2. Lấy biên độ nhiễu đã có trong map
-                    existing_mag = max_mag_map[..., indices]
-                    
-                    # 3. Tạo mask chọn lọc (Dùng bool mask nhẹ hơn)
-                    better_mask = (curr_mag > existing_mag) 
-                    
-                    # 4. Cập nhật MagMap bằng torch.where (Nhanh hơn nhân mask)
-                    new_mag = torch.where(better_mask, curr_mag, existing_mag)
-                    max_mag_map.index_copy_(-1, indices, new_mag)
-                    
-                    # 5. Cập nhật NoiseMap
-                    # Lấy nhiễu cũ ra
-                    old_noise_val = mixed_freq_noise[..., indices]
-                    # Chọn nhiễu mới hoặc giữ nhiễu cũ
-                    new_noise_val = torch.where(better_mask, theta_complex, old_noise_val)
-                    # Ghi đè lại
-                    mixed_freq_noise.index_copy_(-1, indices, new_noise_val)
+                # So sánh với noise đang có trong map
+                current_vals = total_freq_noise[..., indices]
+                
+                # Mask: Chọn cái nào có biên độ lớn hơn (MagMax Activation)
+                mask_better = z_complex.abs() > current_vals.abs()
+                updated_vals = torch.where(mask_better, z_complex, current_vals)
+                
+                # Cập nhật map
+                total_freq_noise.index_copy_(-1, indices, updated_vals)
 
-            out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
-            
-            # Ratio Check (Optional)
-            # if torch.rand(1).item() < 0.01:
-            #    ratio = out_noise.norm() / (x.norm() + 1e-8)
-            #    print(f"[Eval Ratio] {ratio.item():.4f}")
-
-            return x + out_noise
+        # 3. IFFT về miền không gian
+        noise_spatial = torch.fft.irfft(total_freq_noise, n=self.in_dim, dim=-1)
+        
+        # Trả về NOISE (Không cộng x ở đây để dễ tích hợp với Residual gốc)
+        return noise_spatial
 
     def unfreeze_noise(self):
         for param in self.parameters(): param.requires_grad = True
 
     def freeze_noise(self):
         for param in self.parameters(): param.requires_grad = False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
