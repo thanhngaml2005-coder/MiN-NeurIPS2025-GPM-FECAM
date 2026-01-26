@@ -79,7 +79,7 @@ class PiNoise(nn.Module):
         self.freq_dim = in_dim // 2 + 1
         
         # 1. Khởi tạo các thông số kích thước
-        self.k = int(self.freq_dim * 0.1) 
+        self.k = int(self.freq_dim * 0.02) 
         self.mlp_dim = self.k * 2
         self.act = nn.GELU()
         
