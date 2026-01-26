@@ -463,21 +463,71 @@ class PiNoise(nn.Module):
         nn.init.constant_(self.sigma.bias, 1e-6)
 
     # ------------------------------------------------------------------
+    # def _get_spectral_mask(self, task_id):
+    #     anchor = int(self.freq_dim * 0.05)
+    #     max_tasks = 10
+    #     available = torch.arange(anchor, self.freq_dim)
+
+    #     indices = available[task_id % max_tasks :: max_tasks]
+
+    #     if len(indices) >= self.k:
+    #         indices = indices[:self.k]
+    #     else:
+    #         pad = indices[: self.k - len(indices)]
+    #         indices = torch.cat([indices, pad])
+
+    #     return indices.long()
+
     def _get_spectral_mask(self, task_id):
-        anchor = int(self.freq_dim * 0.05)
-        max_tasks = 10
-        available = torch.arange(anchor, self.freq_dim)
+        """
+        Chiến thuật Hybrid:
+        - Giữ lại n_shared_low tần số đầu tiên cho TẤT CẢ các task (để RLS ổn định).
+        - Các tần số còn lại chia đều cho các task (để tạo sự khác biệt).
+        """
+        # --- CẤU HÌNH ---
+        # 4 tần số đầu tiên (0, 1, 2, 3) chứa thông tin cấu trúc, ai cũng cần.
+        n_shared_low = 4  
+        
+        # Chu kỳ lặp lại cho vùng cao (Task 0 chung với Task 10, Task 20...)
+        max_tasks = 10    
 
-        indices = available[task_id % max_tasks :: max_tasks]
+        # --- BƯỚC 1: LẤY VÙNG TẦN SỐ THẤP (SHARED) ---
+        # Đảm bảo không vượt quá kích thước thật
+        safe_n_shared = min(n_shared_low, self.freq_dim)
+        low_indices = torch.arange(0, safe_n_shared)
 
+        # --- BƯỚC 2: LẤY VÙNG TẦN SỐ CAO (DISTRIBUTED) ---
+        if self.freq_dim > safe_n_shared:
+            available_high = torch.arange(safe_n_shared, self.freq_dim)
+            # Chia bài kiểu bước nhảy (Stride slicing)
+            # Ví dụ: Task 0 lấy index 4, 14, 24...
+            #        Task 1 lấy index 5, 15, 25...
+            high_indices = available_high[task_id % max_tasks :: max_tasks]
+        else:
+            high_indices = torch.tensor([], dtype=torch.long)
+
+        # --- BƯỚC 3: GỘP LẠI ---
+        indices = torch.cat([low_indices, high_indices])
+
+        # --- BƯỚC 4: CẮT HOẶC PAD CHO ĐỦ k ---
         if len(indices) >= self.k:
+            # Nếu dư: Cắt bớt phần đuôi (giữ phần đầu quan trọng hơn)
             indices = indices[:self.k]
         else:
-            pad = indices[: self.k - len(indices)]
-            indices = torch.cat([indices, pad])
+            # Nếu thiếu: Padding
+            # Logic Pad: Lặp lại chính các index High Freq để tăng cường độ cho nó.
+            # (Tránh pad thêm Low Freq vì Low Freq đã đủ mạnh rồi)
+            
+            pad_source = high_indices if len(high_indices) > 0 else low_indices
+            
+            # Vòng lặp để pad cho đến khi đủ độ dài self.k
+            while len(indices) < self.k:
+                needed = self.k - len(indices)
+                take = min(needed, len(pad_source))
+                # Nối thêm phần còn thiếu
+                indices = torch.cat([indices, pad_source[:take]])
 
         return indices.long()
-
     # ------------------------------------------------------------------
     def expand_new_task(self):
         self.current_task_id += 1
