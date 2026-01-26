@@ -71,7 +71,7 @@ class MiNbaseNet(nn.Module):
 
         self.device = args["device"]
         self.k = args["k"]
-        self.num_tasks = args["num_tasks"]
+        self.num_tasks =10
 
         self.backbone = args["backbone"]  # timm ViT đã build sẵn
 
