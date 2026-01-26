@@ -128,27 +128,25 @@ class PiNoise(nn.Module):
     # Phiên bản An toàn (Fixed Size)
     def _get_spectral_mask(self, task_id):
         anchor_idx = int(self.freq_dim * 0.10)
-        max_tasks = 10 # Giả định hệ thống hỗ trợ tốt 10 task
-        
-        # Tạo danh sách tất cả các index khả dụng
+        max_tasks = 10 
         available = torch.arange(anchor_idx, self.freq_dim)
         
-        # Lấy mẫu kiểu răng lược
+        # 1. Lấy mẫu răng lược
         indices = available[task_id % max_tasks :: max_tasks]
         
-        # Cắt hoặc Pad để đảm bảo kích thước luôn khớp với self.k ban đầu
-        # Giả sử self.k được tính là int(self.freq_dim * 0.1) trong __init__
-        target_k = int(self.freq_dim * 0.1) 
+        # 2. QUAN TRỌNG: Ép kích thước về đúng self.k (là 16) để khớp với Layer
+        target_k = self.k  
         
         if len(indices) > target_k:
             indices = indices[:target_k]
         elif len(indices) < target_k:
-            # Nếu thiếu (do chia không đều), ta lặp lại các phần tử đầu để lấp đầy
-            # (Hoặc chấp nhận thừa thãi bộ nhớ MLP một chút)
-            padding = indices[:target_k - len(indices)]
+            pad_len = target_k - len(indices)
+            # Lặp lại chính nó để đủ 16
+            padding = indices[:pad_len] if len(indices) > 0 else torch.zeros(pad_len).long()
             indices = torch.cat([indices, padding])
             
         return indices.long()
+    
     def expand_new_task(self):
         self.current_task_id += 1
         device = self.mu.weight.device
