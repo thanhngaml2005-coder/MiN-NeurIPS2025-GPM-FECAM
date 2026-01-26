@@ -20,12 +20,14 @@ except ImportError:
 # 1. CLASS PiNoiseBiLoRA (Giữ nguyên logic - Float32 mặc định)
 # =============================================================================
 class PiNoiseBiLoRA(nn.Module):
+    # ... (Phần __init__ giữ nguyên) ...
     def __init__(self, in_dim, sparsity_ratio=0.10, hidden_dim=256):
         super(PiNoiseBiLoRA, self).__init__()
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
         
-        self.k = int(self.freq_dim * sparsity_ratio) 
+        # Đảm bảo k >= 1
+        self.k = max(1, int(self.freq_dim * sparsity_ratio))
         self.mlp_in_dim = self.k * 2 
         self.hidden_dim = hidden_dim
         
@@ -51,8 +53,9 @@ class PiNoiseBiLoRA(nn.Module):
         self.register_buffer('dummy_buffer', torch.zeros(1))
 
     def reset_parameters(self):
-        # Init Zero cho layer cuối để Noise ban đầu = 0
+        """Fixed: In-place perturbation để tiết kiệm RAM"""
         if self.current_task_id <= 0:
+            # Task 0: Zero Init cho lớp cuối
             for name, m in self.named_modules():
                 if isinstance(m, nn.Linear):
                     is_last = False
@@ -66,10 +69,16 @@ class PiNoiseBiLoRA(nn.Module):
                         init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                         if m.bias is not None: init.constant_(m.bias, 0)
         else:
+            # Task > 0: Warm-start
+            # [FIX OOM] Dùng in-place operation thay vì tạo tensor mới rồi cộng
+            print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting with perturbation.")
             with torch.no_grad():
                 for param in self.parameters():
-                    noise = torch.randn_like(param) * 0.001 
-                    param.add_(noise)
+                    # param = param + noise -> Tốn bộ nhớ
+                    # param.add_(noise, alpha=0.001) -> Tiết kiệm bộ nhớ
+                    param.add_(torch.randn_like(param), alpha=0.001)
+
+    # ... (Các hàm còn lại giữ nguyên) ...
 
     def _get_spectral_mask(self, task_id):
         start_freq = 1 
@@ -292,24 +301,29 @@ class MiNbaseNet(nn.Module):
         return features @ self.weight
 
     @torch.no_grad()
+ 
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """RLS Fit: Toàn bộ dùng Float32"""
+        """RLS Fit"""
         old_training_state = self.training
         self.eval() 
         try:
-            # 1. Feature Extraction (Autocast OK)
             with autocast('cuda', enabled=True): 
                 X_feat = self.backbone(X)
             
-            # 2. RLS Calculation (Float32 Only)
             with autocast('cuda', enabled=False):
-                X_feat = X_feat.detach().float()
+                # Ép kiểu Double -> Tính toán -> Float
+                # Dùng biến tạm để dễ bề xóa
+                X_double = X_feat.detach().double()
+                del X_feat # Xóa bản float16 ngay
                 
-                # Buffer và R đều là float32
-                X_feat = self.buffer(X_feat) 
+                X_proj = self.buffer(X_double) 
+                del X_double # Xóa bản double input ngay
+                
+                X_final = X_proj.float() # Về lại float32 cho RLS
+                del X_proj # Xóa bản double output ngay
                 
                 device = self.weight.device
-                X_feat = X_feat.to(device)
+                X_final = X_final.to(device)
                 Y = Y.to(device).float()
 
                 # Expand weights
@@ -323,9 +337,9 @@ class MiNbaseNet(nn.Module):
                     tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
                     Y = torch.cat((Y, tail), dim=1)
 
-                # RLS Algorithm (Float32)
-                P = self.R @ X_feat.T
-                term = X_feat @ P
+                # RLS Algorithm
+                P = self.R @ X_final.T
+                term = X_final @ P
                 term.diagonal().add_(1.0) 
                 term = 0.5 * (term + term.T)
                 
@@ -340,14 +354,13 @@ class MiNbaseNet(nn.Module):
                 self.R -= P_K @ P.T
                 del P 
                 
-                residual = Y - (X_feat @ self.weight)
+                residual = Y - (X_final @ self.weight)
                 self.weight += P_K @ residual
                 
-                del X_feat, Y, K, P_K, residual
+                del X_final, Y, K, P_K, residual
                 torch.cuda.empty_cache()
         finally:
             self.train(old_training_state)
-
     def forward(self, x, new_forward: bool = False):
         hyper_features = self.backbone(x)
         # Ép kiểu float cho an toàn
