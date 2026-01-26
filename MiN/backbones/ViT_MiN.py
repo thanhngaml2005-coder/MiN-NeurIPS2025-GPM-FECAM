@@ -224,7 +224,7 @@ class PiNoise(nn.Module):
             # Cộng nhiễu vào đúng vị trí tần số đã chọn (Orthogonality)
             total_freq_noise.index_add_(-1, indices, z_complex)
         
-        
+        else:
         # Eval: Duyệt qua tất cả các task (MagMax logic trong miền tần số)
             for indices in self.task_indices:
                 indices = indices.to(device)
@@ -252,6 +252,9 @@ class PiNoise(nn.Module):
 
     def freeze_noise(self):
         for param in self.parameters(): param.requires_grad = False
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
