@@ -5,26 +5,26 @@ import numpy as np
 import torch
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
-from backbones.pretrained_backbone import get_pretrained_backbone 
-from backbones.linears import SimpleLinear
+from backbones.pretrained_backbone import get_pretrained_backbone
+from backbones.linears import SimpleLinear, SplitCosineLinear, CosineLinear
+from einops.layers.torch import Rearrange, Reduce
+from einops import rearrange, reduce, repeat
 from torch.nn import functional as F
-import gc
-
+import scipy.stats as stats
+import timm
+import random
+# Thêm đoạn này vào đầu file utils/inc_net.py
 try:
     from torch.amp import autocast
 except ImportError:
     from torch.cuda.amp import autocast
+
 
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
         self.args = args
         self.backbone = get_pretrained_backbone(args)
-        
-        # [QUAN TRỌNG]: Tắt gradient backbone ngay lập tức để tiết kiệm VRAM khởi tạo
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-            
         self.feature_dim = self.backbone.out_dim
         self.fc = None
 
@@ -36,259 +36,236 @@ class BaseIncNet(nn.Module):
             bias = copy.deepcopy(self.fc.bias.data)
             fc.weight.data[:nb_output] = weight
             fc.bias.data[:nb_output] = bias
+
         del self.fc
         self.fc = fc
 
     @staticmethod
     def generate_fc(in_dim, out_dim):
-        return SimpleLinear(in_dim, out_dim)
+        fc = SimpleLinear(in_dim, out_dim)
+        return fc
 
     def forward(self, x):
         hyper_features = self.backbone(x)
         logits = self.fc(hyper_features)['logits']
-        return {'features': hyper_features, 'logits': logits}
+        return {
+            'features': hyper_features,
+            'logits': logits
+        }
 
-import copy
-import math
-import numpy as np
-import torch
-from torch import nn
-from torch.nn import functional as F
-from backbones.pretrained_backbone import get_pretrained_backbone 
-from backbones.linears import SimpleLinear
-import gc
 
-# -----------------------------------------------------------
-# 1. RandomBuffer: Float32 & GPU
-# (Giữ trên GPU vì cần cho Forward Pass nhanh)
-# -----------------------------------------------------------
-import copy
-import math
-import torch
-from torch import nn
-from torch.nn import functional as F
-from backbones.pretrained_backbone import get_pretrained_backbone 
-from backbones.linears import SimpleLinear
-import gc
-
-# -----------------------------------------------------------------------------
-# 1. RandomBuffer: Float32 & GPU (Nhẹ nhất có thể)
-# -----------------------------------------------------------------------------
 class RandomBuffer(torch.nn.Linear):
     def __init__(self, in_features: int, buffer_size: int, device):
         super(torch.nn.Linear, self).__init__()
+        self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        
-        # [OPTIMIZATION 1]: Ép cứng Float32 ngay từ đầu
-        factory_kwargs = {"device": device, "dtype": torch.float32}
-        
-        # Tạo ma trận rỗng trước
+        factory_kwargs = {"device": device, "dtype": torch.double}
+        # self.W = torch.empty((self.out_features, self.in_features), **factory_kwargs)
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
-        
-        # In-place Init (Không tạo bản copy)
-        nn.init.kaiming_uniform_(self.W, a=math.sqrt(5))
-        
-        # Register buffer để lưu vào state_dict nhưng không tính gradient
         self.register_buffer("weight", self.W)
-        self.weight.requires_grad = False
 
+        self.reset_parameters()
+
+    # @torch.no_grad()
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        X = X.to(self.weight.dtype)
+        X = X.to(self.weight)
         return F.relu(X @ self.W)
 
-# -----------------------------------------------------------------------------
-# 2. MiNbaseNet: Hybrid Init (R nằm ở CPU)
-# -----------------------------------------------------------------------------
+
+# -------------------------------------------------
+# MAIN NETWORK
+# -------------------------------------------------
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
         super(MiNbaseNet, self).__init__()
-        
-        # [OPTIMIZATION 2]: Dọn sạch VRAM trước khi bắt đầu
-        gc.collect()
-        torch.cuda.empty_cache()
-        
         self.args = args
-        self.device = args['device']
-        self.gamma = args['gamma']
-        self.buffer_size = args['buffer_size'] # Khuyên dùng 8192
-        
-        print(f"📉 [Init] Starting Initialization... Target Buffer Size: {self.buffer_size}")
-
-        # --- BƯỚC 1: Load Backbone & Đóng băng ngay lập tức ---
         self.backbone = get_pretrained_backbone(args)
+        self.device = args['device']
         
-        # [OPTIMIZATION 3]: Tắt Gradient NGAY LẬP TỨC
-        # Nếu không tắt ngay, PyTorch có thể cấp phát bộ nhớ dự phòng cho Gradients
-        print("❄️  [Init] Freezing Backbone Gradients...")
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+        # RLS Params
+        self.gamma = args['gamma']
+        self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
-        
-        # Dọn dẹp rác sinh ra khi load backbone
-        torch.cuda.empty_cache()
 
-        # --- BƯỚC 2: Init Random Buffer (GPU) ---
-        print("🎲 [Init] Creating Random Buffer on GPU...")
+        # Random Buffer
         self.buffer = RandomBuffer(in_features=self.feature_dim, 
                                    buffer_size=self.buffer_size, 
                                    device=self.device)
-        
-        # --- BƯỚC 3: Init RLS Matrix (CPU ONLY) ---
-        # Đây là bước quan trọng nhất để cứu VRAM lúc khởi tạo
-        print("💾 [Init] Allocating Covariance Matrix R on CPU RAM...")
-        
-        # Tạo trực tiếp trên CPU (Không bao giờ chạm vào GPU)
-        self.R_cpu = torch.eye(self.buffer_size, dtype=torch.float32, device='cpu')
-        self.R_cpu.div_(self.gamma) # In-place division
-        
-        # Lưu ý: Không register_buffer cho R_cpu để tránh nó bị đẩy lên GPU khi model.to(device)
-        
-        # --- BƯỚC 4: Init Classifier Weight (GPU - Size 0) ---
-        print("⚖️  [Init] Creating Empty Classifier on GPU...")
-        # Khởi tạo kích thước 0. Nó sẽ tự mở rộng khi train. Tốn 0 VRAM lúc này.
-        self.register_buffer("weight", torch.zeros((self.buffer_size, 0), device=self.device, dtype=torch.float32))
 
+        # RLS Weights (Classifier)
+        factory_kwargs = {"device": self.device, "dtype": torch.float32}
+        weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
+        self.register_buffer("weight", weight) 
+
+        # Covariance Matrix R (Inverse)
+        R = torch.eye(self.buffer_size, **factory_kwargs) / self.gamma
+        self.register_buffer("R", R) 
+
+        # Normal FC (Cho việc học SGD - PiNoise training)
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
-        
-        print("✅ [Init] Model Initialized Successfully.")
-        print(f"   - GPU Memory Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
         
-        # Tạo FC mới cho PiNoise training (SGD)
+        # Tạo Normal FC mới để train task hiện tại
         if self.cur_task > 0:
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False).float()
         else:
             new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True).float()
             
+        # Copy trọng số cũ (nếu muốn warm-start normal FC, dù RLS mới là chính)
         if self.normal_fc is not None:
             old_nb = self.normal_fc.out_features
             with torch.no_grad():
                 new_fc.weight[:old_nb] = self.normal_fc.weight.data
                 nn.init.constant_(new_fc.weight[old_nb:], 0.)
             del self.normal_fc
+            self.normal_fc = new_fc
         else:
             nn.init.constant_(new_fc.weight, 0.)
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
-            
-        # Đẩy FC mới lên GPU
-        self.normal_fc = new_fc.to(self.device)
+            self.normal_fc = new_fc
 
     def update_noise(self):
-        if hasattr(self.backbone, 'noise_maker'):
-            for j in range(len(self.backbone.noise_maker)):
-                self.backbone.noise_maker[j].expand_new_task(self.cur_task)
+        # Trigger update mask trong PiNoise
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].update_noise()
 
     def after_task_magmax_merge(self):
-        if hasattr(self.backbone, 'noise_maker'):
-            for j in range(len(self.backbone.noise_maker)):
-                 self.backbone.noise_maker[j].after_task_training()
+        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
+        num_layers = len(self.backbone.blocks) 
+        for i in range(num_layers):
+             self.backbone.noise_maker[i].after_task_training()
 
     def unfreeze_noise(self):
-        if hasattr(self.backbone, 'noise_maker'):
-            for j in range(len(self.backbone.noise_maker)):
-                for param in self.backbone.noise_maker[j].parameters():
-                    param.requires_grad = True
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].unfreeze_noise()
 
     def init_unfreeze(self):
-        self.unfreeze_noise()
-        if hasattr(self.backbone, 'blocks'):
-            for block in self.backbone.blocks:
-                if hasattr(block, 'norm1'): 
-                    for p in block.norm1.parameters(): p.requires_grad = True
-                if hasattr(block, 'norm2'):
-                    for p in block.norm2.parameters(): p.requires_grad = True
-        if hasattr(self.backbone, 'norm'):
-            for p in self.backbone.norm.parameters(): p.requires_grad = True
-
+        # Mở khóa các lớp cần thiết ban đầu
+        for j in range(self.backbone.layer_num):
+            # Unfreeze Noise
+            self.backbone.noise_maker[j].unfreeze_noise()
+            
+            # Unfreeze LayerNorms trong từng Block ViT
+            for p in self.backbone.blocks[j].norm1.parameters():
+                p.requires_grad = True
+            for p in self.backbone.blocks[j].norm2.parameters():
+                p.requires_grad = True
+                
+        # Unfreeze LayerNorm cuối cùng
+        for p in self.backbone.norm.parameters():
+            p.requires_grad = True
     def forward_fc(self, features):
+        features = features.to(self.weight.dtype)
+        # Classifier chính thức (RLS Weight)
         return features @ self.weight
 
+    # -------------------------------------------------
+    # ✅ FIX 2: FIT FUNCTION VỚI EVAL MODE & MEMORY SAFE
+    # -------------------------------------------------
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Hybrid Fit:
-        1. Feature Extraction -> GPU
-        2. RLS Math -> CPU (Dùng self.R_cpu)
+        Huấn luyện Analytic Classifier (RLS).
+        Bắt buộc chuyển sang EVAL mode để PiNoise dùng Merged Weights.
         """
+        # Lưu trạng thái cũ
         old_training_state = self.training
         self.eval() 
         
         try:
-            # --- 1. GPU: Feature Extraction ---
-            from torch.amp import autocast
+            # 1. Feature Extraction (Dùng Autocast cho nhanh)
             with autocast('cuda', enabled=True): 
+                # backbone() sẽ gọi PiNoise.forward()
+                # Ở eval mode, PiNoise sẽ kích hoạt logic Merged + Deterministic
                 X_feat = self.backbone(X)
             
-            # Detach, Float32, Project
-            X_feat = X_feat.detach().float()
-            X_proj = self.buffer(X_feat) 
-            del X_feat 
-            
-            # --- 2. TRANSFER: GPU -> CPU ---
-            # Chỉ chuyển Feature đã project (nhỏ hơn nhiều so với ảnh gốc)
-            X_final_cpu = X_proj.cpu()
-            Y_cpu = Y.cpu().float()
-            del X_proj # Xóa ngay trên GPU
-            
-            # Lấy weight hiện tại về CPU để update
-            weight_cpu = self.weight.detach().cpu()
+            # 2. RLS Calculation (Dùng FP32 chuẩn xác)
+            with autocast('cuda', enabled=False):
+                X_feat = X_feat.detach().float()
+                
+                # Qua Random Buffer
+                X_feat = self.buffer(X_feat).float()
+                
+                device = self.weight.device
+                X_feat = X_feat.to(device)
+                Y = Y.to(device).float()
 
-            # Expand Weight trên CPU
-            num_targets = Y_cpu.shape[1]
-            if num_targets > weight_cpu.shape[1]:
-                tail = torch.zeros((weight_cpu.shape[0], num_targets - weight_cpu.shape[1]))
-                weight_cpu = torch.cat((weight_cpu, tail), dim=1)
-            elif num_targets < weight_cpu.shape[1]:
-                tail = torch.zeros((Y_cpu.shape[0], weight_cpu.shape[1] - num_targets))
-                Y_cpu = torch.cat((Y_cpu, tail), dim=1)
-
-            # --- 3. CPU: RLS Calculation ---
-            # Dùng self.R_cpu (đã nằm sẵn trên RAM)
-            P = self.R_cpu @ X_final_cpu.T
-            
-            term = X_final_cpu @ P
-            term.diagonal().add_(1.0) 
-            term = 0.5 * (term + term.T)
-            
-            # Nghịch đảo trên CPU (An toàn)
-            K = torch.linalg.inv(term)
-            del term
-            
-            P_K = P @ K 
-            self.R_cpu -= P_K @ P.T
-            del P
-            
-            residual = Y_cpu - (X_final_cpu @ weight_cpu)
-            weight_cpu += P_K @ residual
-            
-            # --- 4. TRANSFER: CPU -> GPU ---
-            # Đẩy weight kết quả về lại GPU
-            self.weight = weight_cpu.to(self.device)
-            
-            del X_final_cpu, Y_cpu, K, P_K, residual, weight_cpu
-            gc.collect()
-            torch.cuda.empty_cache()
-
+                # Tự động mở rộng Classifier (Weight matrix)
+                num_targets = Y.shape[1]
+                if num_targets > self.weight.shape[1]:
+                    increment_size = num_targets - self.weight.shape[1]
+                    tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                    self.weight = torch.cat((self.weight, tail), dim=1)
+                elif num_targets < self.weight.shape[1]:
+                    increment_size = self.weight.shape[1] - num_targets
+                    tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                    Y = torch.cat((Y, tail), dim=1)
+                # --- RLS CORE ---
+                # P = R * X^T
+                P = self.R @ X_feat.T
+                
+                # Term = X * P = X * R * X^T
+                term = X_feat @ P
+                # Regularization (Dampening factor)
+                term.diagonal().add_(1.0) 
+                # Symmetrization (giữ tính đối xứng)
+                term = 0.5 * (term + term.T)
+                
+                # Invert (K = term^-1)
+                try:
+                    K = torch.linalg.inv(term)
+                except RuntimeError:
+                    # ✅ Fallback CPU nếu OOM
+                    print("⚠️ GPU OOM during RLS inversion, switching to CPU...")
+                    K = torch.linalg.inv(term.cpu()).to(device)
+                
+                del term # Giải phóng bộ nhớ ngay
+                
+                # Update R
+                # R_new = R - P * K * P^T
+                P_K = P @ K # [Buffer, Batch] * [Batch, Batch]
+                self.R -= P_K @ P.T
+                
+                del P # Giải phóng
+                
+                # Update Weights
+                # W_new = W_old + P * K * (Y - X * W_old)
+                # residual = Y - Prediction
+                residual = Y - (X_feat @ self.weight)
+                self.weight += P_K @ residual
+                
+                # Dọn dẹp cuối cùng
+                del X_feat, Y, K, P_K, residual
+                torch.cuda.empty_cache()
+        
         finally:
+            # ✅ QUAN TRỌNG: Trả lại trạng thái cũ
             self.train(old_training_state)
 
     def forward(self, x, new_forward: bool = False):
+        # Hàm forward tổng quát cho Inference
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+
         hyper_features = self.backbone(x)
-        hyper_features = hyper_features.float()
-        proj_features = self.buffer(hyper_features)
-        logits = self.forward_fc(proj_features)
+        hyper_features = hyper_features.to(self.weight.dtype)
+        
+        # Qua buffer rồi nhân với RLS Weights
+        logits = self.forward_fc(self.buffer(hyper_features))
+        
         return {'logits': logits}
 
     def forward_normal_fc(self, x, new_forward: bool = False):
+        # Hàm forward dành riêng cho lúc Training PiNoise (dùng SGD)
         hyper_features = self.backbone(x)
-        hyper_features = hyper_features.float()
         hyper_features = self.buffer(hyper_features)
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
+        # Dùng Normal FC (có bias, đang học)
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
