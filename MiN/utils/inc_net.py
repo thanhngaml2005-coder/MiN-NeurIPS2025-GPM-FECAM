@@ -60,11 +60,10 @@ class RandomBuffer(torch.nn.Linear):
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        factory_kwargs = {"device": device, "dtype": torch.double}
-        # self.W = torch.empty((self.out_features, self.in_features), **factory_kwargs)
+        # Sửa dtype từ torch.double -> torch.float32
+        factory_kwargs = {"device": device, "dtype": torch.float32} 
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
-
         self.reset_parameters()
 
     # @torch.no_grad()
