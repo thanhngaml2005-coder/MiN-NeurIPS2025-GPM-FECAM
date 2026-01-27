@@ -404,6 +404,9 @@ class PiNoise(nn.Module):
         self.coef.requires_grad = False
     def unfreeze_noise(self):
         self.coef.requires_grad = True
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
@@ -878,7 +881,7 @@ class VisionTransformer(nn.Module):
         hidden_dim = args['hidden_dim'] if args and 'hidden_dim' in args else 192
         
         # 2. Khởi tạo PiNoise với embed_dim động (thay vì số cứng 768)
-        self.noise_maker = nn.ModuleList([PiNoise(dim, layer_id=i) for i in range(depth)])
+        self.noise_maker = nn.ModuleList([PiNoise( layer_id=i) for i in range(depth)])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
         # Classifier Head
