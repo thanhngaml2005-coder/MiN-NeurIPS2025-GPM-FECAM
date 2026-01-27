@@ -223,189 +223,6 @@ import torch.nn as nn
 import torch.fft
 import copy
 
-class PiNoise(nn.Module):
-    def __init__(self, in_dim=768, layer_id=0):
-        super().__init__()
-        self.in_dim = in_dim
-        self.layer_id = layer_id
-        
-        # --- CẤU HÌNH SPATIAL FFT ---
-        # ViT Base có 196 patches -> Grid 14x14
-        self.grid_h = 14
-        self.grid_w = 14
-        
-        # RFFT 2D của 14x14 sẽ ra kích thước: 14 x (14//2 + 1) = 14 x 8
-        self.freq_h = 14
-        self.freq_w = 8 
-        self.total_freq = self.freq_h * self.freq_w # 112 điểm tần số
-        
-        # k nhỏ (Prompting), ví dụ k=16
-        self.k = 16 
-        
-        # --- PARAMETER (COEF) ---
-        # Thay vì MLP, ta dùng Parameter học được trực tiếp.
-        # Shape: [k, 2] -> Cột 0 là Real, Cột 1 là Imag
-        self.coef = nn.Parameter(torch.zeros(self.k, 2))
-        
-        # Hệ số scaling (để noise nhỏ, tương đương epsilon)
-        self.epsilon = 0.1 
-
-        # --- MAGMAX STORAGE ---
-        self.global_coef = None # Lưu trữ kiến thức của các task trước
-
-        self.current_task_id = -1
-        self.task_indices = []
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        # Init = 0 tuyệt đối. 
-        # Task 0 sẽ bắt đầu sạch sẽ như Baseline.
-        nn.init.constant_(self.coef, 0.0)
-
-    def _get_spatial_mask(self, task_id):
-        # Chọn k điểm tần số trong không gian 14x8
-        # Bỏ điểm index 0 (DC Component - thành phần trung bình) để tránh đổi màu ảnh quá mức
-        available = torch.arange(1, self.total_freq) 
-        
-        max_tasks = 10
-        magic_shift = 3 # Magic shift cho Spatial
-        
-        # Công thức lệch pha index
-        start_index = (task_id + self.layer_id * magic_shift) % max_tasks
-        
-        if len(available) > 0:
-            indices = available[start_index :: max_tasks]
-        else:
-            indices = torch.tensor([], dtype=torch.long)
-
-        # Padding/Cut cho đủ k
-        if len(indices) >= self.k:
-            indices = indices[:self.k]
-        else:
-            pad_len = self.k - len(indices)
-            if len(indices) > 0:
-                pad = indices[-1].repeat(pad_len)
-                indices = torch.cat([indices, pad])
-            else:
-                indices = torch.zeros(self.k, dtype=torch.long)
-        return indices.long()
-
-    def update_noise(self, task_id=None):
-        if task_id is not None:
-            self.current_task_id = task_id
-            # Tạo mask mới cho task mới
-            if len(self.task_indices) <= self.current_task_id:
-                indices = self._get_spatial_mask(self.current_task_id)
-                self.task_indices.append(indices.cpu())
-            
-            # --- SEQUENTIAL LEARNING ---
-            if self.current_task_id == 0:
-                # Task 0: Reset về 0
-                self.reset_parameters()
-            else:
-                # Task > 0: Load kiến thức cũ (Global) về để fine-tune tiếp
-                if self.global_coef is not None:
-                    with torch.no_grad():
-                        self.coef.data.copy_(self.global_coef.data)
-                
-                # Đảm bảo bật gradient
-                self.coef.requires_grad = True
-        else:
-            # Fallback
-            self.current_task_id += 1
-            indices = self._get_spatial_mask(self.current_task_id)
-            self.task_indices.append(indices.cpu())
-            self.reset_parameters()
-
-    def after_task_training(self):
-        # --- MAGMAX MERGE CHO COEF ---
-        # Logic: So sánh độ lớn (Magnitude) của Coef vừa học vs Global Coef
-        
-        # [k, 2] -> Tính magnitude: sqrt(real^2 + imag^2)
-        curr_coef = self.coef.data
-        curr_mag = curr_coef.norm(dim=-1) # [k]
-
-        if self.global_coef is None:
-            self.global_coef = curr_coef.clone()
-        else:
-            global_mag = self.global_coef.norm(dim=-1) # [k]
-            
-            # Mask: [k, 1] (Broadcasting cho cả Real/Imag)
-            mask = (curr_mag > global_mag).float().unsqueeze(-1)
-            
-            # Merge: Lấy cái nào mạnh hơn
-            self.global_coef = mask * curr_coef + (1 - mask) * self.global_coef
-            
-        # Load lại vào model
-        with torch.no_grad():
-            self.coef.data.copy_(self.global_coef)
-
-    def forward(self, x):
-        # x shape: [Batch, 197, 768]
-        if self.current_task_id < 0: return x
-        
-        B, N, D = x.shape
-        # Chỉ chạy nếu đúng cấu trúc ViT (có 197 token)
-        if N != 197: return x
-
-        # 1. Tách CLS và Patch
-        cls_token = x[:, 0:1, :]       # [B, 1, 768]
-        patch_tokens = x[:, 1:, :]     # [B, 196, 768]
-        
-        # 2. Reshape về Spatial Grid [B, 14, 14, 768]
-        # Permute thành [B, 768, 14, 14] để tiện xử lý (dù ta tính noise global)
-        # x_spatial = patch_tokens.reshape(B, 14, 14, D).permute(0, 3, 1, 2)
-        
-        # 3. TẠO NOISE TỪ PROMPT (COEF)
-        # Không phụ thuộc x -> Input Independent
-        device = x.device
-        
-        # Canvas tần số trống [112]
-        F_real = torch.zeros(self.total_freq, device=device)
-        F_imag = torch.zeros(self.total_freq, device=device)
-        
-        # Lấy index và coef của task hiện tại (hoặc mixed nếu inference)
-        # Ở đây ta giả sử Inference dùng coef đã merge (self.coef) 
-        # và index của task cuối (hoặc dùng loop nếu muốn chồng noise các task - nhưng MagMax đã merge rồi)
-        
-        # Lấy mask của task hiện tại
-        idx = self.task_indices[self.current_task_id].to(device)
-        
-        # Điền giá trị vào phổ tần số
-        # self.coef shape [k, 2]
-        F_real.index_add_(0, idx, self.coef[:, 0])
-        F_imag.index_add_(0, idx, self.coef[:, 1])
-        
-        # Tạo phổ phức [14, 8]
-        F_complex = torch.complex(F_real, F_imag).reshape(self.freq_h, self.freq_w)
-        
-        # 4. IFFT để ra Noise Không gian [14, 14]
-        # Output là Real
-        noise_spatial = torch.fft.irfft2(F_complex, s=(self.grid_h, self.grid_w))
-        
-        # 5. Broadcast và Cộng
-        # noise_spatial [14, 14] -> [1, 1, 14, 14]
-        noise_broadcast = noise_spatial.unsqueeze(0).unsqueeze(0)
-        
-        # x_spatial [B, 196, 768] -> Reshape để cộng
-        # Ta cộng trực tiếp trên dạng token để đỡ phải permute nhiều
-        # noise_broadcast -> [1, 196, 1] (Flatten spatial, unsqueeze channel)
-        noise_token_aligned = noise_spatial.reshape(1, 196, 1).to(x.dtype)
-        
-        # Cộng noise: [B, 196, 768] + [1, 196, 1]
-        # Noise này sẽ cộng cùng 1 giá trị vào 768 kênh tại mỗi vị trí pixel (Global Texture)
-        patch_tokens_noisy = patch_tokens + self.epsilon * noise_token_aligned
-        
-        # 6. Ghép lại
-        return torch.cat([cls_token, patch_tokens_noisy], dim=1)
-
-    def freeze_noise(self):
-        self.coef.requires_grad = False
-    def unfreeze_noise(self):
-        self.coef.requires_grad = True
-
-
 # class PiNoise(nn.Module):
 #     def __init__(self, in_dim=768, layer_id=0):
 #         super().__init__()
@@ -413,169 +230,352 @@ class PiNoise(nn.Module):
 #         self.layer_id = layer_id
         
 #         # --- CẤU HÌNH SPATIAL FFT ---
-#         # Grid 14x14 cho ViT Base
+#         # ViT Base có 196 patches -> Grid 14x14
+#         self.grid_h = 14
+#         self.grid_w = 14
+        
+#         # RFFT 2D của 14x14 sẽ ra kích thước: 14 x (14//2 + 1) = 14 x 8
 #         self.freq_h = 14
 #         self.freq_w = 8 
-#         self.total_freq = self.freq_h * self.freq_w # 112 điểm
+#         self.total_freq = self.freq_h * self.freq_w # 112 điểm tần số
         
-#         # k: Số lượng tần số mỗi task được phép học
+#         # k nhỏ (Prompting), ví dụ k=16
 #         self.k = 16 
-
-#         # --- [FIX 1] GLOBAL BUFFER (THAY VÌ GLOBAL_COEF) ---
-#         # Lưu trữ toàn bộ bản đồ tần số của tất cả các task đã học.
-#         # MagMax sẽ update trực tiếp vào đây.
-#         # Shape: [112, 2]
-#         self.register_buffer('freq_buffer', torch.zeros(self.total_freq, 2))
         
-#         # Parameter tạm thời để train task hiện tại (chỉ k điểm)
-#         self.current_coef = nn.Parameter(torch.zeros(self.k, 2))
+#         # --- PARAMETER (COEF) ---
+#         # Thay vì MLP, ta dùng Parameter học được trực tiếp.
+#         # Shape: [k, 2] -> Cột 0 là Real, Cột 1 là Imag
+#         self.coef = nn.Parameter(torch.zeros(self.k, 2))
         
-#         # --- [FIX 2] CHANNEL MIXER ---
-#         # Giúp noise tác động khác nhau lên từng kênh (768 channel)
-#         # Thay vì chỉ cộng 1 số scalar giống nhau.
-#         self.channel_weight = nn.Parameter(torch.ones(in_dim, 1, 1) * 0.01)
+#         # Hệ số scaling (để noise nhỏ, tương đương epsilon)
+#         self.epsilon = 0.1 
 
-#         # Hệ số epsilon (scaling global)
-#         self.epsilon = 1.0 
+#         # --- MAGMAX STORAGE ---
+#         self.global_coef = None # Lưu trữ kiến thức của các task trước
 
 #         self.current_task_id = -1
-#         self.current_indices = None # Lưu index của task hiện tại để dùng cho forward train
+#         self.task_indices = []
 
-#     def _get_radial_indices(self):
-#         """
-#         [FIX 3] RADIAL SORTING
-#         Sắp xếp index theo hình học: Từ tâm (Low Freq) ra biên (High Freq).
-#         Giúp phân phối tần số công bằng hơn.
-#         """
-#         y = torch.arange(self.freq_h)
-#         x = torch.arange(self.freq_w)
-#         # Tạo lưới tọa độ
-#         yy, xx = torch.meshgrid(y, x, indexing='ij')
+#         self.reset_parameters()
+
+#     def reset_parameters(self):
+#         # Init = 0 tuyệt đối. 
+#         # Task 0 sẽ bắt đầu sạch sẽ như Baseline.
+#         nn.init.constant_(self.coef, 0.0)
+
+#     def _get_spatial_mask(self, task_id):
+#         # Chọn k điểm tần số trong không gian 14x8
+#         # Bỏ điểm index 0 (DC Component - thành phần trung bình) để tránh đổi màu ảnh quá mức
+#         available = torch.arange(1, self.total_freq) 
         
-#         # Tính khoảng cách Euclidean từ gốc (0,0)
-#         dist = torch.sqrt(yy.float()**2 + xx.float()**2).flatten()
+#         max_tasks = 10
+#         magic_shift = 3 # Magic shift cho Spatial
         
-#         # Sort index theo khoảng cách
-#         sorted_indices = torch.argsort(dist)
+#         # Công thức lệch pha index
+#         start_index = (task_id + self.layer_id * magic_shift) % max_tasks
         
-#         # Bỏ index 0 (DC component)
-#         return sorted_indices[1:]
+#         if len(available) > 0:
+#             indices = available[start_index :: max_tasks]
+#         else:
+#             indices = torch.tensor([], dtype=torch.long)
+
+#         # Padding/Cut cho đủ k
+#         if len(indices) >= self.k:
+#             indices = indices[:self.k]
+#         else:
+#             pad_len = self.k - len(indices)
+#             if len(indices) > 0:
+#                 pad = indices[-1].repeat(pad_len)
+#                 indices = torch.cat([indices, pad])
+#             else:
+#                 indices = torch.zeros(self.k, dtype=torch.long)
+#         return indices.long()
 
 #     def update_noise(self, task_id=None):
-#         if task_id is None: task_id = self.current_task_id + 1
-#         self.current_task_id = task_id
-        
-#         # 1. Lấy danh sách index đã sort theo bán kính
-#         # Cần move về cùng device với buffer
-#         sorted_indices = self._get_radial_indices().to(self.freq_buffer.device)
-        
-#         # 2. Magic Shift: Trượt cửa sổ chọn k điểm
-#         max_tasks = 10 
-#         step = len(sorted_indices) // max_tasks
-        
-#         # Công thức chọn vùng đất cho task
-#         start = (task_id * step + self.layer_id * 3) % len(sorted_indices)
-        
-#         indices = []
-#         for i in range(self.k):
-#             indices.append(sorted_indices[(start + i) % len(sorted_indices)])
-        
-#         self.current_indices = torch.stack(indices).long() # [k]
-        
-#         # 3. SEQUENTIAL INIT (Kế thừa kiến thức)
-#         # Lấy giá trị hiện có trong Global Buffer ra để làm điểm khởi đầu cho current_coef
-#         # Nếu vùng này chưa ai dùng thì nó là 0. Nếu có người dùng rồi thì ta fine-tune tiếp.
-#         with torch.no_grad():
-#             initial_values = self.freq_buffer[self.current_indices]
-#             self.current_coef.data.copy_(initial_values)
-        
-#         # Bật gradient để train
-#         self.current_coef.requires_grad = True
-#         self.channel_weight.requires_grad = True
+#         if task_id is not None:
+#             self.current_task_id = task_id
+#             # Tạo mask mới cho task mới
+#             if len(self.task_indices) <= self.current_task_id:
+#                 indices = self._get_spatial_mask(self.current_task_id)
+#                 self.task_indices.append(indices.cpu())
+            
+#             # --- SEQUENTIAL LEARNING ---
+#             if self.current_task_id == 0:
+#                 # Task 0: Reset về 0
+#                 self.reset_parameters()
+#             else:
+#                 # Task > 0: Load kiến thức cũ (Global) về để fine-tune tiếp
+#                 if self.global_coef is not None:
+#                     with torch.no_grad():
+#                         self.coef.data.copy_(self.global_coef.data)
+                
+#                 # Đảm bảo bật gradient
+#                 self.coef.requires_grad = True
+#         else:
+#             # Fallback
+#             self.current_task_id += 1
+#             indices = self._get_spatial_mask(self.current_task_id)
+#             self.task_indices.append(indices.cpu())
+#             self.reset_parameters()
 
 #     def after_task_training(self):
-#         """
-#         [FIX 4] MAGMAX TRỰC TIẾP TRÊN BUFFER
-#         """
-#         if self.current_indices is None: return
+#         # --- MAGMAX MERGE CHO COEF ---
+#         # Logic: So sánh độ lớn (Magnitude) của Coef vừa học vs Global Coef
+        
+#         # [k, 2] -> Tính magnitude: sqrt(real^2 + imag^2)
+#         curr_coef = self.coef.data
+#         curr_mag = curr_coef.norm(dim=-1) # [k]
 
+#         if self.global_coef is None:
+#             self.global_coef = curr_coef.clone()
+#         else:
+#             global_mag = self.global_coef.norm(dim=-1) # [k]
+            
+#             # Mask: [k, 1] (Broadcasting cho cả Real/Imag)
+#             mask = (curr_mag > global_mag).float().unsqueeze(-1)
+            
+#             # Merge: Lấy cái nào mạnh hơn
+#             self.global_coef = mask * curr_coef + (1 - mask) * self.global_coef
+            
+#         # Load lại vào model
 #         with torch.no_grad():
-#             # 1. Giá trị mới học
-#             new_vals = self.current_coef.data # [k, 2]
-            
-#             # 2. Giá trị cũ trong kho
-#             old_vals = self.freq_buffer[self.current_indices] # [k, 2]
-            
-#             # 3. So sánh độ lớn (Magnitude)
-#             new_mag = new_vals.norm(dim=-1)
-#             old_mag = old_vals.norm(dim=-1)
-            
-#             mask = (new_mag > old_mag).float().unsqueeze(-1)
-            
-#             # 4. Winner takes all
-#             best_vals = mask * new_vals + (1 - mask) * old_vals
-            
-#             # 5. Lưu ngược vào kho
-#             self.freq_buffer[self.current_indices] = best_vals
+#             self.coef.data.copy_(self.global_coef)
 
 #     def forward(self, x):
-#         # x: [B, 197, 768]
+#         # x shape: [Batch, 197, 768]
 #         if self.current_task_id < 0: return x
         
 #         B, N, D = x.shape
+#         # Chỉ chạy nếu đúng cấu trúc ViT (có 197 token)
 #         if N != 197: return x
 
-#         cls_token = x[:, 0:1, :]
-#         patch_tokens = x[:, 1:, :]
+#         # 1. Tách CLS và Patch
+#         cls_token = x[:, 0:1, :]       # [B, 1, 768]
+#         patch_tokens = x[:, 1:, :]     # [B, 196, 768]
         
+#         # 2. Reshape về Spatial Grid [B, 14, 14, 768]
+#         # Permute thành [B, 768, 14, 14] để tiện xử lý (dù ta tính noise global)
+#         # x_spatial = patch_tokens.reshape(B, 14, 14, D).permute(0, 3, 1, 2)
+        
+#         # 3. TẠO NOISE TỪ PROMPT (COEF)
+#         # Không phụ thuộc x -> Input Independent
 #         device = x.device
         
-#         # --- BƯỚC 1: CHUẨN BỊ PHỔ TẦN SỐ ---
-#         if self.training and self.current_indices is not None:
-#             # [TRAIN MODE]
-#             # Lấy bản sao của Buffer
-#             full_freqs = self.freq_buffer.clone()
-#             indices = self.current_indices.to(device)
-#             # Gán đè giá trị đang train (có gradient) vào đúng vị trí
-#             full_freqs.index_copy_(0, indices, self.current_coef)
-#         else:
-#             # [INFERENCE MODE]
-#             # Dùng trực tiếp Buffer (chứa tinh hoa của tất cả các task)
-#             full_freqs = self.freq_buffer
-            
-#         # --- BƯỚC 2: IFFT ---
-#         # [112, 2] -> [14, 8, 2] (Complex View)
-#         F_complex = torch.complex(full_freqs[:, 0], full_freqs[:, 1])
-#         F_2d = F_complex.reshape(self.freq_h, self.freq_w)
+#         # Canvas tần số trống [112]
+#         F_real = torch.zeros(self.total_freq, device=device)
+#         F_imag = torch.zeros(self.total_freq, device=device)
         
-#         # IFFT -> Spatial Noise [14, 14]
-#         noise_spatial = torch.fft.irfft2(F_2d, s=(self.freq_h, self.freq_h))
+#         # Lấy index và coef của task hiện tại (hoặc mixed nếu inference)
+#         # Ở đây ta giả sử Inference dùng coef đã merge (self.coef) 
+#         # và index của task cuối (hoặc dùng loop nếu muốn chồng noise các task - nhưng MagMax đã merge rồi)
         
-#         # --- BƯỚC 3: CHANNEL MIXING (QUAN TRỌNG) ---
-#         # noise_spatial: [14, 14] -> [1, 14, 14]
-#         noise_spatial = noise_spatial.unsqueeze(0)
+#         # Lấy mask của task hiện tại
+#         idx = self.task_indices[self.current_task_id].to(device)
         
-#         # channel_weight: [768, 1, 1]
-#         # Kết quả: [768, 14, 14] -> Mỗi kênh có noise cường độ khác nhau
-#         noise_channel_aware = noise_spatial * self.channel_weight
+#         # Điền giá trị vào phổ tần số
+#         # self.coef shape [k, 2]
+#         F_real.index_add_(0, idx, self.coef[:, 0])
+#         F_imag.index_add_(0, idx, self.coef[:, 1])
         
-#         # Flatten về dạng token: [768, 196] -> [196, 768]
-#         noise_flat = noise_channel_aware.flatten(1).transpose(0, 1)
+#         # Tạo phổ phức [14, 8]
+#         F_complex = torch.complex(F_real, F_imag).reshape(self.freq_h, self.freq_w)
         
-#         # Broadcast cho Batch: [1, 196, 768]
-#         noise_final = noise_flat.unsqueeze(0)
+#         # 4. IFFT để ra Noise Không gian [14, 14]
+#         # Output là Real
+#         noise_spatial = torch.fft.irfft2(F_complex, s=(self.grid_h, self.grid_w))
         
-#         # Cộng vào Patch
-#         patch_tokens_noisy = patch_tokens + self.epsilon * noise_final
+#         # 5. Broadcast và Cộng
+#         # noise_spatial [14, 14] -> [1, 1, 14, 14]
+#         noise_broadcast = noise_spatial.unsqueeze(0).unsqueeze(0)
         
+#         # x_spatial [B, 196, 768] -> Reshape để cộng
+#         # Ta cộng trực tiếp trên dạng token để đỡ phải permute nhiều
+#         # noise_broadcast -> [1, 196, 1] (Flatten spatial, unsqueeze channel)
+#         noise_token_aligned = noise_spatial.reshape(1, 196, 1).to(x.dtype)
+        
+#         # Cộng noise: [B, 196, 768] + [1, 196, 1]
+#         # Noise này sẽ cộng cùng 1 giá trị vào 768 kênh tại mỗi vị trí pixel (Global Texture)
+#         patch_tokens_noisy = patch_tokens + self.epsilon * noise_token_aligned
+        
+#         # 6. Ghép lại
 #         return torch.cat([cls_token, patch_tokens_noisy], dim=1)
 
 #     def freeze_noise(self):
-#         self.current_coef.requires_grad = False
-#         self.channel_weight.requires_grad = False
+#         self.coef.requires_grad = False
 #     def unfreeze_noise(self):
-#         self.current_coef.requires_grad = True
-#         self.channel_weight.requires_grad = True
+#         self.coef.requires_grad = True
+
+
+class PiNoise(nn.Module):
+    def __init__(self, in_dim=768, layer_id=0):
+        super().__init__()
+        self.in_dim = in_dim
+        self.layer_id = layer_id
+        
+        # --- CẤU HÌNH SPATIAL FFT ---
+        # Grid 14x14 cho ViT Base
+        self.freq_h = 14
+        self.freq_w = 8 
+        self.total_freq = self.freq_h * self.freq_w # 112 điểm
+        
+        # k: Số lượng tần số mỗi task được phép học
+        self.k = 16 
+
+        # --- [FIX 1] GLOBAL BUFFER (THAY VÌ GLOBAL_COEF) ---
+        # Lưu trữ toàn bộ bản đồ tần số của tất cả các task đã học.
+        # MagMax sẽ update trực tiếp vào đây.
+        # Shape: [112, 2]
+        self.register_buffer('freq_buffer', torch.zeros(self.total_freq, 2))
+        
+        # Parameter tạm thời để train task hiện tại (chỉ k điểm)
+        self.current_coef = nn.Parameter(torch.zeros(self.k, 2))
+        
+        # --- [FIX 2] CHANNEL MIXER ---
+        # Giúp noise tác động khác nhau lên từng kênh (768 channel)
+        # Thay vì chỉ cộng 1 số scalar giống nhau.
+        self.channel_weight = nn.Parameter(torch.ones(in_dim, 1, 1) * 0.01)
+
+        # Hệ số epsilon (scaling global)
+        self.epsilon = 1.0 
+
+        self.current_task_id = -1
+        self.current_indices = None # Lưu index của task hiện tại để dùng cho forward train
+
+    def _get_radial_indices(self):
+        """
+        [FIX 3] RADIAL SORTING
+        Sắp xếp index theo hình học: Từ tâm (Low Freq) ra biên (High Freq).
+        Giúp phân phối tần số công bằng hơn.
+        """
+        y = torch.arange(self.freq_h)
+        x = torch.arange(self.freq_w)
+        # Tạo lưới tọa độ
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        
+        # Tính khoảng cách Euclidean từ gốc (0,0)
+        dist = torch.sqrt(yy.float()**2 + xx.float()**2).flatten()
+        
+        # Sort index theo khoảng cách
+        sorted_indices = torch.argsort(dist)
+        
+        # Bỏ index 0 (DC component)
+        return sorted_indices[1:]
+
+    def update_noise(self, task_id=None):
+        if task_id is None: task_id = self.current_task_id + 1
+        self.current_task_id = task_id
+        
+        # 1. Lấy danh sách index đã sort theo bán kính
+        # Cần move về cùng device với buffer
+        sorted_indices = self._get_radial_indices().to(self.freq_buffer.device)
+        
+        # 2. Magic Shift: Trượt cửa sổ chọn k điểm
+        max_tasks = 10 
+        step = len(sorted_indices) // max_tasks
+        
+        # Công thức chọn vùng đất cho task
+        start = (task_id * step + self.layer_id * 3) % len(sorted_indices)
+        
+        indices = []
+        for i in range(self.k):
+            indices.append(sorted_indices[(start + i) % len(sorted_indices)])
+        
+        self.current_indices = torch.stack(indices).long() # [k]
+        
+        # 3. SEQUENTIAL INIT (Kế thừa kiến thức)
+        # Lấy giá trị hiện có trong Global Buffer ra để làm điểm khởi đầu cho current_coef
+        # Nếu vùng này chưa ai dùng thì nó là 0. Nếu có người dùng rồi thì ta fine-tune tiếp.
+        with torch.no_grad():
+            initial_values = self.freq_buffer[self.current_indices]
+            self.current_coef.data.copy_(initial_values)
+        
+        # Bật gradient để train
+        self.current_coef.requires_grad = True
+        self.channel_weight.requires_grad = True
+
+    def after_task_training(self):
+        """
+        [FIX 4] MAGMAX TRỰC TIẾP TRÊN BUFFER
+        """
+        if self.current_indices is None: return
+
+        with torch.no_grad():
+            # 1. Giá trị mới học
+            new_vals = self.current_coef.data # [k, 2]
+            
+            # 2. Giá trị cũ trong kho
+            old_vals = self.freq_buffer[self.current_indices] # [k, 2]
+            
+            # 3. So sánh độ lớn (Magnitude)
+            new_mag = new_vals.norm(dim=-1)
+            old_mag = old_vals.norm(dim=-1)
+            
+            mask = (new_mag > old_mag).float().unsqueeze(-1)
+            
+            # 4. Winner takes all
+            best_vals = mask * new_vals + (1 - mask) * old_vals
+            
+            # 5. Lưu ngược vào kho
+            self.freq_buffer[self.current_indices] = best_vals
+
+    def forward(self, x):
+        # x: [B, 197, 768]
+        if self.current_task_id < 0: return x
+        
+        B, N, D = x.shape
+        if N != 197: return x
+
+        cls_token = x[:, 0:1, :]
+        patch_tokens = x[:, 1:, :]
+        
+        device = x.device
+        
+        # --- BƯỚC 1: CHUẨN BỊ PHỔ TẦN SỐ ---
+        if self.training and self.current_indices is not None:
+            # [TRAIN MODE]
+            # Lấy bản sao của Buffer
+            full_freqs = self.freq_buffer.clone()
+            indices = self.current_indices.to(device)
+            # Gán đè giá trị đang train (có gradient) vào đúng vị trí
+            full_freqs.index_copy_(0, indices, self.current_coef)
+        else:
+            # [INFERENCE MODE]
+            # Dùng trực tiếp Buffer (chứa tinh hoa của tất cả các task)
+            full_freqs = self.freq_buffer
+            
+        # --- BƯỚC 2: IFFT ---
+        # [112, 2] -> [14, 8, 2] (Complex View)
+        F_complex = torch.complex(full_freqs[:, 0], full_freqs[:, 1])
+        F_2d = F_complex.reshape(self.freq_h, self.freq_w)
+        
+        # IFFT -> Spatial Noise [14, 14]
+        noise_spatial = torch.fft.irfft2(F_2d, s=(self.freq_h, self.freq_h))
+        
+        # --- BƯỚC 3: CHANNEL MIXING (QUAN TRỌNG) ---
+        # noise_spatial: [14, 14] -> [1, 14, 14]
+        noise_spatial = noise_spatial.unsqueeze(0)
+        
+        # channel_weight: [768, 1, 1]
+        # Kết quả: [768, 14, 14] -> Mỗi kênh có noise cường độ khác nhau
+        noise_channel_aware = noise_spatial * self.channel_weight
+        
+        # Flatten về dạng token: [768, 196] -> [196, 768]
+        noise_flat = noise_channel_aware.flatten(1).transpose(0, 1)
+        
+        # Broadcast cho Batch: [1, 196, 768]
+        noise_final = noise_flat.unsqueeze(0)
+        
+        # Cộng vào Patch
+        patch_tokens_noisy = patch_tokens + self.epsilon * noise_final
+        
+        return torch.cat([cls_token, patch_tokens_noisy], dim=1)
+
+    def freeze_noise(self):
+        self.current_coef.requires_grad = False
+        self.channel_weight.requires_grad = False
+    def unfreeze_noise(self):
+        self.current_coef.requires_grad = True
+        self.channel_weight.requires_grad = True
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
