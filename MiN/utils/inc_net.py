@@ -132,13 +132,14 @@ class MiNbaseNet(nn.Module):
     def update_noise(self):
         # Trigger update mask trong PiNoise
         for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].update_noise()
-
+            if hasattr(m, 'update_noise'):
+                # PiNoise cần nhận tham số task_id
+                m.update_noise(task_id=self.cur_task)
     def after_task_magmax_merge(self):
-        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        num_layers = len(self.backbone.blocks) 
-        for i in range(num_layers):
-             self.backbone.noise_maker[i].after_task_training()
+        print(f"--> [IncNet] Task {self.cur_task}: Triggering MagMax Merging...")
+        for m in self.backbone.noise_maker:
+            # Hàm này trong PiNoise mới đã bao gồm logic _magmax_update
+            m.after_task_training()
 
     def unfreeze_noise(self):
         for j in range(self.backbone.layer_num):
