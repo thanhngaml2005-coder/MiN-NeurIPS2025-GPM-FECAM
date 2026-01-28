@@ -80,115 +80,93 @@ from torch.utils.checkpoint import checkpoint
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 class PiNoise(nn.Module):
-    def __init__(
-        self,
-        in_dim: int = 768,
-        k: int = 3000,
-        alpha: float = 0.1,
-        use_orthogonal: bool = True
-    ):
+    def __init__(self, in_dim=768, out_dim=768, k=3000, alpha=0.1):
         super().__init__()
         self.d = in_dim
         self.k = k
         self.alpha = alpha
         self.total_points = in_dim * in_dim
 
-        # 1. ORTHOGONAL BASIS F
-        if use_orthogonal:
-            w_init = torch.randn(in_dim, in_dim)
-            q, _ = torch.linalg.qr(w_init)
-            self.register_buffer("F", q)
-        else:
-            self.register_buffer("F", torch.eye(in_dim))
+        # 1. Nhánh MLP (Giữ nguyên đầu ra [B, D])
+        self.MLP = nn.Linear(in_dim, out_dim)
+        nn.init.constant_(self.MLP.weight, 0)
+        nn.init.constant_(self.MLP.bias, 0)
 
-        # 2. GLOBAL STORAGE (SPARSE)
+        # 2. Ma trận trực giao F [768 x 768]
+        # Không dùng W_down/W_up, dùng trực tiếp F để xoay toàn bộ không gian 768
+        w_init = torch.randn(in_dim, in_dim)
+        q, _ = torch.linalg.qr(w_init)
+        self.register_buffer("F", q)
+
+        # 3. Global Storage (Ma trận thưa B trong không gian 768x768)
         self.register_buffer("global_u", torch.empty(0, dtype=torch.long))
         self.register_buffer("global_v", torch.empty(0, dtype=torch.long))
         self.register_buffer("global_vals", torch.empty(0))
 
-        # 3. CURRENT TASK PARAMETERS
+        # 4. Current Task Parameters
         self.current_values = nn.Parameter(torch.zeros(k))
         self.register_buffer("current_u", torch.zeros(k, dtype=torch.long))
         self.register_buffer("current_v", torch.zeros(k, dtype=torch.long))
         self.current_task_id = -1
 
-        # 4. MLP BRANCH
-        self.MLP = nn.Linear(in_dim, in_dim)
-        torch.nn.init.constant_(self.MLP.weight, 0)
-        torch.nn.init.constant_(self.MLP.bias, 0)
-
-    def freeze_noise(self):
-        self.current_values.requires_grad_(False)
-        for param in self.MLP.parameters(): param.requires_grad_(False)
-
     def unfreeze_noise(self):
         self.current_values.requires_grad_(True)
         for param in self.MLP.parameters(): param.requires_grad_(True)
-        
-    def _sample_unique_indices(self):
-        flat = torch.randperm(self.total_points)[: self.k]
-        return flat // self.d, flat % self.d
-    
-    def _make_temp_dense(self):
-        dev = self.global_vals.device
-        dense = torch.zeros(self.d, self.d, device=dev, dtype=self.global_vals.dtype)
-        if len(self.global_u) > 0:
-            dense[self.global_u, self.global_v] = self.global_vals
-        return dense
-
-    def _save_dense_to_sparse(self, dense):
-        indices = torch.nonzero(dense, as_tuple=True)
-        self.global_u, self.global_v = indices[0], indices[1]
-        self.global_vals = dense[indices]
-
-    def update_noise(self, task_id: int):
-        self.current_task_id = task_id
-        u, v = self._sample_unique_indices()
-        dev = self.current_u.device
-        self.current_u.data.copy_(u.to(dev)); self.current_v.data.copy_(v.to(dev))
-        with torch.no_grad():
-            temp_B = self._make_temp_dense()
-            old_vals = temp_B[self.current_u, self.current_v]
-            self.current_values.data.copy_(old_vals)
-            mask_zero = (old_vals == 0)
-            if mask_zero.any():
-                self.current_values.data[mask_zero] += torch.randn(mask_zero.sum(), device=dev) * 0.02
-        self.unfreeze_noise()
-
-    def after_task_training(self):
-        if self.current_task_id < 0: return
-        dev = self.global_vals.device
-        with torch.no_grad():
-            temp_B = self._make_temp_dense()
-            new_vals, old_vals = self.current_values.data, temp_B[self.current_u, self.current_v]
-            merged = torch.where(new_vals.abs() > old_vals.abs(), new_vals, old_vals)
-            temp_B[self.current_u, self.current_v] = merged
-            self._save_dense_to_sparse(temp_B)
-        self.freeze_noise()
 
     def _forward_compute_noise(self, x, current_values):
+        """
+        Toán học thuần túy: noise = F @ B @ F.T @ x
+        Input x: [B, 768] (đã được ép về 2D)
+        """
+        # 1. Xoay vào không gian trực giao: h = x @ F
         h = torch.matmul(x, self.F.to(dtype=x.dtype))
         h_mixed = torch.zeros_like(h)
-        # Replay
+
+        # View 2D để broadcast: [1, k]
+        vals_shape = (1, -1)
+
+        # 2. Cộng nhiễu thưa B (MagMax protected)
         if len(self.global_u) > 0:
-            vals_old = self.global_vals.view(1, -1).to(dtype=x.dtype, device=x.device)
+            vals_old = self.global_vals.view(*vals_shape).to(dtype=x.dtype, device=x.device)
+            # Nhân với các cột u, cộng vào các cột v
             source = h[:, self.global_u] * vals_old
             h_mixed.index_add_(-1, self.global_v.to(x.device), source)
-        # Current
-        vals = current_values.to(dtype=x.dtype, device=x.device).view(1, -1)
-        source = h[:, self.current_u] * vals
-        h_mixed.index_add_(-1, self.current_v, source)
-        return torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
+
+        vals_curr = current_values.view(*vals_shape).to(dtype=x.dtype, device=x.device)
+        source_curr = h[:, self.current_u] * vals_curr
+        h_mixed.index_add_(-1, self.current_v, source_curr)
+
+        # 3. Xoay ngược về không gian cũ: noise = h_mixed @ F.T
+        noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
+        return noise
 
     def forward(self, x):
-        if self.current_task_id < 0: return x
-        if self.training and x.requires_grad:
-            noise = checkpoint(self._forward_compute_noise, x, self.current_values, use_reentrant=False)
+        """
+        Đảm bảo đầu ra LUÔN LUÔN là 2D [B, 768]
+        """
+        if self.current_task_id < 0:
+            # Nếu input là 3D, trả về 2D CLS token
+            return x[:, 0] if x.dim() == 3 else x
+
+        # BẮT BUỘC ÉP VỀ 2D (CLS Token) để tính toán
+        # Điều này giúp cộng được với hyper_features [B, 768] ở inc_net
+        x_2d = x[:, 0] if x.dim() == 3 else x
+
+        if self.training and x_2d.requires_grad:
+            noise = checkpoint(self._forward_compute_noise, x_2d, self.current_values, use_reentrant=False)
         else:
-            noise = self._forward_compute_noise(x, self.current_values)
-        return x + self.alpha * noise + self.MLP(x)
+            noise = self._forward_compute_noise(x_2d, self.current_values)
+
+        # Nhánh MLP cũng chạy trên 2D
+        x_mlp = self.MLP(x_2d)
+
+        # Trả về [B, 768]
+        return x_2d + self.alpha * noise + x_mlp
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
