@@ -129,8 +129,8 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = True
 
-        self._network.update_fc(self.init_class, task_id=self.cur_task)
-        self._network.update_noise(task_id=self.cur_task)
+        self._network.update_fc(self.init_class)
+        self._network.update_noise()
         
         self._clear_gpu()
         
@@ -186,11 +186,11 @@ class MinNet(object):
 
         self.fit_fc(train_loader, test_loader)
 
-        self._network.update_fc(self.increment, task_id=self.cur_task)
+        self._network.update_fc(self.increment)
 
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
-        self._network.update_noise(task_id=self.cur_task)
+        self._network.update_noise()
         
         self._clear_gpu()
 
