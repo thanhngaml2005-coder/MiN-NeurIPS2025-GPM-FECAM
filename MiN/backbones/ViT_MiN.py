@@ -250,38 +250,51 @@ class PiNoise(nn.Module):
         h_mixed = torch.zeros_like(h)
 
         if self.training:
-            # [TRAIN]: Chỉ dùng tham số cục bộ của task hiện tại
+            if len(self.global_u) > 0:
+                u_old = self.global_u
+                v_old = self.global_v
+                vals_old = self.global_vals.view(1, 1, -1)
+                
+                # Check device matching
+                if x.device != u_old.device:
+                    u_old = u_old.to(x.device)
+                    v_old = v_old.to(x.device)
+                    vals_old = vals_old.to(x.device)
+                
+                # [FIX 2] Ép kiểu vals_old theo x (quan trọng cho Autocast)
+                vals_old = vals_old.to(dtype=x.dtype)
+                
+                # Replay (detach để ko tính grad cho quá khứ)
+                h_mixed.index_add_(-1, v_old, h[..., u_old] * vals_old.detach())
+
+            # B. Current Task Learning
             u = self.current_u.to(x.device)
             v = self.current_v.to(x.device)
+            
+            # [FIX 3] Ép kiểu vals hiện tại theo x
             vals = self.current_values.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
 
-            h_mixed.index_add_(
-                -1,
-                v,
-                h[..., u] * vals,
-            )
-
+            h_mixed.index_add_(-1, v, h[..., u] * vals)
         else:
-            # [INFERENCE]: Dùng toàn bộ kiến thức cũ (Sparse Replay)
             if len(self.global_u) > 0:
-                u = self.global_u # Đã là buffer (tự theo device model)
+                u = self.global_u
                 v = self.global_v
                 vals = self.global_vals.view(1, 1, -1)
 
-                # An toàn: nếu x ở device khác (ví dụ DataParallel)
                 if x.device != u.device:
-                    u, v, vals = u.to(x.device), v.to(x.device), vals.to(x.device)
+                    u = u.to(x.device)
+                    v = v.to(x.device)
+                    vals = vals.to(x.device)
 
+                # [FIX 4] Ép kiểu cho Inference
                 vals = vals.to(dtype=x.dtype)
 
-                h_mixed.index_add_(
-                    -1,
-                    v,
-                    h[..., u] * vals,
-                )
+                h_mixed.index_add_(-1, v, h[..., u] * vals)
 
-        # 3. Biến đổi ngược & Cộng dư (Residual)
+        # 3. Back-Project
+        # [FIX 5] Ép kiểu F.t() theo x
         noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
+
         return x + self.alpha * noise
    
 
