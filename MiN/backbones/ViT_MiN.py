@@ -356,7 +356,7 @@ class PiNoise(torch.nn.Linear):
         # 2. Tính Noise trực tiếp (Không dùng checkpoint nữa)
         noise = self._forward_compute_noise(x, self.current_values)
 
-        return x_mlp + self.alpha * noise + x
+        return x_mlp +  noise + x
     def unfreeze_task_0(self):
         """Task 0: Học MLP + Noise"""
         for p in self.MLP.parameters(): p.requires_grad = True
