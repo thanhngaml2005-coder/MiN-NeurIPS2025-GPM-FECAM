@@ -245,17 +245,21 @@ class PiNoise(nn.Module):
             return x
 
         # 1. Biến đổi trực giao (trộn thông tin)
-        h = torch.matmul(x, self.F)
+        h = torch.matmul(x, self.F.to(dtype=x.dtype))
+    
         h_mixed = torch.zeros_like(h)
 
         if self.training:
             # [TRAIN]: Chỉ dùng tham số cục bộ của task hiện tại
             u = self.current_u.to(x.device)
             v = self.current_v.to(x.device)
-            # Broadcast values [K] -> [1, 1, K]
-            vals = self.current_values.to(x.device).view(1, 1, -1)
-            
-            h_mixed.index_add_(-1, v, h[..., u] * vals)
+            vals = self.current_values.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
+
+            h_mixed.index_add_(
+                -1,
+                v,
+                h[..., u] * vals,
+            )
 
         else:
             # [INFERENCE]: Dùng toàn bộ kiến thức cũ (Sparse Replay)
@@ -268,10 +272,16 @@ class PiNoise(nn.Module):
                 if x.device != u.device:
                     u, v, vals = u.to(x.device), v.to(x.device), vals.to(x.device)
 
-                h_mixed.index_add_(-1, v, h[..., u] * vals)
+                vals = vals.to(dtype=x.dtype)
+
+                h_mixed.index_add_(
+                    -1,
+                    v,
+                    h[..., u] * vals,
+                )
 
         # 3. Biến đổi ngược & Cộng dư (Residual)
-        noise = torch.matmul(h_mixed, self.F.t())
+        noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
         return x + self.alpha * noise
     def freeze_noise(self):
         for p in self.parameters(): p.requires_grad = False
