@@ -106,8 +106,12 @@ class MiNbaseNet(nn.Module):
         self.cur_task = -1
         self.known_class = 0
 
-    def update_fc(self, nb_classes):
-        self.cur_task += 1
+    def update_fc(self, nb_classes, task_id=None):
+        # [SỬA] Cho phép đồng bộ task_id từ Trainer nếu có
+        if task_id is not None:
+            self.cur_task = task_id
+        else:
+            self.cur_task += 1
         self.known_class += nb_classes
         
         # Tạo Normal FC mới để train task hiện tại
@@ -130,12 +134,21 @@ class MiNbaseNet(nn.Module):
                 nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
 
-    def update_noise(self):
-        # Trigger update mask trong PiNoise
-        for m in self.backbone.noise_maker:
+    def update_noise(self, task_id):
+        """
+        [QUAN TRỌNG] Nhận task_id từ Trainer (Source of Truth).
+        Không để PiNoise tự quyết định ID.
+        """
+        print(f"--> [IncNet] Broadcasting Task ID {task_id} to all PiNoise blocks...")
+        
+        # Đồng bộ ID của mạng chính
+        self.cur_task = task_id
+        
+        # Phát sóng xuống từng layer backbone
+        for i, m in enumerate(self.backbone.noise_maker):
             if hasattr(m, 'update_noise'):
-                # PiNoise cần nhận tham số task_id
-                m.update_noise()
+                # Truyền task_id vào hàm con
+                m.update_noise(task_id=task_id)
     def after_task_magmax_merge(self):
         print(f"--> [IncNet] Task {self.cur_task}: Triggering MagMax Merging...")
         for m in self.backbone.noise_maker:

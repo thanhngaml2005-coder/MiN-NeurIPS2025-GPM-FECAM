@@ -183,9 +183,9 @@ class PiNoise(nn.Module):
     # CORE: TASK LIFECYCLE
     # ======================================================
 
-    def update_noise(self):
+    def update_noise(self, task_id: int):
         """GỌI ĐẦU MỖI TASK: Cấp phát đất mới + Init thông minh"""
-        self.current_task_id += 1
+        self.current_task_id = task_id
 
         # 1. Sample vị trí mới
         u, v = self._sample_unique_indices()
@@ -283,13 +283,7 @@ class PiNoise(nn.Module):
         # 3. Biến đổi ngược & Cộng dư (Residual)
         noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
         return x + self.alpha * noise
-    def freeze_noise(self):
-        for p in self.parameters(): p.requires_grad = False
-    def unfreeze_noise(self):
-        for p in self.parameters(): p.requires_grad = True
-
-
-
+   
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
