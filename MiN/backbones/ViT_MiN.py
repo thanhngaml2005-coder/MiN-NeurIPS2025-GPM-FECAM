@@ -327,34 +327,87 @@ class PiNoise(torch.nn.Linear):
             self.global_vals = dense[indices]
         self.freeze_noise()
 
-    def _forward_compute_noise(self, x, current_values):
-        h = x @ self.w_down.to(x.dtype)
-        h_rot = h @ self.F.to(x.dtype)
-        h_mixed = torch.zeros_like(h_rot)
+    # def _forward_compute_noise(self, x, current_values):
+    #     h = x @ self.w_down.to(x.dtype)
+    #     h_rot = h @ self.F.to(x.dtype)
+    #     h_mixed = torch.zeros_like(h_rot)
+    #     view_shape = (1,) * (x.dim() - 1) + (-1,)
+
+    #     # Quá khứ
+    #     if len(self.global_u) > 0:
+    #         v_old = self.global_vals.view(*view_shape).to(x.dtype)
+    #         source_old = (h_rot[..., self.global_u] * v_old).to(h_mixed.dtype)
+    #         h_mixed.index_add_(-1, self.global_v, source_old)
+            
+    #     # Hiện tại
+    #     v_curr = current_values.view(*view_shape).to(x.dtype)
+    #     source_curr = (h_rot[..., self.current_u] * v_curr).to(h_mixed.dtype)
+    #     h_mixed.index_add_(-1, self.current_v, source_curr)
+
+    #     h_out = h_mixed @ self.F.t().to(x.dtype)
+    #     return h_out @ self.w_up.to(x.dtype)
+
+    # def forward(self, x):
+    #     if self.current_task_id < 0: return x
+    #     x1 = self.MLP(x)
+    #     if self.training and x.requires_grad:
+    #         noise = checkpoint(self._forward_compute_noise, x, self.current_values, use_reentrant=False)
+    #     else:
+    #         noise = self._forward_compute_noise(x, self.current_values)
+    #     return x1 + self.alpha * noise + x
+    def _forward_compute_noise(self, x, current_values, global_vals, current_u, current_v, global_u, global_v):
+        """
+        Quy tắc Checkpoint: Không dùng in-place (_), truyền mọi Tensor vào đối số.
+        """
+        # 1. Chiếu và xoay
+        h_rot = (x @ self.weight_down.to(x.dtype)) @ self.F.to(x.dtype)
+        
+        # Tạo h_mixed bằng lệnh copy thay vì zeros_like đơn thuần để tránh lỗi graph
+        h_mixed = torch.zeros(h_rot.shape, device=h_rot.device, dtype=h_rot.dtype)
+        
         view_shape = (1,) * (x.dim() - 1) + (-1,)
 
-        # Quá khứ
-        if len(self.global_u) > 0:
-            v_old = self.global_vals.view(*view_shape).to(x.dtype)
-            source_old = (h_rot[..., self.global_u] * v_old).to(h_mixed.dtype)
-            h_mixed.index_add_(-1, self.global_v, source_old)
+        # 2. Quá khứ (Dùng index_add - bản không in-place)
+        if len(global_u) > 0:
+            v_old = global_vals.view(*view_shape).to(x.dtype)
+            source_old = (h_rot[..., global_u] * v_old).to(h_mixed.dtype)
+            # KHÔNG DÙNG index_add_ (in-place)
+            h_mixed = torch.index_add(h_mixed, -1, global_v, source_old)
             
-        # Hiện tại
+        # 3. Hiện tại
         v_curr = current_values.view(*view_shape).to(x.dtype)
-        source_curr = (h_rot[..., self.current_u] * v_curr).to(h_mixed.dtype)
-        h_mixed.index_add_(-1, self.current_v, source_curr)
+        source_curr = (h_rot[..., current_u] * v_curr).to(h_mixed.dtype)
+        # KHÔNG DÙNG index_add_ (in-place)
+        h_mixed = torch.index_add(h_mixed, -1, current_v, source_curr)
 
-        h_out = h_mixed @ self.F.t().to(x.dtype)
-        return h_out @ self.w_up.to(x.dtype)
+        # 4. Bung ngược lại
+        return (h_mixed @ self.F.t().to(x.dtype)) @ self.weight_up.to(x.dtype)
 
     def forward(self, x):
         if self.current_task_id < 0: return x
-        x1 = self.MLP(x)
-        if self.training and x.requires_grad:
-            noise = checkpoint(self._forward_compute_noise, x, self.current_values, use_reentrant=False)
+        
+        x_mlp = self.MLP(x)
+        
+        if self.training and (x.requires_grad or self.current_values.requires_grad):
+            # Truyền TẤT CẢ các buffer cần dùng vào checkpoint để nó theo dõi metadata
+            noise = checkpoint(
+                self._forward_compute_noise, 
+                x, 
+                self.current_values,
+                self.global_vals,
+                self.current_u,
+                self.current_v,
+                self.global_u,
+                self.global_v,
+                use_reentrant=False
+            )
         else:
-            noise = self._forward_compute_noise(x, self.current_values)
-        return x1 + self.alpha * noise + x
+            noise = self._forward_compute_noise(
+                x, self.current_values, self.global_vals,
+                self.current_u, self.current_v, self.global_u, self.global_v
+            )
+
+        return x_mlp + self.alpha * noise + x
     def unfreeze_task_0(self):
         """Task 0: Học MLP + Noise"""
         for p in self.MLP.parameters(): p.requires_grad = True
