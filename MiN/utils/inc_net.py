@@ -157,29 +157,22 @@ class MiNbaseNet(nn.Module):
             self.backbone.noise_maker[j].after_task_training()
 
     def unfreeze_noise(self):
-        """Chỉ mở khóa gradient cho các module Noise (cho các task > 0)"""
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].unfreeze_noise()
+        """Gọi cho Task > 0: Chỉ unfreeze Noise thưa"""
+        for j in range(len(self.backbone.noise_maker)):
+            self.backbone.noise_maker[j].unfreeze_incremental()
 
     def init_unfreeze(self):
-        """
-        Mở khóa gradient cho Task 0.
-        Bao gồm Noise modules và các lớp Normalization của Backbone để ổn định hơn.
-        """
-        for j in range(self.backbone.layer_num):
-            # Unfreeze Noise
-            self.backbone.noise_maker[j].unfreeze_noise()
+        for j in range(len(self.backbone.noise_maker)):
+            self.backbone.noise_maker[j].unfreeze_task_0()
             
-            # Unfreeze LayerNorms trong từng Block ViT
-            for p in self.backbone.blocks[j].norm1.parameters():
-                p.requires_grad = True
-            for p in self.backbone.blocks[j].norm2.parameters():
-                p.requires_grad = True
+            # Giữ LayerNorm trainable ở Task 0 để ổn định base
+            if hasattr(self.backbone.blocks[j], 'norm1'):
+                for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
+            if hasattr(self.backbone.blocks[j], 'norm2'):
+                for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
                 
-        # Unfreeze LayerNorm cuối cùng
-        for p in self.backbone.norm.parameters():
-            p.requires_grad = True
-
+        if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
+            for p in self.backbone.norm.parameters(): p.requires_grad = True
     # =========================================================================
     # [ANALYTIC LEARNING (RLS) SECTION]
     # =========================================================================

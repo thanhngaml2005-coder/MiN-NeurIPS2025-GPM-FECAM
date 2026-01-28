@@ -234,7 +234,7 @@ import math
 from torch.utils.checkpoint import checkpoint
 
 class PiNoise(torch.nn.Linear):
-    def __init__(self, in_dim, out_dim, hidden_dim=384, k=3000, alpha=0.1, max_tasks=50):
+    def __init__(self, in_dim, out_dim, hidden_dim=384, k=3000, alpha=0.1, max_tasks=40):
         super(torch.nn.Linear, self).__init__()
         self.bias = None
         self.d = in_dim
@@ -258,10 +258,14 @@ class PiNoise(torch.nn.Linear):
         torch.nn.init.constant_(self.MLP.bias, 0)
 
         # 2. Nhánh Down/Up (Parameter)
-        self.w_down = nn.Parameter(torch.empty((in_dim, self.hidden_dim), **factory_kwargs))
-        self.w_up = nn.Parameter(torch.empty((self.hidden_dim, out_dim), **factory_kwargs))
-        nn.init.kaiming_uniform_(self.w_down, a=math.sqrt(5))
-        nn.init.zeros_(self.w_up)
+        self.w_down = torch.empty((in_dim, hidden_dim), **factory_kwargs)
+        self.register_buffer("weight_down", self.w_down)
+        self.w_up = torch.empty((hidden_dim, out_dim), **factory_kwargs)
+        self.register_buffer("weight_up", self.w_up)
+        
+        # Khởi tạo Xavier cho buffer
+        nn.init.xavier_uniform_(self.weight_down)
+        nn.init.zeros_(self.weight_up)
 
         # 3. Ma trận trực giao F
         w_init = torch.randn(hidden_dim, hidden_dim, **factory_kwargs)
@@ -351,6 +355,15 @@ class PiNoise(torch.nn.Linear):
         else:
             noise = self._forward_compute_noise(x, self.current_values)
         return x1 + self.alpha * noise + x
+    def unfreeze_task_0(self):
+        """Task 0: Học MLP + Noise"""
+        for p in self.MLP.parameters(): p.requires_grad = True
+        self.current_values.requires_grad = True
+
+    def unfreeze_incremental(self):
+        """Task > 0: Chỉ học Noise, FREEZE MLP"""
+        for p in self.MLP.parameters(): p.requires_grad = True
+        self.current_values.requires_grad = True
 
     def unfreeze_noise(self):
         self.current_values.requires_grad = True
