@@ -367,7 +367,7 @@ from torch.utils.checkpoint import checkpoint
 #         self.current_values.requires_grad = True
 
 #     def unfreeze_incremental(self):
-#         """Task > 0: Chỉ học Noise, FREEZE MLP"""
+#         """Task > 0: Chỉ học Noise,  MLP"""
 #         for p in self.MLP.parameters(): p.requires_grad = True
 #         self.current_values.requires_grad = True
 
@@ -392,7 +392,7 @@ import torch.nn as nn
 import torch.fft
 
 class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=384, k=1000, alpha=1.0):
+    def __init__(self, in_dim, out_dim, hidden_dim=384, k=500, alpha=1.0):
         super(PiNoise, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
