@@ -1158,6 +1158,19 @@ class VisionTransformer(nn.Module):
             return tuple(zip(outputs, prefix_tokens))
         return tuple(outputs)
 
+    # def forward_features(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
+    #     x = self.patch_embed(x)
+    #     x = self._pos_embed(x)
+    #     x = self.patch_drop(x)
+    #     x = self.norm_pre(x)
+
+    #     for i in range(len(self.blocks)):
+    #         if new_forward:
+    #             x = self.noise_maker[i].forward_new(self.blocks[i](x))
+    #         else:
+    #             x = self.noise_maker[i](self.blocks[i](x))
+    #     x = self.norm(x)
+    #     return x
     def forward_features(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
         x = self.patch_embed(x)
         x = self._pos_embed(x)
@@ -1165,10 +1178,29 @@ class VisionTransformer(nn.Module):
         x = self.norm_pre(x)
 
         for i in range(len(self.blocks)):
-            if new_forward:
-                x = self.noise_maker[i].forward_new(self.blocks[i](x))
+            # --- BƯỚC 1: Checkpoint khối ViT Block (Attention + MLP) ---
+            if self.training:
+                # use_reentrant=False là chuẩn mới, ổn định hơn
+                x = checkpoint(self.blocks[i], x, use_reentrant=False)
             else:
-                x = self.noise_maker[i](self.blocks[i](x))
+                x = self.blocks[i](x)
+
+            # --- BƯỚC 2: Checkpoint khối PiNoise (FFT + BiLoRA) ---
+            # Vì FFT sinh ra tensor phức (Complex64) rất nặng, cần checkpoint luôn đoạn này
+            if self.training:
+                if new_forward:
+                    # Checkpoint hàm forward_new
+                    x = checkpoint(self.noise_maker[i].forward_new, x, use_reentrant=False)
+                else:
+                    # Checkpoint hàm forward thường
+                    x = checkpoint(self.noise_maker[i], x, use_reentrant=False)
+            else:
+                # Chế độ Eval (Validation/Test) thì chạy bình thường
+                if new_forward:
+                    x = self.noise_maker[i].forward_new(x)
+                else:
+                    x = self.noise_maker[i](x)
+
         x = self.norm(x)
         return x
 
