@@ -234,7 +234,7 @@ import math
 from torch.utils.checkpoint import checkpoint
 
 class PiNoise(torch.nn.Linear):
-    def __init__(self, in_dim, out_dim, hidden_dim=384, k=5000, alpha=0.1, max_tasks=40):
+    def __init__(self, in_dim, out_dim, hidden_dim=384, k=5000, alpha=0.1, max_tasks=20):
         super(torch.nn.Linear, self).__init__()
         self.bias = None
         self.d = in_dim
