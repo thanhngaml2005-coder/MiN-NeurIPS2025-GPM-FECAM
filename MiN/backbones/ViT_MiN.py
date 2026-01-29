@@ -392,7 +392,7 @@ import torch.nn as nn
 import torch.fft
 
 class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=384, k=500, alpha=1.0):
+    def __init__(self, in_dim, out_dim, hidden_dim=384, k=3000, alpha=1.0):
         super(PiNoise, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
