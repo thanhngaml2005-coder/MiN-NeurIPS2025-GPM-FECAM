@@ -532,7 +532,7 @@ class PiNoise(nn.Module):
         self.current_vals_real.requires_grad = True
 
     def unfreeze_incremental(self):
-        for p in self.MLP.parameters(): p.requires_grad = False
+        for p in self.MLP.parameters(): p.requires_grad = True
         self.current_vals_real.requires_grad = True
 
 class Attention(nn.Module):
