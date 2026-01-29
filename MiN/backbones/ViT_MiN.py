@@ -451,20 +451,27 @@ class PiNoise(nn.Module):
         if self.current_task_id < 0: return
         
         with torch.no_grad():
+            # 1. Lấy dữ liệu task hiện tại về CPU
             curr_u_cpu = self.current_u.cpu()
             curr_v_cpu = self.current_v.cpu()
             
-            # Convert từ (K, 2) float -> (K) complex trước khi lưu vào Global
-            # Để tiết kiệm bộ nhớ cho Global Storage
+            # Xử lý số phức (Float -> Complex -> CPU)
             vals_complex = torch.view_as_complex(self.current_vals_real.data)
             curr_vals_cpu = vals_complex.cpu()
             
-            self.global_u = torch.cat([self.global_u, curr_u_cpu])
-            self.global_v = torch.cat([self.global_v, curr_v_cpu])
-            self.global_vals = torch.cat([self.global_vals, curr_vals_cpu])
-        
-        self.current_vals_real.requires_grad = False
+            # 2. [FIX QUAN TRỌNG] Đảm bảo dữ liệu Global cũng đang ở CPU
+            # Vì model.cuda() đã vô tình đẩy global_u lên GPU, ta phải kéo nó về lại
+            global_u_cpu = self.global_u.cpu()
+            global_v_cpu = self.global_v.cpu()
+            global_vals_cpu = self.global_vals.cpu()
 
+            # 3. Nối tất cả trên CPU (An toàn tuyệt đối)
+            self.global_u = torch.cat([global_u_cpu, curr_u_cpu])
+            self.global_v = torch.cat([global_v_cpu, curr_v_cpu])
+            self.global_vals = torch.cat([global_vals_cpu, curr_vals_cpu])
+        
+        # Freeze tham số
+        self.current_vals_real.requires_grad = False
     def _sparse_freq_matmul(self, x_freq, u, v, vals):
         # x_freq: [B, T, H] (Complex)
         # vals: [K] (Complex)
