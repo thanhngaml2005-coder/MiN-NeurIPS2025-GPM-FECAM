@@ -649,6 +649,10 @@ class PiNoise(nn.Module):
         # self.MLP.requires_grad_(True) # GIỮ COMMENT DÒNG NÀY
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
+
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
