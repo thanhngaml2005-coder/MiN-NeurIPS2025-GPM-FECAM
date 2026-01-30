@@ -194,33 +194,53 @@ class PiNoise(nn.Module):
             if self.sigma.weight.grad is not None:
                 self.sigma.weight.grad -= self.sigma.weight.grad @ self.basis
 
-    def compute_projection_matrix(self, threshold=0.95):
+    def compute_projection_matrix(self, threshold=0.95): # Nên đổi từ 0.99 sang 0.95
         """SVD để tìm không gian con quan trọng của task vừa học"""
         if not self.feature_cache: return
         
-        # Chuyển list tensor thành ma trận lớn trên CPU
+        # 1. Chuyển list tensor thành ma trận lớn trên CPU
+        # feat lúc này thường là [N_batches, Batch_size, Tokens, Dim] hoặc tương tự
         feat = torch.cat(self.feature_cache, dim=0) 
         self.feature_cache = [] # Xóa cache ngay để giải phóng RAM
         
-        # Tính ma trận hiệp phương sai trên CPU (tiết kiệm VRAM)
+        # [QUAN TRỌNG: FIX LỖI 3D]
+        # Nếu feat là [Samples, Tokens, Dim] -> Gộp Samples và Tokens lại thành 2D
+        if feat.dim() == 3:
+            feat = feat.reshape(-1, feat.shape[-1])
+        elif feat.dim() == 4: # Trường hợp đặc biệt nếu cache giữ nguyên batch
+            feat = feat.reshape(-1, feat.shape[-1])
+
+        # 2. Tính ma trận hiệp phương sai trên CPU (feat giờ đã là 2D)
+        # out sẽ có kích thước [192, 192] vì hidden_dim của bạn là 192
         out = feat.t() @ feat
+        
+        # 3. Phân rã giá trị đặc dị (SVD)
         U, S, V = torch.svd(out)
         
+        # 4. Tính toán số chiều k dựa trên threshold
         s_sum = torch.sum(S)
         s_cum = torch.cumsum(S, dim=0)
+        # searchsorted tìm vị trí mà tại đó tổng phương sai đạt threshold%
         k = torch.searchsorted(s_cum, s_sum * threshold).item()
+        
+        # In ra để bạn debug:
+        print(f"--> GPM: Task vừa học chiếm {k+1}/192 chiều không gian (Threshold {threshold})")
+        
         new_basis = U[:, :k+1]
 
-        # Đưa basis lên thiết bị của model (GPU)
+        # 5. Đưa basis lên thiết bị của model (GPU) và cập nhật không gian cấm
         new_basis = new_basis.to(self.basis.device)
 
         if torch.sum(self.basis) == 0:
             self.basis = new_basis @ new_basis.t()
         else:
+            # Gộp Basis cũ và mới, sau đó trực giao hóa lại bằng SVD
             combined = torch.cat([self.basis, new_basis], dim=1)
             U_c, _, _ = torch.svd(combined)
-            self.basis = U_c[:, :combined.shape[1]] @ U_c[:, :combined.shape[1]].t()
-    # Hàm tương thích ngược
+            # Giới hạn không gian để không bị đầy (Saturation)
+            # Với Dim 192, không nên để basis chiếm quá 170 chiều
+            max_k = min(combined.shape[1], 170) 
+            self.basis = U_c[:, :max_k] @ U_c[:, :max_k].t()
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
