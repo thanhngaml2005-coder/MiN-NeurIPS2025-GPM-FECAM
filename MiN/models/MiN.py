@@ -135,6 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
+        self._network.collect_projections(mode='threshold', val=0.98)
         self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -195,7 +196,7 @@ class MinNet(object):
         self._clear_gpu()
 
         self.run(train_loader)
-        self._network.collect_projections()
+        self._network.collect_projections(mode='ratio', val=0.5)
         self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -293,7 +294,7 @@ class MinNet(object):
         self._network.to(self.device)
 
         # [ĐÃ BỎ L1 REGULARIZATION THEO YÊU CẦU]
-
+        WARMUP_EPOCHS = 5
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
@@ -326,12 +327,13 @@ class MinNet(object):
         
                 self.scaler.scale(loss).backward()
                 if self.cur_task > 0:
-                    # Unscale gradient trước khi thực hiện phép toán ma trận
-                    self.scaler.unscale_(optimizer)
-                    
-                    # Gọi hàm chiếu gradient đã định nghĩa trong IncNet
-                    # Hàm này sẽ duyệt qua các layer PiNoise và ép gradient trực giao với basis
-                    self._network.apply_gpm_to_grads()
+                    # Chỉ chiếu nếu đã qua giai đoạn Warm-up
+                    if epoch >= WARMUP_EPOCHS:
+                        self.scaler.unscale_(optimizer)
+                        self._network.apply_gpm_to_grads()
+                    else:
+                        # Trong 5 epoch đầu, gradient được tự do cập nhật -> High Plasticity
+                        pass
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
