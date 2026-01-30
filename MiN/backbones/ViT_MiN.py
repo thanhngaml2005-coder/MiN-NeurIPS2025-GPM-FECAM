@@ -183,39 +183,53 @@ class PiNoise(nn.Module):
         noise = self.mu(x_down) + self.sigma(x_down)
         
         return x1 + (noise @ self.w_up) + hyper_features
-    
+    def apply_gradient_projection(self):
+        """Chiếu gradient của mu và sigma trực giao với tri thức cũ"""
+        if torch.sum(self.basis) == 0: return
+        with torch.no_grad():
+            if self.mu.weight.grad is not None:
+                self.mu.weight.grad -= self.mu.weight.grad @ self.basis
+            if self.sigma.weight.grad is not None:
+                self.sigma.weight.grad -= self.sigma.weight.grad @ self.basis
+
+    def compute_projection_matrix(self, threshold=0.99):
+        """SVD để khóa không gian đặc trưng của task vừa học"""
+        if not self.feature_cache: return
+        feat = torch.cat(self.feature_cache, dim=0) # [N, hidden_dim]
+        self.feature_cache = [] 
+        
+        # Tính toán ma trận chiếu (Projector)
+        U, S, V = torch.svd(feat.t() @ feat)
+        s_sum = torch.sum(S)
+        s_cum = torch.cumsum(S, dim=0)
+        k = torch.searchsorted(s_cum, s_sum * threshold).item()
+        new_basis = U[:, :k+1]
+
+        if torch.sum(self.basis) == 0:
+            self.basis = new_basis @ new_basis.t()
+        else:
+            # Gộp không gian cũ và mới
+            combined = torch.cat([self.basis, new_basis], dim=1)
+            U_c, _, _ = torch.svd(combined)
+            self.basis = U_c[:, :combined.shape[1]] @ U_c[:, :combined.shape[1]].t()
     # Hàm tương thích ngược
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
     def unfreeze_noise(self): self.update_noise()
-    # Trong class PiNoise
-
     def unfreeze_task_0(self):
-        """
-        Tại Task 0, bạn có thể cho phép học mạnh hơn để khởi tạo base.
-        Tuy nhiên, w_down/w_up thường được khởi tạo ngẫu nhiên cố định.
-        """
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
-        # Tùy chọn: Task 0 có thể cho học MLP để thích nghi ban đầu
-        self.MLP.weight.requires_grad = True 
-        
-        # Luôn freeze w_down/w_up nếu muốn giữ đúng lý thuyết MiN 
+        """Task 0: Mở toàn bộ để học base tốt nhất"""
+        for param in self.parameters():
+            param.requires_grad = True
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
     def unfreeze_incremental(self):
-        """
-        Tại Task > 0: Chỉ mu và sigma được học[cite: 204].
-        Backbone và các bộ chiếu (w_down, w_up) phải đóng băng tuyệt đối.
-        """
-        # Chỉ mở gradient cho mu và sigma
+        """Task > 0: Chỉ mở mu và sigma để học noise mới"""
         for param in self.mu.parameters(): param.requires_grad = True
         for param in self.sigma.parameters(): param.requires_grad = True
-        
-        # Khóa toàn bộ phần còn lại
-        self.MLP.weight.requires_grad = True 
+        # Giữ MLP, w_down, w_up đóng băng để bảo vệ kiến thức base
+        self.MLP.requires_grad_(True)
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
