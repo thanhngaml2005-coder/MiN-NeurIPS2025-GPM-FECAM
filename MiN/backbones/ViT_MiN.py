@@ -649,10 +649,6 @@ import math
 #         # self.MLP.requires_grad_(True) # GIỮ COMMENT DÒNG NÀY
 #         self.w_down.requires_grad = False
 #         self.w_up.requires_grad = False
-
-import torch
-import torch.nn as nn
-import gc
 import torch
 import torch.nn as nn
 import gc
@@ -698,7 +694,6 @@ class PiNoise(nn.Module):
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
-        # w_down/up could be frozen or not depending on strategy, here we freeze them to act as random projection
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
@@ -709,10 +704,6 @@ class PiNoise(nn.Module):
         self.w_up.requires_grad = False
 
     def after_task_training(self):
-        """
-        1. Snapshot weights hiện tại.
-        2. Thực hiện MagMax Merge để chuẩn bị cho task sau.
-        """
         # Snapshot
         mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
         sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
@@ -730,12 +721,9 @@ class PiNoise(nn.Module):
             keys = history_list[0].keys()
             merged_dict = {}
             for key in keys:
-                # Stack: [Num_Tasks, Dim_Out, Dim_In]
                 stacked = torch.stack([d[key] for d in history_list], dim=0)
-                # Tìm max magnitude
                 magnitudes = torch.abs(stacked)
                 max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                # Gather
                 best_param = torch.gather(stacked, 0, max_indices).squeeze(0)
                 merged_dict[key] = best_param.to(self.w_down.device)
             return merged_dict
@@ -747,51 +735,43 @@ class PiNoise(nn.Module):
         # 1. Down Projection
         x_down = hyper_features @ self.w_down 
         
-        # 2. Caching for GPM (Chỉ lấy 50 batch đầu tiên để tiết kiệm RAM)
+        # 2. Caching for GPM
         if self.training:
+            # Cache vừa đủ để tính SVD, không cần quá nhiều gây OOM
             if len(self.feature_cache) < 50: 
                 self.feature_cache.append(x_down.detach().cpu().float())
         
-        # 3. Generate Noise (MagMax Merged Network)
+        # 3. Generate Noise
         noise = self.mu(x_down) + self.sigma(x_down)
         
         # 4. Add Noise & Up Projection
         return hyper_features + (noise @ self.w_up)
 
     def apply_gradient_projection(self):
-        """
-        GPM: g_new = g - (g @ U) @ U.T
-        Chỉ chiếu các tham số trainable (mu, sigma)
-        """
+        """GPM: g_new = g - (g @ U) @ U.T"""
         if self.core_U.shape[1] == 0: return
         
         with torch.no_grad():
             U = self.core_U 
-            
             def project_grad(weight):
                 if weight.grad is not None:
-                    # [Out, In] @ [In, Rank] -> [Out, Rank]
                     g_inner = weight.grad @ U 
-                    # [Out, Rank] @ [Rank, In] -> [Out, In]
                     g_proj = g_inner @ U.t()
                     weight.grad -= g_proj
 
             project_grad(self.mu.weight)
             project_grad(self.sigma.weight)
 
-    def compute_projection_matrix(self, mode='ratio', val=0.5):
+    def compute_projection_matrix(self, mode='eigenvalue', val=1e-3):
         """
-        Tính SVD trên Covariance Matrix (Streaming).
+        Tính SVD trên Covariance Matrix.
         Args:
-            mode: 'threshold' (Task 0) hoặc 'ratio' (Task > 0)
-            val: giá trị threshold (0.95-0.99) hoặc ratio (0.1-0.5)
+            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy), 'ratio' (Fixed)
+            val: Epsilon hoặc Ratio tương ứng.
         """
         if not self.feature_cache: return
         
-        device = 'cpu' # Tính trên CPU để tiết kiệm VRAM
-        # device = self.w_down.device # Hoặc GPU nếu lười chuyển
-        
-        # 1. Streaming Covariance Calculation
+        device = 'cpu' # Tiết kiệm VRAM tối đa
         correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
         
         for batch in self.feature_cache:
@@ -809,33 +789,51 @@ class PiNoise(nn.Module):
         except:
             U, S, _ = torch.svd(correlation_matrix)
         
-        # 3. Select k based on Strategy
-        if mode == 'threshold':
-            # Task 0: Lấy tối đa thông tin (nhưng có trần mềm để không full rank)
+        # 3. [UPDATE] LOGIC CHỌN K THEO EIGENVALUE THRESHOLD
+        if mode == 'eigenvalue':
+            # Giữ lại các chiều có giá trị > (Max_Val * epsilon)
+            max_s = S[0]
+            if max_s == 0: k = 0
+            else:
+                relative_S = S / max_s
+                # val ở đây là epsilon (ví dụ 1e-3)
+                k = (relative_S > val).sum().item()
+            print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
+
+        elif mode == 'threshold':
             total_var = torch.sum(S)
             s_cumsum = torch.cumsum(S, dim=0)
             k = torch.searchsorted(s_cumsum, total_var * val).item()
-            k = min(k, 160) # Hard cap cho Dim 192
-        else:
-            # Task > 0: Tiết kiệm đất
+            print(f"--> GPM Selection (Energy {val}): Need {k} dims.")
+            
+        else: # ratio
             k = max(1, int(self.hidden_dim * val))
+            print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
 
-        print(f"--> GPM Selection ({mode}={val}): Keeping top {k+1} dims.")
+        # =================================================================
+        # 4. SAFETY MARGIN (BẮT BUỘC)
+        # Luôn chừa lại ít nhất 12 chiều cho Task mới "thở"
+        # =================================================================
+        MARGIN = 12
+        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 180
         
+        # Cắt bớt nếu vượt quá trần
+        k = min(k, MAX_ALLOWED_RANK)
+        
+        # 5. Update Memory
         U_new = U[:, :k+1].to(self.core_U.device)
 
-        # 4. Merge Memory
         if self.core_U.shape[1] == 0:
             self.core_U = U_new
         else:
             combined = torch.cat([self.core_U, U_new], dim=1)
             U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
-            # Giới hạn tổng rank không vượt quá hidden_dim
-            final_k = min(U_final.shape[1], self.hidden_dim)
+            
+            # Giới hạn tổng rank không vượt quá MAX_ALLOWED_RANK
+            final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
             self.core_U = U_final[:, :final_k]
 
-        print(f"GPM Updated: Core Subspace Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
-
+        print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
 class Attention(nn.Module):
     fused_attn: Final[bool]
 

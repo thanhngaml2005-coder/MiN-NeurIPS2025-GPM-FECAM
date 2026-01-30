@@ -272,10 +272,9 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    def collect_projections(self, mode='ratio', val=0.5):
+    def collect_projections(self, mode='eigenvalue', val=1e-3):
         """
         Duyệt qua các lớp PiNoise và tính toán ma trận chiếu.
-        Truyền mode và val xuống dưới.
         """
         print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
         for j in range(self.backbone.layer_num):
