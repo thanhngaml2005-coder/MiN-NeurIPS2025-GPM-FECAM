@@ -144,7 +144,7 @@ class MiNbaseNet(nn.Module):
         Kích hoạt chế độ Sequential Initialization trong PiNoise.
         """
         for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].update_noise(task_id=self.cur_task)
+            self.backbone.noise_maker[j].update_noise()
 
     def after_task_magmax_merge(self):
         """
@@ -272,3 +272,18 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
+    def collect_projections(self):
+        """
+        Duyệt qua các lớp PiNoise và yêu cầu chúng tính toán ma trận chiếu 
+        dựa trên các đặc trưng đã thu thập được trong Task vừa qua.
+        """
+        for j in range(self.backbone.layer_num):
+            # Giả sử noise_maker[j] là đối tượng PiNoise đã được cập nhật hàm compute_projection_matrix
+            self.backbone.noise_maker[j].compute_projection_matrix(threshold=0.99)
+
+    def apply_gpm_to_grads(self):
+        """
+        Thực hiện chiếu trực giao gradient cho mu và sigma.
+        """
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].apply_gradient_projection()
