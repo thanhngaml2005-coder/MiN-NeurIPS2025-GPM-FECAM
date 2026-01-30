@@ -279,7 +279,7 @@ class MiNbaseNet(nn.Module):
         """
         for j in range(self.backbone.layer_num):
             # Giả sử noise_maker[j] là đối tượng PiNoise đã được cập nhật hàm compute_projection_matrix
-            self.backbone.noise_maker[j].compute_projection_matrix(threshold=0.99)
+            self.backbone.noise_maker[j].compute_projection_matrix(threshold=0.95)
 
     def apply_gpm_to_grads(self):
         """
