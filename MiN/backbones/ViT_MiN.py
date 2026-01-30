@@ -96,7 +96,7 @@ class PiNoise(nn.Module):
         self.history_mu = []    
         self.history_sigma = [] 
         
-        self.register_buffer('basis', torch.zeros(hidden_dim, hidden_dim))
+        self.register_buffer('basis', torch.zeros(hidden_dim, hidden_dim, dtype=torch.float32))
         # feature_cache: Dùng để thu thập activation trong quá trình train
         self.feature_cache = []
 
@@ -179,7 +179,9 @@ class PiNoise(nn.Module):
         x_down = hyper_features @ self.w_down
         # Trong quá trình train, thu thập x_down để tính SVD sau này
         if self.training:
-            self.feature_cache.append(x_down.detach().clone())
+            if len(self.feature_cache) < 300:
+                # detachment và đẩy sang CPU để không chiếm VRAM
+                self.feature_cache.append(x_down.detach().cpu().float())
         noise = self.mu(x_down) + self.sigma(x_down)
         
         return x1 + (noise @ self.w_up) + hyper_features
@@ -193,22 +195,28 @@ class PiNoise(nn.Module):
                 self.sigma.weight.grad -= self.sigma.weight.grad @ self.basis
 
     def compute_projection_matrix(self, threshold=0.99):
-        """SVD để khóa không gian đặc trưng của task vừa học"""
+        """SVD để tìm không gian con quan trọng của task vừa học"""
         if not self.feature_cache: return
-        feat = torch.cat(self.feature_cache, dim=0) # [N, hidden_dim]
-        self.feature_cache = [] 
         
-        # Tính toán ma trận chiếu (Projector)
-        U, S, V = torch.svd(feat.t() @ feat)
+        # Chuyển list tensor thành ma trận lớn trên CPU
+        feat = torch.cat(self.feature_cache, dim=0) 
+        self.feature_cache = [] # Xóa cache ngay để giải phóng RAM
+        
+        # Tính ma trận hiệp phương sai trên CPU (tiết kiệm VRAM)
+        out = feat.t() @ feat
+        U, S, V = torch.svd(out)
+        
         s_sum = torch.sum(S)
         s_cum = torch.cumsum(S, dim=0)
         k = torch.searchsorted(s_cum, s_sum * threshold).item()
         new_basis = U[:, :k+1]
 
+        # Đưa basis lên thiết bị của model (GPU)
+        new_basis = new_basis.to(self.basis.device)
+
         if torch.sum(self.basis) == 0:
             self.basis = new_basis @ new_basis.t()
         else:
-            # Gộp không gian cũ và mới
             combined = torch.cat([self.basis, new_basis], dim=1)
             U_c, _, _ = torch.svd(combined)
             self.basis = U_c[:, :combined.shape[1]] @ U_c[:, :combined.shape[1]].t()
