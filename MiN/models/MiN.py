@@ -136,7 +136,7 @@ class MinNet(object):
         
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        self._network.after_task_magmax_merge()
+        #self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
         self._clear_gpu()
@@ -197,7 +197,7 @@ class MinNet(object):
 
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        self._network.after_task_magmax_merge()
+        #self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
         self._clear_gpu()
@@ -315,7 +315,7 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
-        WARMUP_EPOCHS = 0
+        WARMUP_EPOCHS = 5
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
