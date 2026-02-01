@@ -315,7 +315,7 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
-        WARMUP_EPOCHS = 10
+        WARMUP_EPOCHS = 0
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
