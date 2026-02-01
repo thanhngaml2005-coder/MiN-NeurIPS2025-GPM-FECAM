@@ -330,7 +330,7 @@ class MinNet(object):
                     # [QUAN TRỌNG]: LOGIC WARM-UP + GPM
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
-                        self._network.apply_gpm_to_grads(scale = 0.85)
+                        self._network.apply_gpm_to_grads(scale = 0.8)
                     else:
                         # Warm-up phase: Gradient updates freely -> High Plasticity
                         pass
