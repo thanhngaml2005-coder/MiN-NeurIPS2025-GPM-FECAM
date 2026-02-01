@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(mode='threshold', val=0.9)
+        self._network.collect_projections(mode='threshold', val=0.95)
         #self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -196,7 +196,7 @@ class MinNet(object):
         self._clear_gpu()
 
         self.run(train_loader)
-        self._network.collect_projections(mode='threshold', val=0.9)
+        self._network.collect_projections(mode='threshold', val=0.95)
         #self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
