@@ -652,6 +652,9 @@ import math
 import torch
 import torch.nn as nn
 import gc
+import torch
+import torch.nn as nn
+import gc
 
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
@@ -747,8 +750,12 @@ class PiNoise(nn.Module):
         # 4. Add Noise & Up Projection
         return hyper_features + (noise @ self.w_up)
 
-    def apply_gradient_projection(self):
-        """GPM: g_new = g - (g @ U) @ U.T"""
+    def apply_gradient_projection(self, scale=1.0):
+        """
+        GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
+        scale = 1.0: Strict GPM (Bảo vệ tuyệt đối)
+        scale < 1.0 (ví dụ 0.85): Cho phép mượn 15% không gian cũ
+        """
         if self.core_U.shape[1] == 0: return
         
         with torch.no_grad():
@@ -757,16 +764,19 @@ class PiNoise(nn.Module):
                 if weight.grad is not None:
                     g_inner = weight.grad @ U 
                     g_proj = g_inner @ U.t()
-                    weight.grad -= g_proj
+                    
+                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
+                    # Nhân với scale để cho phép nới lỏng ràng buộc
+                    weight.grad -= (g_proj * scale)
 
             project_grad(self.mu.weight)
             project_grad(self.sigma.weight)
 
-    def compute_projection_matrix(self, mode='eigenvalue', val=1e-2):
+    def compute_projection_matrix(self, mode='threshold', val=0.95):
         """
         Tính SVD trên Covariance Matrix.
         Args:
-            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy), 'ratio' (Fixed)
+            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
             val: Epsilon hoặc Ratio tương ứng.
         """
         if not self.feature_cache: return
@@ -789,14 +799,12 @@ class PiNoise(nn.Module):
         except:
             U, S, _ = torch.svd(correlation_matrix)
         
-        # 3. [UPDATE] LOGIC CHỌN K THEO EIGENVALUE THRESHOLD
+        # 3. CHỌN K
         if mode == 'eigenvalue':
-            # Giữ lại các chiều có giá trị > (Max_Val * epsilon)
             max_s = S[0]
             if max_s == 0: k = 0
             else:
                 relative_S = S / max_s
-                # val ở đây là epsilon (ví dụ 1e-3)
                 k = (relative_S > val).sum().item()
             print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
 
@@ -812,10 +820,11 @@ class PiNoise(nn.Module):
 
         # =================================================================
         # 4. SAFETY MARGIN (BẮT BUỘC)
-        # Luôn chừa lại ít nhất 12 chiều cho Task mới "thở"
+        # Giữ lại khoảng trống nhỏ (ví dụ 12 chiều) để task mới luôn có chỗ học
+        # dù Core Space đã đầy.
         # =================================================================
-        MARGIN = 12
-        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 180
+        MARGIN = 12 
+        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
         
         # Cắt bớt nếu vượt quá trần
         k = min(k, MAX_ALLOWED_RANK)
@@ -834,8 +843,6 @@ class PiNoise(nn.Module):
             self.core_U = U_final[:, :final_k]
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
-
-
 
 class Attention(nn.Module):
     fused_attn: Final[bool]

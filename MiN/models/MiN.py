@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(mode='eigenvalue', val=0.01)
+        self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -196,7 +196,7 @@ class MinNet(object):
         self._clear_gpu()
 
         self.run(train_loader)
-        self._network.collect_projections(mode='eigenvalue', val=0.1)
+        self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -330,7 +330,7 @@ class MinNet(object):
                     # [QUAN TRỌNG]: LOGIC WARM-UP + GPM
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
-                        self._network.apply_gpm_to_grads()
+                        self._network.apply_gpm_to_grads(scale = 0.85)
                     else:
                         # Warm-up phase: Gradient updates freely -> High Plasticity
                         pass
