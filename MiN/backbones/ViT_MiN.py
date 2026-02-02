@@ -163,7 +163,7 @@ class PiNoise(nn.Module):
         # 2. Caching for GPM
         if self.training:
             # Cache vừa đủ để tính SVD, không cần quá nhiều gây OOM
-            if len(self.feature_cache) < 200: 
+            if len(self.feature_cache) < 100: 
                 self.feature_cache.append(x_down.detach().cpu().float())
         
         # 3. Generate Noise
