@@ -24,62 +24,71 @@ class DPCREstimator(nn.Module):
         self.feature_dim = feature_dim
         self.device = device
         
-        # Lưu trữ Covariance và Prototype (Mean) ở không gian gốc (768 dim)
-        # Key: class_id, Value: Tensor
         self.saved_covs = {} 
         self.saved_protos = {} 
-        self.projectors = {} # Lưu SVD Projector (CIP) của từng class
+        self.projectors = {}
 
     def get_projector_svd(self, raw_matrix):
-        """Tính SVD để lấy ma trận chiếu CIP (Category Information Projection)"""
-        # Thêm Jitter để tránh lỗi SVD không hội tụ
         try:
             U, S, V = torch.svd(raw_matrix + 1e-4 * torch.eye(raw_matrix.shape[0], device=self.device))
         except:
             return torch.eye(raw_matrix.shape[0], device=self.device)
-            
-        # Lấy các chiều có giá trị singular > 0
         non_zeros = torch.where(S > 1e-5)[0]
         if len(non_zeros) == 0:
             return torch.eye(raw_matrix.shape[0], device=self.device)
-            
         left_vecs = U[:, non_zeros]
-        # P = U * U^T
         projector = left_vecs @ left_vecs.T
         return projector
 
-    def update_stats(self, model, loader, class_list):
+    # [FIX & OPTIMIZE]: Không cần truyền class_list nữa
+    def update_stats(self, model, loader):
         """
-        Lưu trữ Covariance và Mean của Task vừa học xong (khi chưa bị drift).
-        Chỉ chạy cho các Class MỚI.
+        Tự động quét loader và lưu stats cho TẤT CẢ class tìm thấy.
+        Nhanh hơn O(N) thay vì O(N*C).
         """
         model.eval()
-        print(f"--> [DPCR] Saving Stats for new classes {class_list}...")
+        print(f"--> [DPCR] Scanning & Saving Stats (Auto-detect classes)...")
+        
+        # Dictionary tạm để gom feature: key -> list of tensors
+        temp_features = {}
         
         with torch.no_grad():
-            for c in class_list:
-                features = []
-                for _, inputs, targets in loader:
-                    inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    mask = targets == c
-                    if mask.sum() == 0: continue
-                    
-                    # [QUAN TRỌNG] Lấy feature ở tầng Backbone (768), KHÔNG qua Buffer
-                    feat = model.extract_feature(inputs[mask]) 
-                    features.append(feat)
+            # 1. Quét 1 vòng qua Loader
+            for _, inputs, targets in loader:
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                if len(features) > 0:
-                    features = torch.cat(features, dim=0).float() # [N, 768]
+                # Trích xuất feature
+                feats = model.extract_feature(inputs) # [B, 768]
+                
+                # Gom vào từng xô (bucket)
+                unique_labels = torch.unique(targets)
+                for label in unique_labels:
+                    label_item = label.item()
+                    mask = (targets == label)
                     
-                    # Tính Mean
-                    mean = torch.mean(features, dim=0)
-                    # Tính Uncentered Covariance (X^T * X) theo bài báo DPCR
-                    cov = features.T @ features
+                    if label_item not in temp_features:
+                        temp_features[label_item] = []
                     
-                    self.saved_protos[c] = mean
-                    self.saved_covs[c] = cov
-                    self.projectors[c] = self.get_projector_svd(cov)
+                    temp_features[label_item].append(feats[mask].cpu()) # Lưu CPU để đỡ tốn VRAM
 
+        # 2. Tính toán Mean/Cov sau khi gom xong
+        count = 0
+        for c, feat_list in temp_features.items():
+            if len(feat_list) == 0: continue
+            
+            # Gộp lại thành 1 tensor lớn và đẩy lên GPU tính toán
+            features = torch.cat(feat_list, dim=0).to(self.device).float()
+            
+            mean = torch.mean(features, dim=0)
+            cov = features.T @ features
+            
+            self.saved_protos[c] = mean
+            self.saved_covs[c] = cov
+            self.projectors[c] = self.get_projector_svd(cov)
+            count += 1
+            
+        print(f"--> [DPCR] Stats Saved. Total classes found: {count}")
+        del temp_features
     def correct_drift(self, old_model, new_model, current_loader, known_classes):
         """
         Tính toán ma trận Drift và sửa lại Stats của TẤT CẢ Class CŨ.
