@@ -9,6 +9,12 @@ from torch.utils.data import DataLoader
 import copy
 import gc 
 import os
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from torch.nn import functional as F
+
 
 from utils.inc_net import MiNbaseNet
 from torch.utils.data import WeightedRandomSampler
@@ -182,7 +188,7 @@ class MinNet(object):
         
      
         self._network.build_fecam_stats(train_loader_clean)
-        
+        self.diagnose_fecam_space(self._network, train_loader, self.device)
         # [MEMORY OPTIMIZATION]: Xóa sạch sẽ mọi thứ còn lại
         del train_loader_clean, train_set_clean, test_set
         self._clear_gpu()
@@ -261,7 +267,7 @@ class MinNet(object):
         
         # Hàm này sẽ tự động append stats của class mới vào list cũ
         self._network.build_fecam_stats(train_loader_clean)
-
+        self.diagnose_fecam_space(self._network, train_loader, self.device)
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
@@ -451,7 +457,97 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-
+  
+    def diagnose_fecam_space(model, data_loader, device, save_dir="fecam_diagnosis"):
+        """
+        Hàm chẩn đoán "sức khỏe" của không gian FeCAM.
+        Vẽ histogram khoảng cách Mahalanobis của từng class.
+        """
+        print(f"--> [DIAGNOSIS] Starting FeCAM Space Analysis...")
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            
+        model.eval()
+        
+        # [QUAN TRỌNG] Tắt ReLU để nhìn đúng không gian mà FeCAM đang nhìn
+        # Lưu lại trạng thái cũ để restore sau
+        original_relu_state = model.buffer.use_relu
+        model.buffer.use_relu = False
+        
+        # Dictionary lưu khoảng cách của từng class
+        # Key: label, Value: list of distances
+        class_distances = {}
+        
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(data_loader):
+                inputs, targets = inputs.to(device).float(), targets.to(device)
+                
+                # --- Tái tạo lại đúng quy trình biến đổi của FeCAM ---
+                # 1. Backbone
+                feats = model.backbone(inputs)
+                if torch.isnan(feats).any(): feats = torch.nan_to_num(feats)
+                
+                # 2. Linear Buffer (Do đã tắt ReLU)
+                feats = model.buffer(feats)
+                
+                # 3. Robust Transform (Gọi hàm của model hoặc viết lại y hệt)
+                # Code: x = sign(x) * |x|^0.5 -> LayerNorm
+                feats = torch.sign(feats) * torch.pow(torch.abs(feats) + 1e-6, 0.5)
+                feats = F.layer_norm(feats, feats.shape[-1:])
+                
+                # --- Tính khoảng cách ---
+                unique_labels = torch.unique(targets)
+                for label in unique_labels:
+                    label_item = label.item()
+                    
+                    # Chỉ phân tích các class đã được build stats
+                    if label_item >= len(model.class_means):
+                        continue
+                        
+                    mask = (targets == label)
+                    class_feats = feats[mask] # [N, D]
+                    
+                    # Lấy Mean và Var của đúng class đó
+                    mean = model.class_means[label_item].float()
+                    var = model.class_vars[label_item].float()
+                    
+                    # Tính khoảng cách từ Sample của class X tới Tâm của class X (Intra-class)
+                    # Dist = Sum( (x - mean)^2 / var )
+                    diff_sq = (class_feats - mean.unsqueeze(0)) ** 2
+                    dist = torch.sum(diff_sq / (var + 1e-6), dim=1) # [N]
+                    
+                    if label_item not in class_distances:
+                        class_distances[label_item] = []
+                    class_distances[label_item].extend(dist.cpu().numpy().tolist())
+    
+        # --- Restore ReLU ---
+        model.buffer.use_relu = original_relu_state
+        
+        # --- Vẽ biểu đồ ---
+        print(f"--> [DIAGNOSIS] Plotting histograms...")
+        num_classes_to_plot = min(len(class_distances), 5) # Chỉ vẽ 5 class đầu để test
+        
+        plt.figure(figsize=(15, 10))
+        for i, label in enumerate(sorted(class_distances.keys())[:num_classes_to_plot]):
+            dists = class_distances[label]
+            
+            plt.subplot(2, 3, i+1)
+            plt.hist(dists, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
+            
+            # Thống kê
+            mean_dist = np.mean(dists)
+            std_dist = np.std(dists)
+            
+            plt.title(f"Class {label}\nMean={mean_dist:.2f}, Std={std_dist:.2f}")
+            plt.xlabel("Mahalanobis Distance")
+            plt.ylabel("Frequency")
+            plt.grid(True, alpha=0.3)
+            
+        plt.tight_layout()
+        save_path = os.path.join(save_dir, f"task_{model.cur_task}_dist_hist.png")
+        plt.savefig(save_path)
+        print(f"--> [DIAGNOSIS] Saved plot to: {save_path}")
+        plt.close()
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
