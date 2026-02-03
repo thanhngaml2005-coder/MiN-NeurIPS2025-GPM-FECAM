@@ -335,14 +335,13 @@ class MiNbaseNet(nn.Module):
             # CHỈ ĐẨY KẾT QUẢ CUỐI CÙNG LÊN GPU (Rất nhẹ, ~2MB/class)
             self.class_means.append(mean.to(self.device))
             self.class_covs.append(cov.to(self.device))
-            
+            del features_dict[label]
         print(f"--> [FeCAM] Updated stats. Total classes: {len(self.class_means)}")
         
-        # Dọn dẹp RAM hệ thống
         del features_dict
         import gc
         gc.collect()
-
+        torch.cuda.empty_cache()
     def predict_fecam(self, x):
         """
         Dự đoán dựa trên khoảng cách Mahalanobis.
