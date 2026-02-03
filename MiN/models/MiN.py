@@ -107,12 +107,13 @@ class MinNet(object):
             targets[i] = datamanger.map_cat2order(targets[i])
         return targets
 
-    def init_train(self, data_manger):
+def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
         self.logger.info("task_list: {}".format(train_list_name))
         self.logger.info("task_order: {}".format(train_list))
 
+        # --- SETUP DATA ---
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
@@ -125,6 +126,7 @@ class MinNet(object):
 
         self.test_loader = test_loader
 
+        # Unfreeze backbone nếu không dùng pretrained (hoặc task 0 muốn finetune nhẹ)
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = True
@@ -133,41 +135,63 @@ class MinNet(object):
         self._network.update_noise()
         
         self._clear_gpu()
-       
+        
+        # =====================================================================
+        # GIAI ĐOẠN 1: Train Noise Generator (với GPM)
+        # =====================================================================
+        self.logger.info("--> Phase 1: Training Noise Generator...")
         self.run(train_loader)
+        
+        # Thu thập GPM projection matrix sau khi train xong
         self._network.collect_projections(mode='threshold', val=0.95)
         
+        # [MEMORY OPTIMIZATION]: Xóa dữ liệu train vừa dùng xong
+        del train_loader, train_set
         self._clear_gpu()
         
-        # 2. Train Analytic Classifier (Proxy)
-        # Mục đích: Đảm bảo lớp features được tinh chỉnh tối ưu cho phân lớp tuyến tính
-        # Đây là bước "Teacher" cho Noise Generator học
+        # =====================================================================
+        # GIAI ĐOẠN 2: Train Analytic Classifier (Proxy Task)
+        # =====================================================================
+        self.logger.info("--> Phase 2: Updating Analytic Classifier...")
+        
+        # Lấy lại dataset (vì đã xóa ở trên để tiết kiệm RAM)
+        train_set = data_manger.get_task_data(source="train", class_list=train_list)
+        train_set.labels = self.cat2order(train_set.labels, data_manger)
+        
         train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
+        
         self.fit_fc(train_loader_buf, test_loader_buf)
 
-        # 3. [NEW] Build FeCAM Statistics
-        # Sử dụng train_set "sạch" (không augment) để tính Mean/Cov
+        # [MEMORY OPTIMIZATION]: Xóa loader buffer
+        del train_loader_buf, test_loader_buf, train_set
+        self._clear_gpu()
+
+        # =====================================================================
+        # GIAI ĐOẠN 3: Build FeCAM Statistics (CPU Mode)
+        # =====================================================================
+        self.logger.info("--> Phase 3: Building FeCAM Statistics...")
+        
+        # Dùng tập train "sạch" (không augmentation) để tính thống kê chính xác
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
+        
         train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False,
                                   num_workers=self.num_workers)
         
+        # Gọi hàm build stats (đã chuyển sang CPU trong inc_net.py)
         self._network.build_fecam_stats(train_loader_clean)
         
+        # [MEMORY OPTIMIZATION]: Xóa sạch sẽ mọi thứ còn lại
+        del train_loader_clean, train_set_clean, test_set
         self._clear_gpu()
 
+        # Freeze lại backbone sau task 0
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-
-        # Re-fit Analytic (Optional, kept for consistency with original MIN)
-        # self.re_fit(train_loader_clean, test_loader)
-        
-        del train_set, test_set, train_set_clean
-        self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -175,56 +199,76 @@ class MinNet(object):
         self.logger.info("task_list: {}".format(train_list_name))
         self.logger.info("task_order: {}".format(train_list))
 
+        # --- SETUP DATA ---
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        # =====================================================================
+        # GIAI ĐOẠN 1: Update Analytic Classifier cho class mới
+        # =====================================================================
+        self.logger.info("--> Phase 1: Updating Analytic Classifier (New Classes)...")
+        
+        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
 
-        self.test_loader = test_loader
+        self.test_loader = test_loader_buf # Cập nhật loader để test online nếu cần
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.fit_fc(train_loader, test_loader)
+        # Analytic fit cho task mới (để làm proxy teacher)
+        self.fit_fc(train_loader_buf, test_loader_buf)
+        
+        # [MEMORY OPTIMIZATION]: Dùng xong xóa ngay
+        del train_loader_buf, test_loader_buf
+        self._clear_gpu()
 
+        # Mở rộng mạng cho task mới
         self._network.update_fc(self.increment)
+        self._network.update_noise()
 
+        # =====================================================================
+        # GIAI ĐOẠN 2: Train Noise (Sequential GPM)
+        # =====================================================================
+        self.logger.info("--> Phase 2: Training Noise (Sequential GPM)...")
+        
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
-        self._network.update_noise()
         
-        self._clear_gpu()
-
         self.run(train_loader)
+        
+        # Cập nhật GPM memory
         self._network.collect_projections(mode='threshold', val=0.95)
         
+        # [MEMORY OPTIMIZATION]: Xóa loader train
+        del train_loader, train_set
         self._clear_gpu()
 
-
-        del train_set
-
-        # 2. [NEW] Build FeCAM Stats for NEW Classes
+        # =====================================================================
+        # GIAI ĐOẠN 3: Build FeCAM Stats for NEW Classes
+        # =====================================================================
+        self.logger.info("--> Phase 3: Building FeCAM Statistics (New Classes)...")
+        
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
 
         train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False,
                                     num_workers=self.num_workers)
         
-        # Chỉ gọi hàm này, nó sẽ tự append các class mới vào list stats
+        # Hàm này sẽ tự động append stats của class mới vào list cũ
         self._network.build_fecam_stats(train_loader_clean)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # self.re_fit(train_loader_clean, test_loader_buf)
-        del train_set_clean, test_set
+        # [MEMORY OPTIMIZATION]: Xóa sạch sẽ
+        del train_set_clean, train_loader_clean, test_set
         self._clear_gpu()
     def fit_fc(self, train_loader, test_loader):
         self._network.use_fecam = False
@@ -379,6 +423,15 @@ class MinNet(object):
             # Clear cache định kỳ
             if epoch % 5 == 0:
                 self._clear_gpu()
+        del optimizer, scheduler
+        # Xóa các biến tạm nếu còn sót
+        try:
+            del losses, correct, total
+        except: pass
+        
+        self._clear_gpu() # Gọi dọn rác triệt để
+        
+        # Bật lại FeCAM sau khi train xong
         self._network.use_fecam = True
     def eval_task(self, test_loader):
         self._network.use_fecam = True
