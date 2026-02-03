@@ -98,6 +98,10 @@ class MiNbaseNet(nn.Module):
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
+        # --- FeCAM Storage ---
+        self.class_means = []      # List chứa prototypes (Mu)
+        self.class_covs = []       # List chứa covariance matrices (Sigma)
+        self.use_fecam = True      # Flag bật tắt FeCAM
 
     def update_fc(self, nb_classes):
         """
@@ -236,7 +240,142 @@ class MiNbaseNet(nn.Module):
             self.weight += K @ (Y - X @ self.weight)
             
             # [QUAN TRỌNG] Xóa ngay lập tức để giải phóng VRAM cho batch sau
-            del term, jitter, K, X, Y    # =========================================================================
+            del term, jitter, K, X, Y    
+    # =========================================================================
+    # [FeCAM INTEGRATION SECTION]
+    # =========================================================================
+    
+    def _tukeys_transform(self, x, beta=0.5):
+        """Tukey's transformation để làm Gaussian hóa phân bố"""
+        return torch.pow(x, beta)
+
+    def _shrink_cov(self, cov):
+        """Co ngót ma trận hiệp phương sai để đảm bảo khả nghịch"""
+        diag_mean = torch.mean(torch.diagonal(cov))
+        off_diag = cov.clone()
+        off_diag.fill_diagonal_(0.0)
+        mask = off_diag != 0.0
+        # Tránh chia cho 0 nếu ma trận toàn 0
+        if mask.sum() > 0:
+            off_diag_mean = (off_diag * mask).sum() / mask.sum()
+        else:
+            off_diag_mean = 0.0
+            
+        iden = torch.eye(cov.shape[0], device=cov.device)
+        # Các hệ số alpha này có thể tune, ở đây dùng default của FeCAM
+        alpha1 = 0.01
+        alpha2 = 0.01 
+        cov_ = cov + (alpha1 * diag_mean * iden) + (alpha2 * off_diag_mean * (1 - iden))
+        return cov_
+
+    def build_fecam_stats(self, train_loader):
+        """
+        Tính toán Prototypes và Covariance Matrix cho các lớp mới.
+        """
+        self.eval()
+        print(f"--> [FeCAM] Building Statistics for Task {self.cur_task}...")
+        
+        # 1. Trích xuất features cho toàn bộ tập train
+        features_dict = {} # {class_id: [features]}
+        
+        with torch.no_grad():
+            for i, (inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(self.device)
+                
+                # Forward qua backbone + noise + buffer (quan trọng: dùng noise đã train)
+                # Dùng buffer output làm feature space cho FeCAM
+                feats = self.backbone(inputs)
+                feats = self.buffer(feats) # [Batch, Buffer_Size]
+                
+                # Tukey transform ngay sau khi extract
+                feats = self._tukeys_transform(feats)
+                
+                targets = targets.cpu().numpy()
+                for idx in range(len(targets)):
+                    label = targets[idx]
+                    if label not in features_dict:
+                        features_dict[label] = []
+                    features_dict[label].append(feats[idx].detach().cpu())
+
+        # 2. Tính Mean và Covariance cho từng lớp
+        # Sắp xếp label để đảm bảo thứ tự
+        sorted_labels = sorted(features_dict.keys())
+        
+        # Nếu là task đầu, reset list. Nếu task sau, append thêm.
+        if self.cur_task == 0:
+            self.class_means = []
+            self.class_covs = []
+        
+        for label in sorted_labels:
+            # Stack features: [N, D]
+            class_feats = torch.stack(features_dict[label]).to(self.device)
+            
+            # Tính Mean (Prototype)
+            mean = torch.mean(class_feats, dim=0)
+            self.class_means.append(mean)
+            
+            # Tính Covariance
+            # Dùng double để tính cov chính xác hơn rồi cast về float
+            cov = torch.cov(class_feats.T).float()
+            
+            # Shrinkage để đảm bảo khả nghịch (Full Covariance)
+            cov = self._shrink_cov(cov)
+            
+            # Normalization (Correlation Normalization - Optional nhưng tốt)
+            # Trong FeCAM gốc họ normalize, ở đây ta làm đơn giản để tránh phức tạp
+            self.class_covs.append(cov)
+            
+        print(f"--> [FeCAM] Updated stats. Total classes: {len(self.class_means)}")
+        
+        # Giải phóng bộ nhớ
+        del features_dict
+        torch.cuda.empty_cache()
+
+    def predict_fecam(self, x):
+        """
+        Dự đoán dựa trên khoảng cách Mahalanobis.
+        """
+        # Feature extraction
+        feats = self.backbone(x)
+        feats = self.buffer(feats)
+        feats = self._tukeys_transform(feats) # [Batch, D]
+        
+        batch_size = feats.shape[0]
+        num_classes = len(self.class_means)
+        dists = []
+        
+        # Tính khoảng cách đến từng lớp
+        for c in range(num_classes):
+            mean = self.class_means[c] # [D]
+            cov = self.class_covs[c]   # [D, D]
+            
+            # Centered features
+            diff = feats - mean.unsqueeze(0) # [Batch, D]
+            
+            # Mahalanobis Distance: (x-u)^T * Sigma^-1 * (x-u)
+            # Dùng linalg.solve cho (Sigma * Z = (x-u)^T) -> Z = Sigma^-1 (x-u)^T
+            # Dist = (x-u) * Z
+            
+            # [Tối ưu] Pre-compute inverse covariance nếu cần, nhưng solve ổn định hơn
+            # Term: [Batch, D]
+            try:
+                term = torch.linalg.solve(cov, diff.T).T 
+            except:
+                # Fallback pseudo inverse
+                inv_cov = torch.linalg.pinv(cov)
+                term = diff @ inv_cov
+                
+            # Mahalanobis distance = batch_diag(diff @ term^T)
+            # Tính hiệu quả: sum(diff * term, dim=1)
+            dist = torch.sum(diff * term, dim=1) # [Batch]
+            dists.append(dist)
+            
+        dists = torch.stack(dists, dim=1) # [Batch, Num_Classes]
+        
+        # FeCAM distance là khoảng cách, càng nhỏ càng tốt.
+        # Để tương thích với code eval (argmax), ta trả về -distance (Logits giả)
+        return -dists
+    # =========================================================================
     # [FORWARD PASSES]
     # =========================================================================
 
@@ -248,11 +387,37 @@ class MiNbaseNet(nn.Module):
         
         # [SỬA]: Đảm bảo đặc trưng đồng nhất kiểu dữ liệu trước khi vào Buffer
         hyper_features = hyper_features.to(self.weight.dtype)
+        features_buffer = self.buffer(hyper_features)
         
-        # Buffer trả về ReLU(X @ W), forward_fc thực hiện X @ Weight
-        logits = self.forward_fc(self.buffer(hyper_features))
+        # [QUYẾT ĐỊNH LUỒNG]
+        # Nếu đang Training hoặc chưa có FeCAM stats -> Dùng Analytic FC
+        # Nếu đang Eval và đã có FeCAM -> Dùng FeCAM
+        if self.training or not self.use_fecam or len(self.class_means) == 0:
+            logits = self.forward_fc(features_buffer)
+        else:
+            # FeCAM Inference
+            # Lưu ý: Hàm predict_fecam tự gọi backbone+buffer bên trong, 
+            # nhưng ở đây ta đã có features_buffer rồi. 
+            # Để tối ưu, ta tách logic predict_fecam ra nhận features đầu vào
+            logits = self._predict_fecam_from_features(features_buffer)
         
         return {'logits': logits}
+    def _predict_fecam_from_features(self, feats):
+        """Helper để tính FeCAM từ features đã trích xuất"""
+        feats = self._tukeys_transform(feats)
+        dists = []
+        for c in range(len(self.class_means)):
+            mean = self.class_means[c]
+            cov = self.class_covs[c]
+            diff = feats - mean.unsqueeze(0)
+            try:
+                term = torch.linalg.solve(cov, diff.T).T 
+            except:
+                inv_cov = torch.linalg.pinv(cov)
+                term = diff @ inv_cov
+            dist = torch.sum(diff * term, dim=1)
+            dists.append(dist)
+        return -torch.stack(dists, dim=1)
     def extract_feature(self, x):
         """Chỉ trích xuất đặc trưng từ Backbone"""
         return self.backbone(x)
