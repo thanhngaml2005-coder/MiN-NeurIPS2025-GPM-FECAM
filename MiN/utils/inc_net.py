@@ -186,7 +186,7 @@ class MiNbaseNet(nn.Module):
         # Đảm bảo features cùng kiểu với trọng số RLS (float32)
         features = features.to(self.weight.dtype) 
         return features @ self.weight
-# Trong class MiNbaseNet
+
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
@@ -245,24 +245,32 @@ class MiNbaseNet(nn.Module):
     # [FeCAM INTEGRATION SECTION]
     # =========================================================================
     
+    # =========================================================================
+    # [FeCAM INTEGRATION SECTION - CPU OPTIMIZED]
+    # =========================================================================
+    
     def _tukeys_transform(self, x, beta=0.5):
-        """Tukey's transformation để làm Gaussian hóa phân bố"""
+        """Tukey's transformation"""
         return torch.pow(x, beta)
 
     def _shrink_cov(self, cov):
-        """Co ngót ma trận hiệp phương sai để đảm bảo khả nghịch"""
+        """
+        Co ngót ma trận hiệp phương sai.
+        Chạy trên thiết bị của tensor 'cov' (nên là CPU để tránh OOM)
+        """
         diag_mean = torch.mean(torch.diagonal(cov))
         off_diag = cov.clone()
         off_diag.fill_diagonal_(0.0)
         mask = off_diag != 0.0
-        # Tránh chia cho 0 nếu ma trận toàn 0
+        
         if mask.sum() > 0:
             off_diag_mean = (off_diag * mask).sum() / mask.sum()
         else:
             off_diag_mean = 0.0
             
-        iden = torch.eye(cov.shape[0], device=cov.device)
-        # Các hệ số alpha này có thể tune, ở đây dùng default của FeCAM
+        # Tạo identity matrix trên cùng device với cov
+        iden = torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+        
         alpha1 = 0.01
         alpha2 = 0.01 
         cov_ = cov + (alpha1 * diag_mean * iden) + (alpha2 * off_diag_mean * (1 - iden))
@@ -271,65 +279,69 @@ class MiNbaseNet(nn.Module):
     def build_fecam_stats(self, train_loader):
         """
         Tính toán Prototypes và Covariance Matrix cho các lớp mới.
+        [FIX OOM]: Tính toán hoàn toàn trên CPU.
         """
         self.eval()
-        print(f"--> [FeCAM] Building Statistics for Task {self.cur_task}...")
+        print(f"--> [FeCAM] Building Statistics for Task {self.cur_task} (CPU Mode)...")
         
-        # 1. Trích xuất features cho toàn bộ tập train
-        features_dict = {} # {class_id: [features]}
+        # Dictionary lưu features trên CPU
+        features_dict = {} 
         
+        # 1. Trích xuất features
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 
-                # Forward qua backbone + noise + buffer (quan trọng: dùng noise đã train)
-                # Dùng buffer output làm feature space cho FeCAM
+                # Forward lấy feature (Vẫn chạy trên GPU cho nhanh)
                 feats = self.backbone(inputs)
-                feats = self.buffer(feats) # [Batch, Buffer_Size]
+                feats = self.buffer(feats) 
                 
-                # Tukey transform ngay sau khi extract
+                # Chuyển ngay về CPU để giải phóng VRAM
+                feats = feats.detach().cpu()
+                
+                # Tukey transform (làm trên CPU)
                 feats = self._tukeys_transform(feats)
                 
-                targets = targets.cpu().numpy()
+                targets = targets.numpy() # targets đã ở cpu sẵn do dataloader
                 for idx in range(len(targets)):
                     label = targets[idx]
                     if label not in features_dict:
                         features_dict[label] = []
-                    features_dict[label].append(feats[idx].detach().cpu())
+                    features_dict[label].append(feats[idx])
 
-        # 2. Tính Mean và Covariance cho từng lớp
-        # Sắp xếp label để đảm bảo thứ tự
+        # Giải phóng cache GPU ngay lập tức sau khi extract xong
+        torch.cuda.empty_cache()
+
+        # 2. Tính Mean và Covariance trên CPU
         sorted_labels = sorted(features_dict.keys())
         
-        # Nếu là task đầu, reset list. Nếu task sau, append thêm.
         if self.cur_task == 0:
             self.class_means = []
             self.class_covs = []
         
         for label in sorted_labels:
-            # Stack features: [N, D]
-            class_feats = torch.stack(features_dict[label]).to(self.device)
+            # Stack features: [N, D] trên CPU
+            class_feats = torch.stack(features_dict[label])
             
-            # Tính Mean (Prototype)
+            # Tính Mean (Prototype) trên CPU
             mean = torch.mean(class_feats, dim=0)
-            self.class_means.append(mean)
             
-            # Tính Covariance
-            # Dùng double để tính cov chính xác hơn rồi cast về float
-            cov = torch.cov(class_feats.T).float()
+            # Tính Covariance trên CPU
+            cov = torch.cov(class_feats.T)
             
-            # Shrinkage để đảm bảo khả nghịch (Full Covariance)
+            # Shrinkage trên CPU
             cov = self._shrink_cov(cov)
             
-            # Normalization (Correlation Normalization - Optional nhưng tốt)
-            # Trong FeCAM gốc họ normalize, ở đây ta làm đơn giản để tránh phức tạp
-            self.class_covs.append(cov)
+            # CHỈ ĐẨY KẾT QUẢ CUỐI CÙNG LÊN GPU (Rất nhẹ, ~2MB/class)
+            self.class_means.append(mean.to(self.device))
+            self.class_covs.append(cov.to(self.device))
             
         print(f"--> [FeCAM] Updated stats. Total classes: {len(self.class_means)}")
         
-        # Giải phóng bộ nhớ
+        # Dọn dẹp RAM hệ thống
         del features_dict
-        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
 
     def predict_fecam(self, x):
         """
