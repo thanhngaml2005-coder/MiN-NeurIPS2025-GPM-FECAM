@@ -177,10 +177,10 @@ class MinNet(object):
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
         
-        train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False,
+        train_loader_clean = DataLoader(train_set_clean, batch_size= 32, shuffle=False,
                                   num_workers=self.num_workers)
         
-        # Gọi hàm build stats (đã chuyển sang CPU trong inc_net.py)
+     
         self._network.build_fecam_stats(train_loader_clean)
         
         # [MEMORY OPTIMIZATION]: Xóa sạch sẽ mọi thứ còn lại
