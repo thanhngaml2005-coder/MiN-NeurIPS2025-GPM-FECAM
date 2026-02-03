@@ -8,10 +8,12 @@ from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
 
-# Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
+# Import xử lý tương thích các phiên bản PyTorch
 try:
+    # PyTorch mới (>= 1.10)
     from torch.amp import autocast
 except ImportError:
+    # PyTorch cũ
     from torch.cuda.amp import autocast
 
 class BaseIncNet(nn.Module):
@@ -150,6 +152,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        # [FIX]: Thêm 'cuda' vào autocast
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
             X = self.buffer(X) 
@@ -207,8 +210,8 @@ class MiNbaseNet(nn.Module):
         
         running_stats = {} 
         
-        # [QUAN TRỌNG] Tắt Autocast khi build stats
-        with torch.no_grad(), autocast(enabled=False):
+        # [FIX]: Thêm 'cuda' vào autocast
+        with torch.no_grad(), autocast('cuda', enabled=False):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device).float() # Ép kiểu input về float32
                 targets = targets.to(self.device)
@@ -272,40 +275,40 @@ class MiNbaseNet(nn.Module):
         del running_stats
         torch.cuda.empty_cache()
 
-    # [FIX] Tắt Autocast trong hàm inference này
-    @torch.cuda.amp.autocast(enabled=False)
     def predict_fecam_internal(self, feats):
         """
         Robust Inference with FP32 enforcement
         """
-        # Đảm bảo đầu vào là Float32
-        feats = feats.float()
-        
-        feats = self._tukeys_transform(feats)
-        dists = []
-        JITTER = 1e-5 
-        
-        for c in range(len(self.class_means)):
-            mean = self.class_means[c].float()
-            cov = self.class_covs[c].float()
+        # [FIX]: Dùng context manager thay vì decorator để tránh lỗi import
+        with autocast('cuda', enabled=False):
+            # Đảm bảo đầu vào là Float32
+            feats = feats.float()
             
-            diff = feats - mean.unsqueeze(0)
+            feats = self._tukeys_transform(feats)
+            dists = []
+            JITTER = 1e-5 
             
-            try:
-                cov_stable = cov + torch.eye(cov.shape[0], device=cov.device) * JITTER
-                term = torch.linalg.solve(cov_stable, diff.T).T 
-            except RuntimeError:
+            for c in range(len(self.class_means)):
+                mean = self.class_means[c].float()
+                cov = self.class_covs[c].float()
+                
+                diff = feats - mean.unsqueeze(0)
+                
                 try:
-                    cov_cpu = cov.detach().cpu() + torch.eye(cov.shape[0]) * JITTER
-                    inv_cov = torch.linalg.pinv(cov_cpu)
-                    term = (diff.detach().cpu() @ inv_cov).to(self.device)
-                except:
-                    term = diff
+                    cov_stable = cov + torch.eye(cov.shape[0], device=cov.device) * JITTER
+                    term = torch.linalg.solve(cov_stable, diff.T).T 
+                except RuntimeError:
+                    try:
+                        cov_cpu = cov.detach().cpu() + torch.eye(cov.shape[0]) * JITTER
+                        inv_cov = torch.linalg.pinv(cov_cpu)
+                        term = (diff.detach().cpu() @ inv_cov).to(self.device)
+                    except:
+                        term = diff
 
-            dist = torch.sum(diff * term, dim=1)
-            dists.append(dist)
-            
-        return -torch.stack(dists, dim=1)
+                dist = torch.sum(diff * term, dim=1)
+                dists.append(dist)
+                
+            return -torch.stack(dists, dim=1)
 
     # =========================================================================
     # [FORWARD PASSES]
