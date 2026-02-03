@@ -106,7 +106,7 @@ class MinNet(object):
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
-        LAMBDA = 0.0 # Tune giá trị này (0.2 -> 0.8)
+        LAMBDA = 0.5 # Tune giá trị này (0.2 -> 0.8)
         
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
@@ -134,7 +134,7 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        LAMBDA = 0.0 # Tune giá trị này
+        LAMBDA = 0.5 # Tune giá trị này
         
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
