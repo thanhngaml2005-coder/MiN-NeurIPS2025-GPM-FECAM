@@ -92,11 +92,21 @@ class MinNet(object):
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
 
-    # [EVAL] Hybrid: Analytic + FeCAM (đã được DPCR sửa)
+    # =========================================================================
+    # [FIXED EVAL] Normalization & Hybrid Decision
+    # =========================================================================
+    
+    def _normalize_logits(self, logits):
+        """Hàm chuẩn hóa Z-score cho Logits"""
+        # (Logits - Mean) / Std
+        mean = logits.mean(dim=1, keepdim=True)
+        std = logits.std(dim=1, keepdim=True) + 1e-6
+        return (logits - mean) / std
+
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
-        LAMBDA = 0.2
+        LAMBDA = 0.6 # Tune giá trị này (0.2 -> 0.8)
         
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
@@ -107,7 +117,12 @@ class MinNet(object):
                 
                 if len(model.class_means) > 0:
                     logits_fecam = model.predict_fecam_internal(inputs)
-                    logits = logits_anal + LAMBDA * logits_fecam
+                    
+                    # [NORMALIZE] Chuẩn hóa trước khi cộng
+                    norm_anal = self._normalize_logits(logits_anal)
+                    norm_fecam = self._normalize_logits(logits_fecam)
+                    
+                    logits = norm_anal + LAMBDA * norm_fecam
                 else:
                     logits = logits_anal
                 
@@ -115,6 +130,48 @@ class MinNet(object):
                 correct += (predicts.cpu() == targets).sum()
                 total += len(targets)
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+    def eval_task(self, test_loader):
+        model = self._network.eval()
+        pred, label = [], []
+        LAMBDA = 0.6 # Tune giá trị này
+        
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(test_loader):
+                inputs = inputs.to(self.device)
+                
+                outputs = model(inputs)
+                logits_anal = outputs["logits"]
+                
+                if len(model.class_means) > 0:
+                    logits_fecam = model.predict_fecam_internal(inputs)
+                    
+                    # [NORMALIZE] Chuẩn hóa trước khi cộng
+                    norm_anal = self._normalize_logits(logits_anal)
+                    norm_fecam = self._normalize_logits(logits_fecam)
+                    
+                    logits = norm_anal + LAMBDA * norm_fecam
+                else:
+                    logits = logits_anal
+                
+                predicts = torch.max(logits, dim=1)[1]
+                pred.extend(predicts.cpu().numpy().tolist())
+                label.extend(targets.cpu().numpy().tolist())
+                
+        class_info = calculate_class_metrics(pred, label)
+        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
+        return {
+            "all_class_accy": class_info['all_accy'],
+            "class_accy": class_info['class_accy'],
+            "class_confusion": class_info['class_confusion_matrices'],
+            "task_accy": task_info['all_accy'],
+            "task_confusion": task_info['task_confusion_matrices'],
+            "all_task_accy": task_info['task_accy'],
+        }
+
+    # =========================================================================
+    # [TRAINING LOGIC]
+    # =========================================================================
 
     @staticmethod
     def cat2order(targets, datamanger):
@@ -143,7 +200,6 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
-        # --- TRAIN LOOP ---
         self._clear_gpu()
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
@@ -162,14 +218,12 @@ class MinNet(object):
 
         self.re_fit(train_loader_noaug, test_loader_buf)
         
-        # =========================================================
-        # [DPCR STEP 1] Lưu trữ Stats cho Task 0 (Base Task)
-        # =========================================================
+        # [DPCR STEP 1] Lưu Stats cho Task 0 (đã sửa lỗi gọi hàm thừa arguments)
         print("--> [DPCR] Initializing stats for Task 0...")
         self._network.dpcr.update_stats(self._network, train_loader_noaug)
         self._network.update_fecam_stats_with_dpcr()
         
-        # [DPCR STEP 2] Tạo Snapshot cho Model cũ để tính Drift sau này
+        # [DPCR STEP 2] Snapshot Model cũ
         self._old_network = copy.deepcopy(self._network)
         self._old_network.eval()
         for p in self._old_network.parameters(): p.requires_grad = False
@@ -201,11 +255,9 @@ class MinNet(object):
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self._network.update_noise()
         
-        # [DPCR] Đảm bảo đã có old_network
         if self._old_network is None:
             self._old_network = copy.deepcopy(self._network)
         
-        # --- TRAIN LOOP ---
         self._clear_gpu()
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
@@ -224,26 +276,23 @@ class MinNet(object):
 
         self.re_fit(train_loader_noaug, test_loader)
         
-        # =========================================================
         # [DPCR STEP 3] Xử lý Drift và Update Stats
-        # =========================================================
         
-        # 1. Lưu Stats của Class MỚI (chưa bị drift)
+        # 1. Lưu Stats MỚI (chưa drift)
         self._network.dpcr.update_stats(self._network, train_loader_noaug)
         
-        # 2. Sửa lỗi Drift cho các Class CŨ (dùng old_network và new_network)
-        # Sử dụng dữ liệu task mới để học ma trận chuyển đổi P
+        # 2. Sửa lỗi Drift CŨ (TSSP + CIP)
         self._network.dpcr.correct_drift(
             old_model=self._old_network, 
             new_model=self._network, 
             current_loader=train_loader_noaug, 
-            known_classes=self.known_class - self.increment # Số lượng class cũ
+            known_classes=self.known_class - self.increment
         )
         
-        # 3. Đồng bộ DPCR Stats -> FeCAM (16k)
+        # 3. Đồng bộ DPCR -> FeCAM
         self._network.update_fecam_stats_with_dpcr()
         
-        # 4. Update Snapshot cho task kế tiếp
+        # 4. Update Snapshot
         self._old_network = copy.deepcopy(self._network)
         self._old_network.eval()
         for p in self._old_network.parameters(): p.requires_grad = False
@@ -355,34 +404,6 @@ class MinNet(object):
             self.logger.info(info)
             prog_bar.set_description(info)
             if epoch % 5 == 0: self._clear_gpu()
-
-    def eval_task(self, test_loader):
-        model = self._network.eval()
-        pred, label = [], []
-        LAMBDA = 0.2
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(self.device)
-                outputs = model(inputs)
-                logits_anal = outputs["logits"]
-                if len(model.class_means) > 0:
-                    logits_fecam = model.predict_fecam_internal(inputs)
-                    logits = logits_anal + LAMBDA * logits_fecam
-                else:
-                    logits = logits_anal
-                predicts = torch.max(logits, dim=1)[1]
-                pred.extend(predicts.cpu().numpy().tolist())
-                label.extend(targets.cpu().numpy().tolist())
-        class_info = calculate_class_metrics(pred, label)
-        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
-        return {
-            "all_class_accy": class_info['all_accy'],
-            "class_accy": class_info['class_accy'],
-            "class_confusion": class_info['class_confusion_matrices'],
-            "task_accy": task_info['all_accy'],
-            "task_confusion": task_info['task_confusion_matrices'],
-            "all_task_accy": task_info['task_accy'],
-        }
 
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
