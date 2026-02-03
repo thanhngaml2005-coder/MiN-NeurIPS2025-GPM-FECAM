@@ -245,35 +245,23 @@ class MiNbaseNet(nn.Module):
     # [FeCAM INTEGRATION SECTION]
     # =========================================================================
     
-    # =========================================================================
-    # [FeCAM INTEGRATION SECTION - CPU OPTIMIZED]
-    # =========================================================================
-    
-    # =========================================================================
-    # [FeCAM INTEGRATION SECTION - GPU STREAMING OPTIMIZED]
-    # =========================================================================
-    
+
     def _tukeys_transform(self, x, beta=0.5):
         """Tukey's transformation (GPU)"""
         return torch.pow(x, beta)
 
     def _shrink_cov(self, cov):
         """
-        Co ngót ma trận hiệp phương sai trên GPU (Phiên bản tiết kiệm VRAM).
+        Co ngót ma trận hiệp phương sai trên GPU.
+        Phiên bản In-place Operations để tránh cấp phát bộ nhớ mới gây OOM.
         """
+        # 1. Tính các thống kê vô hướng (Scalar) - Rất nhẹ
+        n = cov.shape[0]
         diag = torch.diagonal(cov)
         diag_mean = torch.mean(diag)
-        
-        # Tính tổng tất cả phần tử
         sum_all = torch.sum(cov)
-        # Tính tổng đường chéo
         sum_diag = torch.sum(diag)
-        
-        # Tổng off-diagonal = Tổng - Tổng chéo
         sum_off_diag = sum_all - sum_diag
-        
-        n = cov.shape[0]
-        # Số lượng phần tử off-diagonal = n*n - n
         num_off_diag = n * n - n
         
         if num_off_diag > 0:
@@ -281,21 +269,26 @@ class MiNbaseNet(nn.Module):
         else:
             off_diag_mean = 0.0
             
-        iden = torch.eye(n, device=cov.device)
-        
         alpha1 = 0.01
         alpha2 = 0.01 
         
-        # cov_ = cov + alpha1*diag_mean*I + alpha2*off_mean*(1-I)
-        # Viết lại để tránh tạo matrix trung gian:
-        # cov_ = cov + (alpha1*diag_mean - alpha2*off_diag_mean) * I + alpha2*off_diag_mean
+        # Công thức: cov_ = cov + alpha1*diag_mean*I + alpha2*off_mean*(1-I)
+        # Viết lại: cov_ = (cov + alpha2*off_mean) + (alpha1*diag_mean - alpha2*off_mean)*I
+        # Ta sẽ thực hiện phép cộng trực tiếp vào 'cov' (in-place add_)
         
-        term_diag = (alpha1 * diag_mean - alpha2 * off_diag_mean) * iden
-        term_const = alpha2 * off_diag_mean
+        # 2. Cộng hằng số vào toàn bộ ma trận (In-place)
+        # cov += alpha2 * off_diag_mean
+        cov.add_(alpha2 * off_diag_mean)
         
-        cov_ = cov + term_diag + term_const
+        # 3. Cộng thêm phần tử đường chéo (In-place)
+        # Đường chéo cần cộng thêm: (alpha1*diag_mean - alpha2*off_diag_mean)
+        diff_diag = alpha1 * diag_mean - alpha2 * off_diag_mean
         
-        return cov_
+        # Lấy view đường chéo và cộng trực tiếp
+        # torch.diagonal trả về view, nên sửa nó là sửa cov gốc
+        torch.diagonal(cov).add_(diff_diag)
+        
+        return cov
 
     def build_fecam_stats(self, train_loader):
         """
