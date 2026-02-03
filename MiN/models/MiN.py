@@ -9,12 +9,6 @@ from torch.utils.data import DataLoader
 import copy
 import gc 
 import os
-import torch
-import matplotlib.pyplot as plt
-import numpy as np
-import os
-from torch.nn import functional as F
-
 
 from utils.inc_net import MiNbaseNet
 from torch.utils.data import WeightedRandomSampler
@@ -61,7 +55,6 @@ class MinNet(object):
         self.class_acc = []
         self.task_acc = []
         
-        # Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
@@ -80,7 +73,10 @@ class MinNet(object):
         test_set.labels = self.cat2order(test_set.labels, data_manger)
         test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
                                  num_workers=self.num_workers)
+        
+        # [PLAN A] Eval bằng Hybrid
         eval_res = self.eval_task(test_loader)
+        
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
         self.logger.info('total acc: {}'.format(self.total_acc))
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
@@ -93,15 +89,33 @@ class MinNet(object):
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
 
+    # [PLAN A] Hàm đánh giá Hybrid
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
+        
+        # Hệ số hòa trộn (Tune từ 0.1 đến 0.5)
+        # FeCAM distance rất lớn, nên cần alpha nhỏ hoặc chuẩn hóa
+        LAMBDA_FECAM = 0.2 
+        
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(device)
+                
+                # 1. Analytic Logits (Main)
                 outputs = model(inputs)
-                logits = outputs["logits"]
+                logits_analytic = outputs["logits"]
+                
+                # 2. FeCAM Logits (Support)
+                # Chỉ chạy nếu đã có stats
+                if len(model.class_means) > 0:
+                    logits_fecam = model.predict_fecam_internal(inputs)
+                    # Cộng gộp: Analytic + lambda * FeCAM (FeCAM là số âm)
+                    logits = logits_analytic + LAMBDA_FECAM * logits_fecam
+                else:
+                    logits = logits_analytic
+                
                 predicts = torch.max(logits, dim=1)[1]
                 correct += (predicts.cpu() == targets).sum()
                 total += len(targets)
@@ -112,13 +126,13 @@ class MinNet(object):
         for i in range(len(targets)):
             targets[i] = datamanger.map_cat2order(targets[i])
         return targets
+
     def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
         self.logger.info("task_list: {}".format(train_list_name))
         self.logger.info("task_order: {}".format(train_list))
 
-        # --- SETUP DATA ---
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
@@ -131,7 +145,6 @@ class MinNet(object):
 
         self.test_loader = test_loader
 
-        # Unfreeze backbone nếu không dùng pretrained (hoặc task 0 muốn finetune nhẹ)
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = True
@@ -141,62 +154,34 @@ class MinNet(object):
         
         self._clear_gpu()
         
-        # =====================================================================
-        # GIAI ĐOẠN 1: Train Noise Generator (với GPM)
-        # =====================================================================
-        self.logger.info("--> Phase 1: Training Noise Generator...")
         self.run(train_loader)
-        
-        # Thu thập GPM projection matrix sau khi train xong
         self._network.collect_projections(mode='threshold', val=0.95)
         
-        # [MEMORY OPTIMIZATION]: Xóa dữ liệu train vừa dùng xong
-        del train_loader, train_set
         self._clear_gpu()
-        
-        # =====================================================================
-        # GIAI ĐOẠN 2: Train Analytic Classifier (Proxy Task)
-        # =====================================================================
-        self.logger.info("--> Phase 2: Updating Analytic Classifier...")
-        
-        # Lấy lại dataset (vì đã xóa ở trên để tiết kiệm RAM)
-        train_set = data_manger.get_task_data(source="train", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
         
         train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
-        
         self.fit_fc(train_loader_buf, test_loader_buf)
 
-        # [MEMORY OPTIMIZATION]: Xóa loader buffer
-        del train_loader_buf, test_loader_buf, train_set
-        self._clear_gpu()
+        train_set_noaug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_noaug.labels = self.cat2order(train_set_noaug.labels, data_manger)
+        train_loader_noaug = DataLoader(train_set_noaug, batch_size=self.buffer_batch, shuffle=True,
+                                    num_workers=self.num_workers)
 
-        # =====================================================================
-        # GIAI ĐOẠN 3: Build FeCAM Statistics (CPU Mode)
-        # =====================================================================
-        self.logger.info("--> Phase 3: Building FeCAM Statistics...")
-        
-        # Dùng tập train "sạch" (không augmentation) để tính thống kê chính xác
-        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
-        
-        train_loader_clean = DataLoader(train_set_clean, batch_size= 32, shuffle=False,
-                                  num_workers=self.num_workers)
-        
-     
-        self._network.build_fecam_stats(train_loader_clean)
-        self.diagnose_fecam_space(self._network, train_loader, self.device)
-        # [MEMORY OPTIMIZATION]: Xóa sạch sẽ mọi thứ còn lại
-        del train_loader_clean, train_set_clean, test_set
-        self._clear_gpu()
-
-        # Freeze lại backbone sau task 0
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
+
+        self.re_fit(train_loader_noaug, test_loader_buf)
+        
+        # [PLAN A] Build FeCAM Stats sau khi train xong Task 0
+        # Dùng dữ liệu không Augmentation để tính stats chuẩn nhất
+        self._network.build_fecam_stats(train_loader_noaug)
+
+        del train_set, test_set, train_set_noaug
+        self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -204,79 +189,59 @@ class MinNet(object):
         self.logger.info("task_list: {}".format(train_list_name))
         self.logger.info("task_order: {}".format(train_list))
 
-        # --- SETUP DATA ---
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        # =====================================================================
-        # GIAI ĐOẠN 1: Update Analytic Classifier cho class mới
-        # =====================================================================
-        self.logger.info("--> Phase 1: Updating Analytic Classifier (New Classes)...")
-        
-        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
 
-        self.test_loader = test_loader_buf # Cập nhật loader để test online nếu cần
+        self.test_loader = test_loader
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # Analytic fit cho task mới (để làm proxy teacher)
-        self.fit_fc(train_loader_buf, test_loader_buf)
-        
-        # [MEMORY OPTIMIZATION]: Dùng xong xóa ngay
-        del train_loader_buf, test_loader_buf
-        self._clear_gpu()
+        self.fit_fc(train_loader, test_loader)
 
-        # Mở rộng mạng cho task mới
         self._network.update_fc(self.increment)
-        self._network.update_noise()
 
-        # =====================================================================
-        # GIAI ĐOẠN 2: Train Noise (Sequential GPM)
-        # =====================================================================
-        self.logger.info("--> Phase 2: Training Noise (Sequential GPM)...")
-        
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
+        self._network.update_noise()
         
-        self.run(train_loader)
-        
-        # Cập nhật GPM memory
-        self._network.collect_projections(mode='threshold', val=0.95)
-        
-        # [MEMORY OPTIMIZATION]: Xóa loader train
-        del train_loader, train_set
         self._clear_gpu()
 
-        # =====================================================================
-        # GIAI ĐOẠN 3: Build FeCAM Stats for NEW Classes
-        # =====================================================================
-        self.logger.info("--> Phase 3: Building FeCAM Statistics (New Classes)...")
+        self.run(train_loader)
+        self._network.collect_projections(mode='threshold', val=0.95)
         
-        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
+        self._clear_gpu()
+        del train_set
 
-        train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False,
+        train_set_noaug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_noaug.labels = self.cat2order(train_set_noaug.labels, data_manger)
+
+        train_loader_noaug = DataLoader(train_set_noaug, batch_size=self.buffer_batch, shuffle=True,
                                     num_workers=self.num_workers)
-        
-        # Hàm này sẽ tự động append stats của class mới vào list cũ
-        self._network.build_fecam_stats(train_loader_clean)
-        self.diagnose_fecam_space(self._network, train_loader, self.device)
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+                                    num_workers=self.num_workers)
+
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # [MEMORY OPTIMIZATION]: Xóa sạch sẽ
-        del train_set_clean, train_loader_clean, test_set
+        self.re_fit(train_loader_noaug, test_loader)
+        
+        # [PLAN A] Build FeCAM Stats cho Task mới
+        self._network.build_fecam_stats(train_loader_noaug)
+        
+        del train_set_noaug, test_set
         self._clear_gpu()
+
     def fit_fc(self, train_loader, test_loader):
-        self._network.use_fecam = False
         self._network.eval()
         self._network.to(self.device)
 
@@ -296,7 +261,6 @@ class MinNet(object):
             self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
-        self._network.use_fecam = False
         self._network.eval()
         self._network.to(self.device)
         prog_bar = tqdm(train_loader)
@@ -314,16 +278,14 @@ class MinNet(object):
         self._clear_gpu()
 
     def compute_adaptive_scale(self, current_loader):
-        # 1. Tính prototype task hiện tại
         curr_proto = self.get_task_prototype(self._network, current_loader)
         
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
         
         if not self.old_prototypes:
             self.old_prototypes.append(curr_proto)
-            return 0.95 # Task đầu tiên chưa cần scale, hoặc scale cao
+            return 0.95 
             
-        # 2. So sánh với quá khứ
         max_sim = 0.0
         curr_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
         for old_p in self.old_prototypes:
@@ -333,17 +295,13 @@ class MinNet(object):
                 
         self.old_prototypes.append(curr_proto)
         
-        # 3. Tính Scale: Giống nhau nhiều -> Scale thấp (để học đè lên). Khác nhau -> Scale cao.
-        # Công thức: Scale chạy từ 0.5 đến 0.95
         scale = 0.5 + 0.5 * (1.0 - max_sim)
-        scale = max(0.65, min(scale, 0.95)) # Kẹp giá trị an toàn
+        scale = max(0.65, min(scale, 0.95))
         
         self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
         return scale
+
     def run(self, train_loader):
-        # Tắt FeCAM khi train noise
-        self._network.use_fecam = False
-        
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
@@ -352,7 +310,6 @@ class MinNet(object):
         if self.cur_task > 0:
             current_scale = self.compute_adaptive_scale(train_loader)
 
-        # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -369,11 +326,6 @@ class MinNet(object):
 
         WARMUP_EPOCHS = 2
 
-        # [FIX OOM]: Dọn rác trước khi vào loop
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
@@ -385,9 +337,7 @@ class MinNet(object):
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
-                            # [Optimization]: Detach ngay để không lưu graph
-                            logits1 = self._network(inputs, new_forward=False)['logits'].detach()
-                        
+                            logits1 = self._network(inputs, new_forward=False)['logits']
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                         logits_final = logits2 + logits1
                     else:
@@ -412,9 +362,7 @@ class MinNet(object):
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                # [FIX OOM]: Xóa biến ngay lập tức
                 del inputs, targets, loss, logits_final
-                if self.cur_task > 0: del logits1, logits2
 
             scheduler.step()
             train_acc = 100. * correct / total
@@ -424,29 +372,37 @@ class MinNet(object):
             )
             self.logger.info(info)
             prog_bar.set_description(info)
-            print(info)
             
-            # [FIX OOM]: Dọn rác System RAM định kỳ
-            if epoch % 2 == 0:
-                gc.collect()
+            if epoch % 5 == 0:
                 self._clear_gpu()
-        
-        del optimizer, scheduler
-        self._clear_gpu()
-        
-        self._network.use_fecam = True
+
+    # [PLAN A] Hàm eval_task cũng phải dùng Hybrid
     def eval_task(self, test_loader):
-        self._network.use_fecam = True
         model = self._network.eval()
         pred, label = [], []
+        
+        # Hệ số hòa trộn (Tune từ 0.1 đến 0.5)
+        LAMBDA_FECAM = 0.2
+        
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
+                
+                # 1. Analytic Logits
                 outputs = model(inputs)
-                logits = outputs["logits"]
+                logits_analytic = outputs["logits"]
+                
+                # 2. FeCAM Logits (Support)
+                if len(model.class_means) > 0:
+                    logits_fecam = model.predict_fecam_internal(inputs)
+                    logits = logits_analytic + LAMBDA_FECAM * logits_fecam
+                else:
+                    logits = logits_analytic
+                
                 predicts = torch.max(logits, dim=1)[1]
                 pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
                 label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
+                
         class_info = calculate_class_metrics(pred, label)
         task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
         return {
@@ -457,97 +413,7 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-  
-    def diagnose_fecam_space(model, data_loader, device, save_dir="fecam_diagnosis"):
-        """
-        Hàm chẩn đoán "sức khỏe" của không gian FeCAM.
-        Vẽ histogram khoảng cách Mahalanobis của từng class.
-        """
-        print(f"--> [DIAGNOSIS] Starting FeCAM Space Analysis...")
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-            
-        model.eval()
-        
-        # [QUAN TRỌNG] Tắt ReLU để nhìn đúng không gian mà FeCAM đang nhìn
-        # Lưu lại trạng thái cũ để restore sau
-        original_relu_state = model.buffer.use_relu
-        model.buffer.use_relu = False
-        
-        # Dictionary lưu khoảng cách của từng class
-        # Key: label, Value: list of distances
-        class_distances = {}
-        
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(data_loader):
-                inputs, targets = inputs.to(device).float(), targets.to(device)
-                
-                # --- Tái tạo lại đúng quy trình biến đổi của FeCAM ---
-                # 1. Backbone
-                feats = model.backbone(inputs)
-                if torch.isnan(feats).any(): feats = torch.nan_to_num(feats)
-                
-                # 2. Linear Buffer (Do đã tắt ReLU)
-                feats = model.buffer(feats)
-                
-                # 3. Robust Transform (Gọi hàm của model hoặc viết lại y hệt)
-                # Code: x = sign(x) * |x|^0.5 -> LayerNorm
-                feats = torch.sign(feats) * torch.pow(torch.abs(feats) + 1e-6, 0.5)
-                feats = F.layer_norm(feats, feats.shape[-1:])
-                
-                # --- Tính khoảng cách ---
-                unique_labels = torch.unique(targets)
-                for label in unique_labels:
-                    label_item = label.item()
-                    
-                    # Chỉ phân tích các class đã được build stats
-                    if label_item >= len(model.class_means):
-                        continue
-                        
-                    mask = (targets == label)
-                    class_feats = feats[mask] # [N, D]
-                    
-                    # Lấy Mean và Var của đúng class đó
-                    mean = model.class_means[label_item].float()
-                    var = model.class_vars[label_item].float()
-                    
-                    # Tính khoảng cách từ Sample của class X tới Tâm của class X (Intra-class)
-                    # Dist = Sum( (x - mean)^2 / var )
-                    diff_sq = (class_feats - mean.unsqueeze(0)) ** 2
-                    dist = torch.sum(diff_sq / (var + 1e-6), dim=1) # [N]
-                    
-                    if label_item not in class_distances:
-                        class_distances[label_item] = []
-                    class_distances[label_item].extend(dist.cpu().numpy().tolist())
-    
-        # --- Restore ReLU ---
-        model.buffer.use_relu = original_relu_state
-        
-        # --- Vẽ biểu đồ ---
-        print(f"--> [DIAGNOSIS] Plotting histograms...")
-        num_classes_to_plot = min(len(class_distances), 5) # Chỉ vẽ 5 class đầu để test
-        
-        plt.figure(figsize=(15, 10))
-        for i, label in enumerate(sorted(class_distances.keys())[:num_classes_to_plot]):
-            dists = class_distances[label]
-            
-            plt.subplot(2, 3, i+1)
-            plt.hist(dists, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
-            
-            # Thống kê
-            mean_dist = np.mean(dists)
-            std_dist = np.std(dists)
-            
-            plt.title(f"Class {label}\nMean={mean_dist:.2f}, Std={std_dist:.2f}")
-            plt.xlabel("Mahalanobis Distance")
-            plt.ylabel("Frequency")
-            plt.grid(True, alpha=0.3)
-            
-        plt.tight_layout()
-        save_path = os.path.join(save_dir, f"task_{model.cur_task}_dist_hist.png")
-        plt.savefig(save_path)
-        print(f"--> [DIAGNOSIS] Saved plot to: {save_path}")
-        plt.close()
+
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
@@ -563,4 +429,3 @@ class MinNet(object):
         prototype = torch.mean(all_features, dim=0).to(self.device)
         self._clear_gpu()
         return prototype
-    
