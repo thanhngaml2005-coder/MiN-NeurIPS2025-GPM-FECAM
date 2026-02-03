@@ -106,8 +106,7 @@ class MinNet(object):
         for i in range(len(targets)):
             targets[i] = datamanger.map_cat2order(targets[i])
         return targets
-
-def init_train(self, data_manger):
+    def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
         self.logger.info("task_list: {}".format(train_list_name))
