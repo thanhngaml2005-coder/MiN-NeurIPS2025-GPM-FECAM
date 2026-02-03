@@ -225,37 +225,22 @@ class MiNbaseNet(nn.Module):
     # [FeCAM INTEGRATION - OPTIMIZED FOR BACKBONE FEATURES]
     # =========================================================================
     
+    # =========================================================================
+    # [FeCAM INTEGRATION - NAN FIX]
+    # =========================================================================
+    
     def _tukeys_transform(self, x, beta=0.5):
+        """
+        Tukey's transformation.
+        [FIX NAN]: Thêm ReLU để đảm bảo không căn bậc hai số âm.
+        """
+        # Đảm bảo đầu vào không âm trước khi mũ hóa
+        x = F.relu(x) 
         return torch.pow(x, beta)
-
-    def _shrink_cov(self, cov):
-        """
-        Co ngót ma trận hiệp phương sai (In-place & No extra allocation).
-        """
-        diag = torch.diagonal(cov)
-        diag_mean = torch.mean(diag)
-        sum_all = torch.sum(cov)
-        sum_diag = torch.sum(diag)
-        sum_off_diag = sum_all - sum_diag
-        n = cov.shape[0]
-        num_off_diag = n * n - n
-        
-        if num_off_diag > 0:
-            off_diag_mean = sum_off_diag / num_off_diag
-        else:
-            off_diag_mean = 0.0
-            
-        alpha1 = 0.01; alpha2 = 0.01 
-        
-        # In-place add
-        cov.add_(alpha2 * off_diag_mean)
-        torch.diagonal(cov).add_(alpha1 * diag_mean - alpha2 * off_diag_mean)
-        return cov
 
     def build_fecam_stats(self, train_loader):
         """
-        Tính FeCAM trên Backbone Features (D=768).
-        Nhanh, Chính xác và Siêu nhẹ (No OOM).
+        Tính FeCAM trên Backbone Features.
         """
         self.eval()
         print(f"--> [FeCAM] Building Statistics (Backbone Features D={self.backbone.out_dim})...")
@@ -267,10 +252,15 @@ class MiNbaseNet(nn.Module):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
-                # [QUAN TRỌNG]: Chỉ dùng backbone, KHÔNG qua buffer
-                # Feats shape: [Batch, 768] -> Ma trận Cov chỉ 2.3MB
-                feats = self.backbone(inputs) 
+                # 1. Forward Backbone
+                feats = self.backbone(inputs)
                 
+                # [QUAN TRỌNG]: Kiểm tra xem backbone có ra NaN không (Optional safety check)
+                if torch.isnan(feats).any():
+                    print(f"[Warning] NaN detected in Backbone features at batch {i}")
+                    feats = torch.nan_to_num(feats)
+                
+                # 2. Transform (Đã có ReLU bên trong để chặn số âm)
                 feats = self._tukeys_transform(feats)
                 
                 unique_labels = torch.unique(targets)
@@ -287,7 +277,7 @@ class MiNbaseNet(nn.Module):
                             'n': 0
                         }
                     
-                    # Accumulate on GPU (Safe because D=768 is small)
+                    # Tích lũy
                     running_stats[label_item]['sum_x'] += class_feats.sum(dim=0)
                     running_stats[label_item]['sum_xxT'].addmm_(class_feats.T, class_feats)
                     running_stats[label_item]['n'] += class_feats.shape[0]
@@ -305,11 +295,18 @@ class MiNbaseNet(nn.Module):
             sum_xxT = stats['sum_xxT']
             
             mean = sum_x / n
+            
+            # Tính Covariance: E[XX^T] - E[X]E[X]^T
             if n > 1:
                 term2 = torch.outer(sum_x, sum_x) / n
                 cov = (sum_xxT - term2) / (n - 1)
             else:
                 cov = torch.eye(mean.shape[0], device=self.device) * 1e-6
+            
+            # [CHECK NAN]: Kiểm tra lần cuối trước khi shrink
+            if torch.isnan(cov).any() or torch.isinf(cov).any():
+                print(f"[Warning] Covariance matrix for class {label} contains NaNs! Resetting to Identity.")
+                cov = torch.eye(mean.shape[0], device=self.device)
             
             cov = self._shrink_cov(cov)
             
@@ -325,54 +322,37 @@ class MiNbaseNet(nn.Module):
     def predict_fecam_internal(self, feats):
         """
         Hàm tính khoảng cách Mahalanobis (Robust Version).
-        Tự động xử lý lỗi Singular Matrix và SVD convergence failure.
         """
+        # Transform cũng phải có ReLU
         feats = self._tukeys_transform(feats)
         dists = []
         
-        # Jitter để đảm bảo ma trận không bị suy biến (Singular)
-        # 1e-5 đủ nhỏ để không ảnh hưởng kết quả, đủ lớn để tránh lỗi chia cho 0
         JITTER = 1e-5 
         
         for c in range(len(self.class_means)):
             mean = self.class_means[c]
             cov = self.class_covs[c]
             
-            diff = feats - mean.unsqueeze(0) # [Batch, D]
+            diff = feats - mean.unsqueeze(0) 
             
-            # [CƠ CHẾ AN TOÀN 3 LỚP]
             try:
-                # Lớp 1: Thử giải hệ phương trình tuyến tính trên GPU (Nhanh nhất)
-                # cov * x = diff.T  => x = cov^-1 * diff.T
-                # Thêm Jitter vào đường chéo trước khi tính
+                # Lớp 1: GPU Solve
                 cov_stable = cov + torch.eye(cov.shape[0], device=cov.device) * JITTER
                 term = torch.linalg.solve(cov_stable, diff.T).T 
                 
             except RuntimeError:
-                # Lớp 2: Nếu GPU lỗi (Singular hoặc SVD fail), chuyển về CPU dùng Pseudo-Inverse
-                # CPU (LAPACK) tính SVD ổn định hơn GPU (cuSolver) rất nhiều
+                # Lớp 2: CPU Fallback
                 try:
                     cov_cpu = cov.detach().cpu()
                     diff_cpu = diff.detach().cpu()
-                    # Thêm jitter trên CPU
                     cov_cpu = cov_cpu + torch.eye(cov_cpu.shape[0]) * JITTER
-                    
-                    # Dùng pinv (nghịch đảo giả) an toàn hơn solve
                     inv_cov = torch.linalg.pinv(cov_cpu)
-                    
-                    # Tính term = diff * inv_cov
                     term_cpu = diff_cpu @ inv_cov
-                    term = term_cpu.to(self.device) # Đẩy lại GPU để tính khoảng cách
-                    
+                    term = term_cpu.to(self.device)
                 except Exception as e:
-                    # Lớp 3: Fallback cuối cùng - Dùng khoảng cách Euclidean
-                    # (Coi như Covariance là ma trận đơn vị)
-                    # Trường hợp này cực hiếm khi xảy ra
-                    print(f"Warning: Class {c} covariance collapsed using Euclidean. Error: {e}")
+                    # Fallback Euclidean
                     term = diff
 
-            # Tính khoảng cách Mahalanobis
-            # dist = (x-u)^T * Sigma^-1 * (x-u) = sum(diff * term)
             dist = torch.sum(diff * term, dim=1)
             dists.append(dist)
             
