@@ -323,22 +323,56 @@ class MiNbaseNet(nn.Module):
         torch.cuda.empty_cache()
 
     def predict_fecam_internal(self, feats):
-        """Hàm tính khoảng cách nhận features đầu vào (đã trích xuất từ backbone)"""
+        """
+        Hàm tính khoảng cách Mahalanobis (Robust Version).
+        Tự động xử lý lỗi Singular Matrix và SVD convergence failure.
+        """
         feats = self._tukeys_transform(feats)
         dists = []
+        
+        # Jitter để đảm bảo ma trận không bị suy biến (Singular)
+        # 1e-5 đủ nhỏ để không ảnh hưởng kết quả, đủ lớn để tránh lỗi chia cho 0
+        JITTER = 1e-5 
+        
         for c in range(len(self.class_means)):
             mean = self.class_means[c]
             cov = self.class_covs[c]
             
-            diff = feats - mean.unsqueeze(0)
+            diff = feats - mean.unsqueeze(0) # [Batch, D]
             
-            # Solve linear system: cov * x = diff.T
-            # Với D=768, solve cực nhanh
+            # [CƠ CHẾ AN TOÀN 3 LỚP]
             try:
-                term = torch.linalg.solve(cov, diff.T).T 
-            except:
-                term = diff @ torch.linalg.pinv(cov)
+                # Lớp 1: Thử giải hệ phương trình tuyến tính trên GPU (Nhanh nhất)
+                # cov * x = diff.T  => x = cov^-1 * diff.T
+                # Thêm Jitter vào đường chéo trước khi tính
+                cov_stable = cov + torch.eye(cov.shape[0], device=cov.device) * JITTER
+                term = torch.linalg.solve(cov_stable, diff.T).T 
                 
+            except RuntimeError:
+                # Lớp 2: Nếu GPU lỗi (Singular hoặc SVD fail), chuyển về CPU dùng Pseudo-Inverse
+                # CPU (LAPACK) tính SVD ổn định hơn GPU (cuSolver) rất nhiều
+                try:
+                    cov_cpu = cov.detach().cpu()
+                    diff_cpu = diff.detach().cpu()
+                    # Thêm jitter trên CPU
+                    cov_cpu = cov_cpu + torch.eye(cov_cpu.shape[0]) * JITTER
+                    
+                    # Dùng pinv (nghịch đảo giả) an toàn hơn solve
+                    inv_cov = torch.linalg.pinv(cov_cpu)
+                    
+                    # Tính term = diff * inv_cov
+                    term_cpu = diff_cpu @ inv_cov
+                    term = term_cpu.to(self.device) # Đẩy lại GPU để tính khoảng cách
+                    
+                except Exception as e:
+                    # Lớp 3: Fallback cuối cùng - Dùng khoảng cách Euclidean
+                    # (Coi như Covariance là ma trận đơn vị)
+                    # Trường hợp này cực hiếm khi xảy ra
+                    print(f"Warning: Class {c} covariance collapsed using Euclidean. Error: {e}")
+                    term = diff
+
+            # Tính khoảng cách Mahalanobis
+            # dist = (x-u)^T * Sigma^-1 * (x-u) = sum(diff * term)
             dist = torch.sum(diff * term, dim=1)
             dists.append(dist)
             
