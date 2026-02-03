@@ -134,33 +134,40 @@ class MinNet(object):
         
         self._clear_gpu()
         
+        1. Train Noise (với GPM)
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        #self._network.after_task_magmax_merge()
-        #self.analyze_model_sparsity()
         
         self._clear_gpu()
         
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        # 2. Train Analytic Classifier (Proxy)
+        # Mục đích: Đảm bảo lớp features được tinh chỉnh tối ưu cho phân lớp tuyến tính
+        # Đây là bước "Teacher" cho Noise Generator học
+        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
-        self.fit_fc(train_loader, test_loader)
+        self.fit_fc(train_loader_buf, test_loader_buf)
 
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        # 3. [NEW] Build FeCAM Statistics
+        # Sử dụng train_set "sạch" (không augment) để tính Mean/Cov
+        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
+        train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False,
                                   num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
+        
+        self._network.build_fecam_stats(train_loader_clean)
+        
+        self._clear_gpu()
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
-        #self.check_rls_quality()
-        del train_set, test_set
+        # Re-fit Analytic (Optional, kept for consistency with original MIN)
+        # self.re_fit(train_loader_clean, test_loader)
+        
+        del train_set, test_set, train_set_clean
         self._clear_gpu()
 
     def increment_train(self, data_manger):
@@ -197,32 +204,31 @@ class MinNet(object):
 
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        #self._network.after_task_magmax_merge()
-        #self.analyze_model_sparsity()
         
         self._clear_gpu()
 
 
         del train_set
 
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
+        # 2. [NEW] Build FeCAM Stats for NEW Classes
+        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False,
                                     num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                    num_workers=self.num_workers)
+        
+        # Chỉ gọi hàm này, nó sẽ tự append các class mới vào list stats
+        self._network.build_fecam_stats(train_loader_clean)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
-        #self.check_rls_quality()
-        del train_set, test_set
+        # self.re_fit(train_loader_clean, test_loader_buf)
+        del train_set_clean, test_set
         self._clear_gpu()
-
     def fit_fc(self, train_loader, test_loader):
+        self._network.use_fecam = False
         self._network.eval()
         self._network.to(self.device)
 
@@ -242,6 +248,7 @@ class MinNet(object):
             self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
+        self._network.use_fecam = False
         self._network.eval()
         self._network.to(self.device)
         prog_bar = tqdm(train_loader)
@@ -286,10 +293,8 @@ class MinNet(object):
         self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
         return scale
     def run(self, train_loader):
-        # [TỐI ƯU 1]: Import nên để đầu file, nhưng nếu để đây cũng ko sao.
-        # scaler = GradScaler() -> [SAI]: Đừng tạo mới mỗi task!
-        # Hãy dùng self.scaler đã tạo trong __init__
-
+        self._network.use_fecam = False
+    
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
@@ -329,9 +334,7 @@ class MinNet(object):
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
-                            # forward cũ
                             logits1 = self._network(inputs, new_forward=False)['logits']
-                        # forward mới
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                         logits_final = logits2 + logits1
                     else:
@@ -377,7 +380,9 @@ class MinNet(object):
             # Clear cache định kỳ
             if epoch % 5 == 0:
                 self._clear_gpu()
+        self._network.use_fecam = True
     def eval_task(self, test_loader):
+        self._network.use_fecam = True
         model = self._network.eval()
         pred, label = [], []
         with torch.no_grad():
