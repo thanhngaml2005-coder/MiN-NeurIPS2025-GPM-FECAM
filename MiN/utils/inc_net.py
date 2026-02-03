@@ -259,24 +259,42 @@ class MiNbaseNet(nn.Module):
 
     def _shrink_cov(self, cov):
         """
-        Co ngót ma trận hiệp phương sai trên GPU.
+        Co ngót ma trận hiệp phương sai trên GPU (Phiên bản tiết kiệm VRAM).
         """
-        # Tính trên GPU rất nhanh
-        diag_mean = torch.mean(torch.diagonal(cov))
-        off_diag = cov.clone()
-        off_diag.fill_diagonal_(0.0)
-        mask = off_diag != 0.0
+        diag = torch.diagonal(cov)
+        diag_mean = torch.mean(diag)
         
-        if mask.sum() > 0:
-            off_diag_mean = (off_diag * mask).sum() / mask.sum()
+        # Tính tổng tất cả phần tử
+        sum_all = torch.sum(cov)
+        # Tính tổng đường chéo
+        sum_diag = torch.sum(diag)
+        
+        # Tổng off-diagonal = Tổng - Tổng chéo
+        sum_off_diag = sum_all - sum_diag
+        
+        n = cov.shape[0]
+        # Số lượng phần tử off-diagonal = n*n - n
+        num_off_diag = n * n - n
+        
+        if num_off_diag > 0:
+            off_diag_mean = sum_off_diag / num_off_diag
         else:
             off_diag_mean = 0.0
             
-        iden = torch.eye(cov.shape[0], device=cov.device)
+        iden = torch.eye(n, device=cov.device)
         
         alpha1 = 0.01
         alpha2 = 0.01 
-        cov_ = cov + (alpha1 * diag_mean * iden) + (alpha2 * off_diag_mean * (1 - iden))
+        
+        # cov_ = cov + alpha1*diag_mean*I + alpha2*off_mean*(1-I)
+        # Viết lại để tránh tạo matrix trung gian:
+        # cov_ = cov + (alpha1*diag_mean - alpha2*off_diag_mean) * I + alpha2*off_diag_mean
+        
+        term_diag = (alpha1 * diag_mean - alpha2 * off_diag_mean) * iden
+        term_const = alpha2 * off_diag_mean
+        
+        cov_ = cov + term_diag + term_const
+        
         return cov_
 
     def build_fecam_stats(self, train_loader):
@@ -339,7 +357,7 @@ class MiNbaseNet(nn.Module):
         if self.cur_task == 0:
             self.class_means = []
             self.class_covs = []
-        
+        torch.cuda.empty_cache()
         for label in sorted_labels:
             stats = running_stats[label]
             n = stats['n']
@@ -351,27 +369,31 @@ class MiNbaseNet(nn.Module):
             
             # Tính Covariance Matrix
             if n > 1:
-                # E[XX^T] - E[X]E[X]^T
-                # Dùng outer product cho số hạng thứ 2: (sum_x.unsqueeze(1) @ sum_x.unsqueeze(0))
+                # [TỐI ƯU VRAM]: Xóa biến sum_xxT khỏi stats ngay khi dùng xong
+                del running_stats[label]['sum_xxT'] 
+                
                 term2 = torch.outer(sum_x, sum_x) / n
                 cov = (sum_xxT - term2) / (n - 1)
+                
+                # Xóa tiếp các biến tạm
+                del sum_xxT, term2
             else:
-                # Fallback nếu chỉ có 1 sample (hiếm gặp)
                 cov = torch.eye(mean.shape[0], device=self.device) * 1e-6
             
-            # Shrinkage (Vẫn trên GPU)
+            # Shrinkage
             cov = self._shrink_cov(cov)
             
-            # Lưu kết quả
             self.class_means.append(mean)
             self.class_covs.append(cov)
             
-            # Giải phóng bộ nhớ tạm của class này ngay lập tức
+            # Xóa sạch stats của lớp này
             del running_stats[label]
             
+            # Dọn rác GPU sau mỗi lớp để tránh tích tụ
+            if label % 10 == 0:
+                torch.cuda.empty_cache()
+            
         print(f"--> [FeCAM] Updated stats. Total classes: {len(self.class_means)}")
-        
-        # Dọn dẹp
         del running_stats
         torch.cuda.empty_cache()
     def predict_fecam(self, x):
