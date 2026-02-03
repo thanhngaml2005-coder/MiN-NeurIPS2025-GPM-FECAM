@@ -45,26 +45,30 @@ class BaseIncNet(nn.Module):
 
 
 class RandomBuffer(nn.Module):
+    """
+    Random Buffer: Hỗ trợ chuyển đổi giữa ReLU (Analytic) và Linear (FeCAM)
+    """
     def __init__(self, in_features: int, buffer_size: int, device):
         super(RandomBuffer, self).__init__()
         self.in_features = in_features
         self.out_features = buffer_size
         
         factory_kwargs = {"device": device, "dtype": torch.float32}
-        
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
         
-        self.use_relu = True 
+        # Mặc định bật ReLU (cho luồng Training chính)
+        self.use_relu = True
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # Dùng Normal Init để đúng bản chất Random Projection (JL Lemma)
+        # Dùng Normal Init để tối ưu cho cả 2 mode (JL Lemma)
         nn.init.normal_(self.W, mean=0.0, std=1.0 / math.sqrt(self.in_features))
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         X = X.to(self.weight.dtype)
         out = X @ self.W
+        # Công tắc chuyển mạch
         return F.relu(out) if self.use_relu else out
 
 
@@ -79,10 +83,9 @@ class MiNbaseNet(nn.Module):
         self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
 
-        # Random Buffer
+        # Random Buffer thông minh
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
-        # Analytic Parameters
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight) 
@@ -94,14 +97,14 @@ class MiNbaseNet(nn.Module):
         self.cur_task = -1
         self.known_class = 0
         
-        # --- FeCAM Storage ---
-        self.class_means = []      
-        self.class_vars = []  
-        self.use_fecam = True      
+        # --- [PLAN A] FeCAM Storage ---
+        self.class_means = []
+        self.class_vars = []
 
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
+        
         if self.cur_task > 0:
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
@@ -153,8 +156,14 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        self.buffer.use_relu = True 
+        # Analytic LUÔN dùng ReLU
+        self.buffer.use_relu = True
         
+        try:
+            from torch.amp import autocast
+        except ImportError:
+            from torch.cuda.amp import autocast
+
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
             X = self.buffer(X) 
@@ -165,8 +174,7 @@ class MiNbaseNet(nn.Module):
                 increment_size = num_targets - self.weight.shape[1]
                 tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 new_weight = torch.cat((self.weight, tail), dim=1)
-                self.weight = new_weight 
-                
+                self.weight = new_weight
             elif num_targets < self.weight.shape[1]:
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
@@ -181,38 +189,39 @@ class MiNbaseNet(nn.Module):
 
             self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
-            
-            self.buffer.use_relu = True
             del term, jitter, K, X, Y 
 
     # =========================================================================
-    # [FeCAM: DIAGONAL + LINEAR BUFFER + ROBUST STATS]
+    # [PLAN A: FeCAM HELPERS]
     # =========================================================================
-    
+
     def _robust_transform(self, x, beta=0.5):
-        # Power Transform: Thêm epsilon để tránh gradient nổ tại 0
+        # Power + LayerNorm để chuẩn hóa không gian Linear Buffer
         x = torch.sign(x) * torch.pow(torch.abs(x) + 1e-6, beta)
-        
-        # LayerNorm: Chuẩn PyTorch (ổn định hơn tự code)
         x = F.layer_norm(x, x.shape[-1:])
         return x
 
     def build_fecam_stats(self, train_loader):
+        """
+        Xây dựng thống kê cho FeCAM.
+        QUAN TRỌNG: Chỉ chạy sau khi train xong task.
+        """
         self.eval()
-        print(f"--> [FeCAM] Building Diagonal Stats (Linear Buffer D={self.buffer_size})...")
+        print(f"--> [FeCAM] Building Stats for Hybrid Decision...")
         
+        # Tắt ReLU để lấy Linear Space
         self.buffer.use_relu = False
-        running_stats = {} 
+        running_stats = {}
         
         with torch.no_grad(), autocast('cuda', enabled=False):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device).float()
                 targets = targets.to(self.device)
                 
+                # Forward: Backbone -> Linear Buffer -> Transform
                 feats = self.backbone(inputs)
                 if torch.isnan(feats).any(): feats = torch.nan_to_num(feats)
-                
-                feats = self.buffer(feats) 
+                feats = self.buffer(feats)
                 feats = self._robust_transform(feats)
                 
                 unique_labels = torch.unique(targets)
@@ -229,14 +238,12 @@ class MiNbaseNet(nn.Module):
                             'n': 0
                         }
                     
-                    # Accumulate Sum(X)
+                    # Accumulate
                     running_stats[label_item]['sum_x'] += class_feats.sum(dim=0)
-                    
-                    # [OPTIMIZATION] Dùng phép nhân thay vì pow(2) để tối ưu VRAM/Speed
                     running_stats[label_item]['sum_sq_x'] += torch.sum(class_feats * class_feats, dim=0)
-                    
                     running_stats[label_item]['n'] += class_feats.shape[0]
 
+        # Convert to Mean/Var
         sorted_labels = sorted(running_stats.keys())
         if self.cur_task == 0:
             self.class_means = []
@@ -249,48 +256,60 @@ class MiNbaseNet(nn.Module):
             sum_sq_x = stats['sum_sq_x']
             
             mean = sum_x / n
-            
             if n > 1:
                 var = (sum_sq_x / n) - (mean ** 2)
-                var = var * (n / (n - 1)) 
+                var = var * (n / (n - 1))
             else:
                 var = torch.ones_like(mean)
             
+            # Robust Variance
             var = torch.clamp(var, min=1e-4)
             mean_var = torch.mean(var)
-            alpha = 0.1
-            var = (1 - alpha) * var + alpha * mean_var
+            var = 0.9 * var + 0.1 * mean_var # Shrinkage
             
             self.class_means.append(mean)
             self.class_vars.append(var)
-            del running_stats[label]
             
+        # Trả lại trạng thái ReLU cho buffer (để an toàn cho các quy trình khác)
         self.buffer.use_relu = True
-        print(f"--> [FeCAM] Stats Built. Total classes: {len(self.class_means)}")
+        print(f"--> [FeCAM] Stats Built. Classes: {len(self.class_means)}")
         del running_stats
         torch.cuda.empty_cache()
 
-    def predict_fecam_internal(self, feats):
-        with autocast('cuda', enabled=False):
+    def predict_fecam_internal(self, inputs):
+        """
+        Trả về Logits của FeCAM (Negative Mahalanobis Distance).
+        Inputs là ảnh gốc hoặc features (tùy logic gọi).
+        Ở đây ta nhận vào input ảnh gốc để tiện gọi từ bên ngoài.
+        """
+        with torch.no_grad(), autocast('cuda', enabled=False):
+            # Tắt ReLU
             self.buffer.use_relu = False
             
+            # Forward
+            if inputs.ndim == 4: # Nếu là ảnh
+                feats = self.backbone(inputs)
+            else: # Nếu là features
+                feats = inputs
+                
             feats = feats.float()
-            feats = self.buffer(feats) 
+            if torch.isnan(feats).any(): feats = torch.nan_to_num(feats)
+            feats = self.buffer(feats)
             feats = self._robust_transform(feats)
             
             dists = []
-            
             for c in range(len(self.class_means)):
                 mean = self.class_means[c].float()
                 var = self.class_vars[c].float()
                 
                 diff_sq = (feats - mean.unsqueeze(0)) ** 2
-                
-                # Thêm epsilon khi chia để an toàn tuyệt đối
                 dist = torch.sum(diff_sq / (var + 1e-6), dim=1)
                 dists.append(dist)
             
+            # Bật lại ReLU
             self.buffer.use_relu = True
+            
+            # Trả về số âm (Khoảng cách càng nhỏ -> Logits càng lớn)
             return -torch.stack(dists, dim=1)
 
     # =========================================================================
@@ -303,13 +322,12 @@ class MiNbaseNet(nn.Module):
         else:
             hyper_features = self.backbone(x)
         
-        if self.training or not self.use_fecam or len(self.class_means) == 0:
-            hyper_features_fp32 = hyper_features.to(self.weight.dtype)
-            features_buffer = self.buffer(hyper_features_fp32)
-            logits = self.forward_fc(features_buffer)
-        else:
-            logits = self.predict_fecam_internal(hyper_features)
-            
+        # Luồng chính: Analytic Classifier (ReLU ON)
+        hyper_features_fp32 = hyper_features.to(self.weight.dtype)
+        
+        # Buffer tự động dùng ReLU vì mặc định use_relu=True
+        logits = self.forward_fc(self.buffer(hyper_features_fp32))
+        
         return {'logits': logits}
 
     def extract_feature(self, x):
@@ -323,6 +341,7 @@ class MiNbaseNet(nn.Module):
         
         hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
+        
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
 
