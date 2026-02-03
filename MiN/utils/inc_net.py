@@ -338,8 +338,7 @@ class MiNbaseNet(nn.Module):
                     
                     # sum_xxT += feats.T @ feats
                     # [Tối ưu]: Dùng bmm hoặc matmul. Với k nhỏ, mm là nhanh nhất.
-                    running_stats[label_item]['sum_xxT'] += class_feats.T @ class_feats
-                    
+                    running_stats[label_item]['sum_xxT'].addmm_(class_feats.T, class_feats)
                     running_stats[label_item]['n'] += class_feats.shape[0]
 
         # 4. Tổng hợp kết quả cuối cùng từ thống kê tích lũy
