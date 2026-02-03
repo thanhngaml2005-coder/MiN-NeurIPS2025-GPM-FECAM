@@ -7,6 +7,8 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
+
+# Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
 try:
     from torch.amp import autocast
 except ImportError:
@@ -175,16 +177,16 @@ class MiNbaseNet(nn.Module):
             del term, jitter, K, X, Y 
 
     # =========================================================================
-    # [FeCAM INTEGRATION - BACKBONE ONLY - ROBUST]
+    # [FeCAM INTEGRATION - ROBUST FP32 MODE]
     # =========================================================================
     
     def _tukeys_transform(self, x, beta=0.5):
-        # [FIX NAN]: ReLU để tránh căn bậc 2 số âm
+        # [FIX NAN]: ReLU chặn số âm, Clamp chặn số vô cực
         x = F.relu(x)
+        x = torch.clamp(x, min=0.0, max=1e5) 
         return torch.pow(x, beta)
 
     def _shrink_cov(self, cov):
-        """In-place shrinkage to save memory"""
         diag = torch.diagonal(cov)
         diag_mean = torch.mean(diag)
         sum_all = torch.sum(cov)
@@ -195,27 +197,156 @@ class MiNbaseNet(nn.Module):
         
         alpha1, alpha2 = 0.01, 0.01 
         
-        # In-place modifications
         cov.add_(alpha2 * off_diag_mean)
         torch.diagonal(cov).add_(alpha1 * diag_mean - alpha2 * off_diag_mean)
         return cov
 
     def build_fecam_stats(self, train_loader):
-        """
-        Build FeCAM stats on Backbone Features (D=768).
-        Runs on GPU safely (2MB per class).
-        """
         self.eval()
         print(f"--> [FeCAM] Building Statistics (Backbone D={self.backbone.out_dim})...")
         
         running_stats = {} 
         
-        with torch.no_grad():
+        # [QUAN TRỌNG] Tắt Autocast khi build stats
+        with torch.no_grad(), autocast(enabled=False):
             for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
+                inputs = inputs.to(self.device).float() # Ép kiểu input về float32
                 targets = targets.to(self.device)
                 
-                # [QUAN TRỌNG]: Lấy features từ Backbone (768 chiều), KHÔNG qua Buffer
                 feats = self.backbone(inputs) 
                 
-                # Biến đổi Tukey (có ReLU)
+                # Sanitize Features
+                if torch.isnan(feats).any():
+                    feats = torch.nan_to_num(feats)
+                
+                feats = self._tukeys_transform(feats)
+                
+                unique_labels = torch.unique(targets)
+                for label in unique_labels:
+                    label_item = label.item()
+                    mask = (targets == label)
+                    class_feats = feats[mask]
+                    
+                    if label_item not in running_stats:
+                        D = class_feats.shape[1]
+                        running_stats[label_item] = {
+                            'sum_x': torch.zeros(D, device=self.device, dtype=torch.float32),
+                            'sum_xxT': torch.zeros((D, D), device=self.device, dtype=torch.float32),
+                            'n': 0
+                        }
+                    
+                    running_stats[label_item]['sum_x'] += class_feats.sum(dim=0)
+                    running_stats[label_item]['sum_xxT'].addmm_(class_feats.T, class_feats)
+                    running_stats[label_item]['n'] += class_feats.shape[0]
+
+        sorted_labels = sorted(running_stats.keys())
+        if self.cur_task == 0:
+            self.class_means = []
+            self.class_covs = []
+        
+        for label in sorted_labels:
+            stats = running_stats[label]
+            n = stats['n']
+            sum_x = stats['sum_x']
+            sum_xxT = stats['sum_xxT']
+            
+            mean = sum_x / n
+            if n > 1:
+                term2 = torch.outer(sum_x, sum_x) / n
+                cov = (sum_xxT - term2) / (n - 1)
+            else:
+                cov = torch.eye(mean.shape[0], device=self.device) * 1e-6
+            
+            if torch.isnan(cov).any() or torch.isinf(cov).any():
+                print(f"[Warning] Covariance matrix for class {label} corrupted. Using Identity.")
+                cov = torch.eye(mean.shape[0], device=self.device)
+
+            cov = self._shrink_cov(cov)
+            
+            self.class_means.append(mean)
+            self.class_covs.append(cov)
+            
+            del running_stats[label]
+            
+        print(f"--> [FeCAM] Stats Built. Total classes: {len(self.class_means)}")
+        del running_stats
+        torch.cuda.empty_cache()
+
+    # [FIX] Tắt Autocast trong hàm inference này
+    @torch.cuda.amp.autocast(enabled=False)
+    def predict_fecam_internal(self, feats):
+        """
+        Robust Inference with FP32 enforcement
+        """
+        # Đảm bảo đầu vào là Float32
+        feats = feats.float()
+        
+        feats = self._tukeys_transform(feats)
+        dists = []
+        JITTER = 1e-5 
+        
+        for c in range(len(self.class_means)):
+            mean = self.class_means[c].float()
+            cov = self.class_covs[c].float()
+            
+            diff = feats - mean.unsqueeze(0)
+            
+            try:
+                cov_stable = cov + torch.eye(cov.shape[0], device=cov.device) * JITTER
+                term = torch.linalg.solve(cov_stable, diff.T).T 
+            except RuntimeError:
+                try:
+                    cov_cpu = cov.detach().cpu() + torch.eye(cov.shape[0]) * JITTER
+                    inv_cov = torch.linalg.pinv(cov_cpu)
+                    term = (diff.detach().cpu() @ inv_cov).to(self.device)
+                except:
+                    term = diff
+
+            dist = torch.sum(diff * term, dim=1)
+            dists.append(dist)
+            
+        return -torch.stack(dists, dim=1)
+
+    # =========================================================================
+    # [FORWARD PASSES]
+    # =========================================================================
+
+    def forward(self, x, new_forward: bool = False):
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
+        
+        if self.training or not self.use_fecam or len(self.class_means) == 0:
+            hyper_features_fp32 = hyper_features.to(self.weight.dtype)
+            features_buffer = self.buffer(hyper_features_fp32)
+            logits = self.forward_fc(features_buffer)
+        else:
+            # Inference: Ép kiểu FP32 trước khi vào FeCAM
+            logits = self.predict_fecam_internal(hyper_features.float())
+            
+        return {'logits': logits}
+
+    def extract_feature(self, x):
+        return self.backbone(x)
+
+    def forward_normal_fc(self, x, new_forward: bool = False):
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
+        
+        hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
+        hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
+        
+        logits = self.normal_fc(hyper_features)['logits']
+        return {"logits": logits}
+
+    def collect_projections(self, mode='threshold', val=0.95):
+        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
+
+    def apply_gpm_to_grads(self, scale=1.0):
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
