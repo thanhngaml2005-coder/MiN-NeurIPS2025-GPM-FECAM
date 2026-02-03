@@ -166,7 +166,7 @@ class MinNet(object):
         # [DPCR STEP 1] Lưu trữ Stats cho Task 0 (Base Task)
         # =========================================================
         print("--> [DPCR] Initializing stats for Task 0...")
-        self._network.dpcr.update_stats(self._network, train_loader_noaug, train_list)
+        self._network.dpcr.update_stats(self._network, train_loader_noaug)
         self._network.update_fecam_stats_with_dpcr()
         
         # [DPCR STEP 2] Tạo Snapshot cho Model cũ để tính Drift sau này
@@ -229,7 +229,7 @@ class MinNet(object):
         # =========================================================
         
         # 1. Lưu Stats của Class MỚI (chưa bị drift)
-        self._network.dpcr.update_stats(self._network, train_loader_noaug, train_list)
+        self._network.dpcr.update_stats(self._network, train_loader_noaug)
         
         # 2. Sửa lỗi Drift cho các Class CŨ (dùng old_network và new_network)
         # Sử dụng dữ liệu task mới để học ma trận chuyển đổi P
