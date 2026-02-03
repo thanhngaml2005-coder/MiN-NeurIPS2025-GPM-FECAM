@@ -279,7 +279,7 @@ class MiNbaseNet(nn.Module):
         features_dict = {} # {class_id: [features]}
         
         with torch.no_grad():
-            for i, (inputs, targets) in enumerate(train_loader):
+            for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 
                 # Forward qua backbone + noise + buffer (quan trọng: dùng noise đã train)
