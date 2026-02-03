@@ -24,43 +24,41 @@ class DPCREstimator(nn.Module):
         self.feature_dim = feature_dim
         self.device = device
         
+        # Lưu trữ Covariance và Prototype (Mean) ở không gian gốc (768 dim)
         self.saved_covs = {} 
         self.saved_protos = {} 
-        self.projectors = {}
+        self.projectors = {} # Lưu SVD Projector (CIP)
 
     def get_projector_svd(self, raw_matrix):
+        """Tính SVD để lấy ma trận chiếu CIP"""
         try:
             U, S, V = torch.svd(raw_matrix + 1e-4 * torch.eye(raw_matrix.shape[0], device=self.device))
         except:
             return torch.eye(raw_matrix.shape[0], device=self.device)
+            
         non_zeros = torch.where(S > 1e-5)[0]
         if len(non_zeros) == 0:
             return torch.eye(raw_matrix.shape[0], device=self.device)
+            
         left_vecs = U[:, non_zeros]
         projector = left_vecs @ left_vecs.T
         return projector
 
-    # [FIX & OPTIMIZE]: Không cần truyền class_list nữa
     def update_stats(self, model, loader):
         """
-        Tự động quét loader và lưu stats cho TẤT CẢ class tìm thấy.
-        Nhanh hơn O(N) thay vì O(N*C).
+        [FIXED] Tự động quét và lưu stats cho TẤT CẢ class trong loader.
+        Đã thêm bước Centering Features để tính Covariance đúng.
         """
         model.eval()
         print(f"--> [DPCR] Scanning & Saving Stats (Auto-detect classes)...")
         
-        # Dictionary tạm để gom feature: key -> list of tensors
         temp_features = {}
         
         with torch.no_grad():
-            # 1. Quét 1 vòng qua Loader
             for _, inputs, targets in loader:
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # Trích xuất feature
                 feats = model.extract_feature(inputs) # [B, 768]
                 
-                # Gom vào từng xô (bucket)
                 unique_labels = torch.unique(targets)
                 for label in unique_labels:
                     label_item = label.item()
@@ -69,18 +67,21 @@ class DPCREstimator(nn.Module):
                     if label_item not in temp_features:
                         temp_features[label_item] = []
                     
-                    temp_features[label_item].append(feats[mask].cpu()) # Lưu CPU để đỡ tốn VRAM
+                    temp_features[label_item].append(feats[mask].cpu())
 
-        # 2. Tính toán Mean/Cov sau khi gom xong
         count = 0
         for c, feat_list in temp_features.items():
             if len(feat_list) == 0: continue
             
-            # Gộp lại thành 1 tensor lớn và đẩy lên GPU tính toán
             features = torch.cat(feat_list, dim=0).to(self.device).float()
             
+            # Tính Mean
             mean = torch.mean(features, dim=0)
-            cov = features.T @ features
+            
+            # [FIX CRITICAL] Centering Features: Trừ Mean trước khi nhân ma trận
+            # Covariance = (X - Mu)^T @ (X - Mu)
+            features_centered = features - mean.unsqueeze(0)
+            cov = features_centered.T @ features_centered
             
             self.saved_protos[c] = mean
             self.saved_covs[c] = cov
@@ -89,21 +90,16 @@ class DPCREstimator(nn.Module):
             
         print(f"--> [DPCR] Stats Saved. Total classes found: {count}")
         del temp_features
+
     def correct_drift(self, old_model, new_model, current_loader, known_classes):
-        """
-        Tính toán ma trận Drift và sửa lại Stats của TẤT CẢ Class CŨ.
-        """
+        """Tính toán ma trận Drift và sửa lại Stats của Class CŨ"""
         print(f"--> [DPCR] Calculating Drift Matrix & Correcting {known_classes} old classes...")
         old_model.eval()
         new_model.eval()
         
-        # 1. Tính TSSP (Task-wise Semantic Shift Projection)
-        # Gom dữ liệu task mới để học sự thay đổi từ Old -> New Model
-        # Công thức: Tìm P sao cho X_old * P = X_new
         cov_old = torch.zeros(self.feature_dim, self.feature_dim).to(self.device)
         cross_corr = torch.zeros(self.feature_dim, self.feature_dim).to(self.device)
         
-        # Dùng một phần dữ liệu task mới để tính toán (không cần toàn bộ nếu dataset lớn)
         sample_count = 0
         MAX_SAMPLES = 2000 
         
@@ -111,8 +107,8 @@ class DPCREstimator(nn.Module):
             for _, inputs, _ in current_loader:
                 inputs = inputs.to(self.device)
                 
-                feat_old = old_model.extract_feature(inputs).float() # f_t-1(x)
-                feat_new = new_model.extract_feature(inputs).float() # f_t(x)
+                feat_old = old_model.extract_feature(inputs).float() 
+                feat_new = new_model.extract_feature(inputs).float() 
                 
                 cov_old += feat_old.T @ feat_old
                 cross_corr += feat_old.T @ feat_new
@@ -120,34 +116,20 @@ class DPCREstimator(nn.Module):
                 sample_count += inputs.shape[0]
                 if sample_count > MAX_SAMPLES: break
         
-        # Giải phương trình: P = (X_old^T X_old + epsilon)^-1 @ (X_old^T X_new)
-        # P: [768, 768] - Ma trận biến đổi toàn cục
         epsilon = 1e-4 * torch.eye(self.feature_dim, device=self.device)
-        
-        # Sử dụng linalg.solve an toàn hơn nghịch đảo trực tiếp
         try:
             P_tssp = torch.linalg.solve(cov_old + epsilon, cross_corr)
         except:
             P_tssp = torch.inverse(cov_old + epsilon) @ cross_corr
         
-        # 2. Áp dụng CIP và Update Stats cũ
-        # Duyệt qua các class cũ
         corrected_count = 0
         for c in range(known_classes):
             if c not in self.saved_covs: continue
             
-            # Kết hợp TSSP và CIP (Projector riêng của class)
-            # W_c = P_tssp @ Projector_c (Projector_c là U*U^T từ SVD)
             W_c = P_tssp @ self.projectors[c]
             
-            # Update Covariance: Cov_new = W^T @ Cov_old @ W
             self.saved_covs[c] = W_c.T @ self.saved_covs[c] @ W_c
-            
-            # Update Mean: Mean_new = Mean_old @ W
-            # Lưu ý: vector nhân ma trận -> (1, D) @ (D, D)
             self.saved_protos[c] = self.saved_protos[c] @ W_c
-            
-            # Update lại Projector cho vòng sau (để task kế tiếp dùng)
             self.projectors[c] = self.get_projector_svd(self.saved_covs[c])
             corrected_count += 1
             
@@ -185,9 +167,6 @@ class BaseIncNet(nn.Module):
 
 
 class RandomBuffer(nn.Module):
-    """
-    Random Buffer: Hỗ trợ Bật/Tắt ReLU.
-    """
     def __init__(self, in_features: int, buffer_size: int, device):
         super(RandomBuffer, self).__init__()
         self.in_features = in_features
@@ -199,7 +178,6 @@ class RandomBuffer(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # Normal Init (Johnson-Lindenstrauss Lemma friendly)
         nn.init.normal_(self.W, mean=0.0, std=1.0 / math.sqrt(self.in_features))
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
@@ -346,30 +324,25 @@ class MiNbaseNet(nn.Module):
         
         with torch.no_grad():
             for c in sorted_classes:
-                # 1. Lấy Mean đã được DPCR sửa lỗi trôi (768 dim)
                 mean_768 = self.dpcr.saved_protos[c].float()
                 
-                # 2. Chiếu qua Buffer (16k dim)
-                # unsqueeze để tạo batch dimension [1, 768]
+                # Chiếu Mean qua Buffer (16k dim)
                 mean_16k = self.buffer(mean_768.unsqueeze(0)).squeeze(0)
                 
-                # 3. Robust Transform
+                # Robust Transform
                 mean_16k = self._robust_transform(mean_16k.unsqueeze(0)).squeeze(0)
                 
-                # 4. Variance:
-                # Do việc chiếu Covariance Matrix 768x768 qua Buffer 16k rất nặng,
-                # và FeCAM Hybrid chủ yếu dựa vào Mean, ta set Variance = 1 (Nearest Mean).
-                # Điều này an toàn và hiệu quả hơn là ước lượng sai Variance.
+                # FeCAM Hybrid (Nearest Mean): Set Var = 1
                 var_16k = torch.ones_like(mean_16k)
                 
                 self.class_means.append(mean_16k)
                 self.class_vars.append(var_16k)
                 
         self.buffer.use_relu = True
-        print(f"--> [FeCAM] Sync Done. Ready for Hybrid Inference. Classes: {len(self.class_means)}")
+        print(f"--> [FeCAM] Sync Done. Classes: {len(self.class_means)}")
 
     def predict_fecam_internal(self, inputs):
-        """FeCAM Inference (Logits = Negative Distance)"""
+        """FeCAM Inference"""
         self.buffer.use_relu = False
         with torch.no_grad(), autocast('cuda', enabled=False):
             if inputs.ndim == 4:
@@ -386,13 +359,16 @@ class MiNbaseNet(nn.Module):
                 mean = self.class_means[c]
                 var = self.class_vars[c]
                 
-                # Mahalanobis Distance (với Var=1 thì là Euclidean)
                 diff_sq = (feats - mean.unsqueeze(0)) ** 2
-                dist = torch.sum(diff_sq / (var + 1e-6), dim=1)
+                
+                # [FIX SCALE] Chia cho sqrt(D) để giảm magnitude của khoảng cách
+                D = feats.shape[1]
+                dist = torch.sum(diff_sq / (var + 1e-6), dim=1) / math.sqrt(D)
+                
                 dists.append(dist)
                 
         self.buffer.use_relu = True
-        # Trả về số âm vì distance càng nhỏ càng tốt => Logits càng lớn
+        # Trả về số âm: Distance nhỏ -> Logits lớn
         return -torch.stack(dists, dim=1)
 
     # --- Các hàm khác ---
