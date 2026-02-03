@@ -249,15 +249,19 @@ class MiNbaseNet(nn.Module):
     # [FeCAM INTEGRATION SECTION - CPU OPTIMIZED]
     # =========================================================================
     
+    # =========================================================================
+    # [FeCAM INTEGRATION SECTION - GPU STREAMING OPTIMIZED]
+    # =========================================================================
+    
     def _tukeys_transform(self, x, beta=0.5):
-        """Tukey's transformation"""
+        """Tukey's transformation (GPU)"""
         return torch.pow(x, beta)
 
     def _shrink_cov(self, cov):
         """
-        Co ngót ma trận hiệp phương sai.
-        Chạy trên thiết bị của tensor 'cov' (nên là CPU để tránh OOM)
+        Co ngót ma trận hiệp phương sai trên GPU.
         """
+        # Tính trên GPU rất nhanh
         diag_mean = torch.mean(torch.diagonal(cov))
         off_diag = cov.clone()
         off_diag.fill_diagonal_(0.0)
@@ -268,8 +272,7 @@ class MiNbaseNet(nn.Module):
         else:
             off_diag_mean = 0.0
             
-        # Tạo identity matrix trên cùng device với cov
-        iden = torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+        iden = torch.eye(cov.shape[0], device=cov.device)
         
         alpha1 = 0.01
         alpha2 = 0.01 
@@ -278,69 +281,98 @@ class MiNbaseNet(nn.Module):
 
     def build_fecam_stats(self, train_loader):
         """
-        Tính toán Prototypes và Covariance Matrix cho các lớp mới.
-        [FIX OOM]: Tính toán hoàn toàn trên CPU.
+        Tính toán FeCAM trên GPU theo cơ chế Streaming (Online Update).
+        Không bao giờ bị OOM vì không lưu features thô.
         """
         self.eval()
-        print(f"--> [FeCAM] Building Statistics for Task {self.cur_task} (CPU Mode)...")
+        print(f"--> [FeCAM] Building Statistics for Task {self.cur_task} (GPU Streaming)...")
         
-        # Dictionary lưu features trên CPU
-        features_dict = {} 
+        # Dictionary lưu thống kê tạm thời: {class_id: {'sum_x': vector, 'sum_xxT': matrix, 'n': count}}
+        running_stats = {} 
         
-        # 1. Trích xuất features
         with torch.no_grad():
+            # Thêm _ để unpack đúng 3 giá trị từ dataloader
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
+                targets = targets.to(self.device) # Target cũng lên GPU
                 
-                # Forward lấy feature (Vẫn chạy trên GPU cho nhanh)
+                # 1. Forward lấy feature (GPU)
                 feats = self.backbone(inputs)
                 feats = self.buffer(feats) 
                 
-                # Chuyển ngay về CPU để giải phóng VRAM
-                feats = feats.detach().cpu()
+                # 2. Tukey transform (GPU)
+                feats = self._tukeys_transform(feats) # [B, D]
                 
-                # Tukey transform (làm trên CPU)
-                feats = self._tukeys_transform(feats)
+                # 3. Cập nhật thống kê theo từng lớp trong batch hiện tại
+                unique_labels = torch.unique(targets)
                 
-                targets = targets.numpy() # targets đã ở cpu sẵn do dataloader
-                for idx in range(len(targets)):
-                    label = targets[idx]
-                    if label not in features_dict:
-                        features_dict[label] = []
-                    features_dict[label].append(feats[idx])
+                for label in unique_labels:
+                    label_item = label.item()
+                    
+                    # Lọc các sample thuộc class này
+                    mask = (targets == label)
+                    class_feats = feats[mask] # [k, D]
+                    
+                    if label_item not in running_stats:
+                        D = class_feats.shape[1]
+                        running_stats[label_item] = {
+                            'sum_x': torch.zeros(D, device=self.device),
+                            'sum_xxT': torch.zeros((D, D), device=self.device),
+                            'n': 0
+                        }
+                    
+                    # Cập nhật tích lũy
+                    # sum_x += sum(feats)
+                    running_stats[label_item]['sum_x'] += class_feats.sum(dim=0)
+                    
+                    # sum_xxT += feats.T @ feats
+                    # [Tối ưu]: Dùng bmm hoặc matmul. Với k nhỏ, mm là nhanh nhất.
+                    running_stats[label_item]['sum_xxT'] += class_feats.T @ class_feats
+                    
+                    running_stats[label_item]['n'] += class_feats.shape[0]
 
-        # Giải phóng cache GPU ngay lập tức sau khi extract xong
-        torch.cuda.empty_cache()
-
-        # 2. Tính Mean và Covariance trên CPU
-        sorted_labels = sorted(features_dict.keys())
+        # 4. Tổng hợp kết quả cuối cùng từ thống kê tích lũy
+        # Công thức Cov(X) = (sum_xxT - (sum_x * sum_x.T) / n) / (n - 1)
+        
+        sorted_labels = sorted(running_stats.keys())
         
         if self.cur_task == 0:
             self.class_means = []
             self.class_covs = []
         
         for label in sorted_labels:
-            # Stack features: [N, D] trên CPU
-            class_feats = torch.stack(features_dict[label])
+            stats = running_stats[label]
+            n = stats['n']
+            sum_x = stats['sum_x']
+            sum_xxT = stats['sum_xxT']
             
-            # Tính Mean (Prototype) trên CPU
-            mean = torch.mean(class_feats, dim=0)
+            # Tính Mean
+            mean = sum_x / n
             
-            # Tính Covariance trên CPU
-            cov = torch.cov(class_feats.T)
+            # Tính Covariance Matrix
+            if n > 1:
+                # E[XX^T] - E[X]E[X]^T
+                # Dùng outer product cho số hạng thứ 2: (sum_x.unsqueeze(1) @ sum_x.unsqueeze(0))
+                term2 = torch.outer(sum_x, sum_x) / n
+                cov = (sum_xxT - term2) / (n - 1)
+            else:
+                # Fallback nếu chỉ có 1 sample (hiếm gặp)
+                cov = torch.eye(mean.shape[0], device=self.device) * 1e-6
             
-            # Shrinkage trên CPU
+            # Shrinkage (Vẫn trên GPU)
             cov = self._shrink_cov(cov)
             
-            # CHỈ ĐẨY KẾT QUẢ CUỐI CÙNG LÊN GPU (Rất nhẹ, ~2MB/class)
-            self.class_means.append(mean.to(self.device))
-            self.class_covs.append(cov.to(self.device))
-            del features_dict[label]
+            # Lưu kết quả
+            self.class_means.append(mean)
+            self.class_covs.append(cov)
+            
+            # Giải phóng bộ nhớ tạm của class này ngay lập tức
+            del running_stats[label]
+            
         print(f"--> [FeCAM] Updated stats. Total classes: {len(self.class_means)}")
         
-        del features_dict
-        import gc
-        gc.collect()
+        # Dọn dẹp
+        del running_stats
         torch.cuda.empty_cache()
     def predict_fecam(self, x):
         """
