@@ -133,8 +133,7 @@ class MinNet(object):
         self._network.update_noise()
         
         self._clear_gpu()
-        
-        1. Train Noise (với GPM)
+       
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
         
