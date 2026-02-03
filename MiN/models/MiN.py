@@ -335,16 +335,15 @@ class MinNet(object):
         self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
         return scale
     def run(self, train_loader):
+        # Tắt FeCAM khi train noise
         self._network.use_fecam = False
-    
+        
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # [TỐI ƯU 2]: Tính scale một lần đầu task
         current_scale = 0.85 
         if self.cur_task > 0:
-            # Đảm bảo bạn đã thêm hàm compute_adaptive_scale vào class MinNet nhé
             current_scale = self.compute_adaptive_scale(train_loader)
 
         # Freeze/Unfreeze Logic
@@ -364,6 +363,11 @@ class MinNet(object):
 
         WARMUP_EPOCHS = 2
 
+        # [FIX OOM]: Dọn rác trước khi vào loop
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
@@ -372,11 +376,12 @@ class MinNet(object):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 optimizer.zero_grad(set_to_none=True) 
 
-                # Tự động detect device cho autocast
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
-                            logits1 = self._network(inputs, new_forward=False)['logits']
+                            # [Optimization]: Detach ngay để không lưu graph
+                            logits1 = self._network(inputs, new_forward=False)['logits'].detach()
+                        
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                         logits_final = logits2 + logits1
                     else:
@@ -384,18 +389,13 @@ class MinNet(object):
                     
                     loss = F.cross_entropy(logits_final, targets.long())
 
-                # [TỐI ƯU 3]: Dùng self.scaler
                 self.scaler.scale(loss).backward()
                 
-                # Logic GPM + Warmup
                 if self.cur_task > 0:
-                    # Đã vào task > 0 thì check epoch thôi
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
-                        # Áp dụng Adaptive Scale
                         self._network.apply_gpm_to_grads(scale=0.85)
                     else:
-                        # Warm-up: Thả trôi gradient để học nhanh
                         pass
                 
                 self.scaler.step(optimizer)
@@ -406,8 +406,9 @@ class MinNet(object):
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                # Cleanup
+                # [FIX OOM]: Xóa biến ngay lập tức
                 del inputs, targets, loss, logits_final
+                if self.cur_task > 0: del logits1, logits2
 
             scheduler.step()
             train_acc = 100. * correct / total
@@ -419,18 +420,14 @@ class MinNet(object):
             prog_bar.set_description(info)
             print(info)
             
-            # Clear cache định kỳ
-            if epoch % 5 == 0:
+            # [FIX OOM]: Dọn rác System RAM định kỳ
+            if epoch % 2 == 0:
+                gc.collect()
                 self._clear_gpu()
+        
         del optimizer, scheduler
-        # Xóa các biến tạm nếu còn sót
-        try:
-            del losses, correct, total
-        except: pass
+        self._clear_gpu()
         
-        self._clear_gpu() # Gọi dọn rác triệt để
-        
-        # Bật lại FeCAM sau khi train xong
         self._network.use_fecam = True
     def eval_task(self, test_loader):
         self._network.use_fecam = True
