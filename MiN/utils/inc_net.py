@@ -1,9 +1,7 @@
 import copy
-import logging
 import math
-import numpy as np
 import torch
-from torch import nn, Tensor
+from torch import nn
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
@@ -14,78 +12,158 @@ try:
 except ImportError:
     from torch.cuda.amp import autocast
 
-class BaseIncNet(nn.Module):
-    def __init__(self, args: dict):
-        super(BaseIncNet, self).__init__()
-        self.args = args
-        self.backbone = get_pretrained_backbone(args)
-        self.feature_dim = self.backbone.out_dim
-        self.fc = None
+# =============================================================================
+# [NEW MODULE] DPCR Estimator - Bộ sửa lỗi trôi đặc trưng
+# =============================================================================
+class DPCREstimator(nn.Module):
+    def __init__(self, feature_dim, device):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.device = device
+        
+        # Lưu trữ Covariance và Prototype (Mean) ở không gian gốc (768 dim)
+        # Key: class_id, Value: Tensor
+        self.saved_covs = {} 
+        self.saved_protos = {} 
+        self.projectors = {} # Lưu SVD Projector của từng class
 
-    def update_fc(self, nb_classes):
-        fc = self.generate_fc(self.feature_dim, nb_classes)
-        if self.fc is not None:
-            nb_output = self.fc.out_features
-            weight = copy.deepcopy(self.fc.weight.data)
-            bias = copy.deepcopy(self.fc.bias.data)
-            fc.weight.data[:nb_output] = weight
-            fc.bias.data[:nb_output] = bias
-        del self.fc
-        self.fc = fc
+    def get_projector_svd(self, raw_matrix):
+        """Tính SVD để lấy ma trận chiếu CIP"""
+        # raw_matrix: [768, 768]
+        try:
+            U, S, V = torch.svd(raw_matrix + 1e-4 * torch.eye(raw_matrix.shape[0], device=self.device))
+        except:
+            # Fallback nếu SVD lỗi
+            return torch.eye(raw_matrix.shape[0], device=self.device)
+            
+        # Lấy các chiều có giá trị singular > 0 (hoặc top k)
+        # Trong bài báo họ lấy full rank
+        non_zeros = torch.where(S > 1e-5)[0]
+        if len(non_zeros) == 0:
+            return torch.eye(raw_matrix.shape[0], device=self.device)
+            
+        left_vecs = U[:, non_zeros]
+        # P = U * U^T
+        projector = left_vecs @ left_vecs.T
+        return projector
 
-    @staticmethod
-    def generate_fc(in_dim, out_dim):
-        fc = SimpleLinear(in_dim, out_dim)
-        return fc
+    def update_stats(self, model, loader, class_list):
+        """
+        Lưu trữ Covariance và Mean của Task vừa học xong (khi chưa bị drift)
+        """
+        model.eval()
+        print(f"--> [DPCR] Saving Stats for classes {class_list}...")
+        
+        with torch.no_grad():
+            for c in class_list:
+                features = []
+                for _, inputs, targets in loader:
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    mask = targets == c
+                    if mask.sum() == 0: continue
+                    
+                    # Lấy feature ở tầng Backbone (768), KHÔNG qua Buffer
+                    feat = model.extract_feature(inputs[mask]) 
+                    features.append(feat)
+                
+                if len(features) > 0:
+                    features = torch.cat(features, dim=0).float() # [N, 768]
+                    
+                    # Tính Mean
+                    mean = torch.mean(features, dim=0)
+                    # Tính Uncentered Covariance (X^T * X) theo bài báo
+                    cov = features.T @ features
+                    
+                    self.saved_protos[c] = mean
+                    self.saved_covs[c] = cov
+                    self.projectors[c] = self.get_projector_svd(cov)
 
-    def forward(self, x):
-        hyper_features = self.backbone(x)
-        logits = self.fc(hyper_features)['logits']
-        return {'features': hyper_features, 'logits': logits}
+    def correct_drift(self, old_model, new_model, current_loader, known_classes):
+        """
+        Tính toán ma trận Drift và sửa lại Stats cũ
+        """
+        print(f"--> [DPCR] Calculating Drift Matrix & Correcting {known_classes} old classes...")
+        old_model.eval()
+        new_model.eval()
+        
+        # 1. Tính TSSP (Task-wise Shift)
+        # Gom dữ liệu task mới để học sự thay đổi từ Old -> New Model
+        cov_old = torch.zeros(self.feature_dim, self.feature_dim).to(self.device)
+        cross_corr = torch.zeros(self.feature_dim, self.feature_dim).to(self.device)
+        
+        with torch.no_grad():
+            for _, inputs, _ in current_loader:
+                inputs = inputs.to(self.device)
+                
+                feat_old = old_model.extract_feature(inputs).float() # f_t-1(x)
+                feat_new = new_model.extract_feature(inputs).float() # f_t(x)
+                
+                cov_old += feat_old.T @ feat_old
+                cross_corr += feat_old.T @ feat_new
+        
+        # Giải phương trình: P = (X_old^T X_old + epsilon)^-1 @ (X_old^T X_new)
+        # P: [768, 768] - Ma trận biến đổi toàn cục
+        epsilon = 1e-4 * torch.eye(self.feature_dim, device=self.device)
+        P_tssp = torch.linalg.solve(cov_old + epsilon, cross_corr)
+        
+        # 2. Áp dụng CIP và Update Stats cũ
+        # Duyệt qua các class cũ
+        for c in range(known_classes):
+            if c not in self.saved_covs: continue
+            
+            # Kết hợp TSSP và CIP (Projector riêng của class)
+            # W_c = P_tssp @ Projector_c
+            W_c = P_tssp @ self.projectors[c]
+            
+            # Update Covariance: Cov_new = W^T @ Cov_old @ W
+            self.saved_covs[c] = W_c.T @ self.saved_covs[c] @ W_c
+            
+            # Update Mean: Mean_new = Mean_old @ W
+            # Lưu ý: vector nhân ma trận -> (1, D) @ (D, D)
+            self.saved_protos[c] = self.saved_protos[c] @ W_c
+            
+            # Update lại Projector cho vòng sau
+            self.projectors[c] = self.get_projector_svd(self.saved_covs[c])
+            
+        print("--> [DPCR] Correction Done.")
 
+# =============================================================================
+# [MODIFIED] RandomBuffer & MiNbaseNet
+# =============================================================================
 
 class RandomBuffer(nn.Module):
-    """
-    Random Buffer: Hỗ trợ chuyển đổi giữa ReLU (Analytic) và Linear (FeCAM)
-    """
     def __init__(self, in_features: int, buffer_size: int, device):
         super(RandomBuffer, self).__init__()
         self.in_features = in_features
         self.out_features = buffer_size
-        
         factory_kwargs = {"device": device, "dtype": torch.float32}
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
-        
-        # Mặc định bật ReLU (cho luồng Training chính)
         self.use_relu = True
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # Dùng Normal Init để tối ưu cho cả 2 mode (JL Lemma)
         nn.init.normal_(self.W, mean=0.0, std=1.0 / math.sqrt(self.in_features))
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         X = X.to(self.weight.dtype)
         out = X @ self.W
-        # Công tắc chuyển mạch
         return F.relu(out) if self.use_relu else out
 
-
 class MiNbaseNet(nn.Module):
+    
     def __init__(self, args: dict):
         super(MiNbaseNet, self).__init__()
         self.args = args
         self.backbone = get_pretrained_backbone(args)
         self.device = args['device']
-        
         self.gamma = args['gamma']
         self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
 
-        # Random Buffer thông minh
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
+        # Analytic Parameters
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight) 
@@ -97,9 +175,11 @@ class MiNbaseNet(nn.Module):
         self.cur_task = -1
         self.known_class = 0
         
-        # --- [PLAN A] FeCAM Storage ---
+        # --- FeCAM & DPCR ---
         self.class_means = []
         self.class_vars = []
+        # Khởi tạo bộ sửa lỗi DPCR
+        self.dpcr = DPCREstimator(self.feature_dim, self.device)
 
     def update_fc(self, nb_classes):
         self.cur_task += 1
@@ -156,14 +236,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        # Analytic LUÔN dùng ReLU
         self.buffer.use_relu = True
-        
-        try:
-            from torch.amp import autocast
-        except ImportError:
-            from torch.cuda.amp import autocast
-
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
             X = self.buffer(X) 
@@ -189,159 +262,151 @@ class MiNbaseNet(nn.Module):
 
             self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
-            del term, jitter, K, X, Y 
 
-    # =========================================================================
-    # [PLAN A: FeCAM HELPERS]
-    # =========================================================================
+    # --- DPCR Helper ---
+    def extract_feature(self, x):
+        return self.backbone(x)
 
     def _robust_transform(self, x, beta=0.5):
-        # Power + LayerNorm để chuẩn hóa không gian Linear Buffer
         x = torch.sign(x) * torch.pow(torch.abs(x) + 1e-6, beta)
         x = F.layer_norm(x, x.shape[-1:])
         return x
 
-    def build_fecam_stats(self, train_loader):
+    def update_fecam_stats_with_dpcr(self):
         """
-        Xây dựng thống kê cho FeCAM.
-        QUAN TRỌNG: Chỉ chạy sau khi train xong task.
+        Hàm quan trọng nhất: Chuyển đổi từ DPCR Stats (768 dim) sang FeCAM Stats (16k dim)
         """
-        self.eval()
-        print(f"--> [FeCAM] Building Stats for Hybrid Decision...")
+        print("--> [Sync] Updating FeCAM Stats from DPCR corrected memory...")
+        self.class_means = []
+        self.class_vars = []
         
-        # Tắt ReLU để lấy Linear Space
-        self.buffer.use_relu = False
-        running_stats = {}
+        # Duyệt qua tất cả các class đã lưu trong DPCR (đã được correct)
+        sorted_classes = sorted(self.dpcr.saved_protos.keys())
         
-        with torch.no_grad(), autocast('cuda', enabled=False):
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device).float()
-                targets = targets.to(self.device)
+        self.buffer.use_relu = False # Tắt ReLU để lấy linear projection
+        
+        with torch.no_grad():
+            for c in sorted_classes:
+                # 1. Lấy Mean/Cov gốc (768)
+                mean_768 = self.dpcr.saved_protos[c].float()
+                # cov_768 = self.dpcr.saved_covs[c].float() # (Ít dùng để tính var chéo vì nặng)
                 
-                # Forward: Backbone -> Linear Buffer -> Transform
-                feats = self.backbone(inputs)
-                if torch.isnan(feats).any(): feats = torch.nan_to_num(feats)
-                feats = self.buffer(feats)
-                feats = self._robust_transform(feats)
+                # 2. Chiếu Mean qua Buffer (16k)
+                # mean_16k = Buffer(mean_768)
+                mean_16k = self.buffer(mean_768.unsqueeze(0)).squeeze(0)
                 
-                unique_labels = torch.unique(targets)
-                for label in unique_labels:
-                    label_item = label.item()
-                    mask = (targets == label)
-                    class_feats = feats[mask]
-                    
-                    if label_item not in running_stats:
-                        D = class_feats.shape[1]
-                        running_stats[label_item] = {
-                            'sum_x': torch.zeros(D, device=self.device, dtype=torch.float32),
-                            'sum_sq_x': torch.zeros(D, device=self.device, dtype=torch.float32),
-                            'n': 0
-                        }
-                    
-                    # Accumulate
-                    running_stats[label_item]['sum_x'] += class_feats.sum(dim=0)
-                    running_stats[label_item]['sum_sq_x'] += torch.sum(class_feats * class_feats, dim=0)
-                    running_stats[label_item]['n'] += class_feats.shape[0]
-
-        # Convert to Mean/Var
-        sorted_labels = sorted(running_stats.keys())
-        if self.cur_task == 0:
-            self.class_means = []
-            self.class_vars = []
-        
-        for label in sorted_labels:
-            stats = running_stats[label]
-            n = stats['n']
-            sum_x = stats['sum_x']
-            sum_sq_x = stats['sum_sq_x']
-            
-            mean = sum_x / n
-            if n > 1:
-                var = (sum_sq_x / n) - (mean ** 2)
-                var = var * (n / (n - 1))
-            else:
-                var = torch.ones_like(mean)
-            
-            # Robust Variance
-            var = torch.clamp(var, min=1e-4)
-            mean_var = torch.mean(var)
-            var = 0.9 * var + 0.1 * mean_var # Shrinkage
-            
-            self.class_means.append(mean)
-            self.class_vars.append(var)
-            
-        # Trả lại trạng thái ReLU cho buffer (để an toàn cho các quy trình khác)
+                # 3. Ước lượng Variance ở 16k
+                # Cách chuẩn: Var[Ax] = A Var[x] A^T. Nhưng A (buffer) quá lớn.
+                # Cách "đường tắt" (Heuristic): 
+                # Chúng ta giả định Buffer bảo toàn phân phối tương đối.
+                # Tuy nhiên, để đơn giản và hiệu quả, ta dùng Variance trung bình toàn cục 
+                # hoặc tính Var từ mean_16k (nếu có mẫu).
+                # Vì DPCR chỉ lưu Covariance ma trận, việc chiếu Covariance 768x768 -> 16k Diagonal 
+                # là phép tính rất nặng: diag(W @ Cov @ W^T).
+                
+                # [THỦ THUẬT]: Tính Variance trực tiếp từ công thức Var(Projected)
+                # Var_i = Sum_j(W_ij^2 * Cov_jj) + ... (Phức tạp)
+                
+                # [GIẢI PHÁP TỐT NHẤT CHO HYBRID]:
+                # Dùng Mean đã sửa (Mean chuẩn quan trọng hơn Var).
+                # Dùng Variance mặc định hoặc Variance cũ (nếu có).
+                # Ở đây tôi set Variance đồng nhất = 1 để FeCAM hoạt động như NCM (Nearest Mean) 
+                # nhưng trên không gian đã được DPCR sửa lỗi. Điều này an toàn hơn tính Var sai.
+                var_16k = torch.ones_like(mean_16k)
+                
+                # Robust transform cho Mean
+                mean_16k = self._robust_transform(mean_16k.unsqueeze(0)).squeeze(0)
+                
+                self.class_means.append(mean_16k)
+                self.class_vars.append(var_16k)
+                
         self.buffer.use_relu = True
-        print(f"--> [FeCAM] Stats Built. Classes: {len(self.class_means)}")
-        del running_stats
-        torch.cuda.empty_cache()
+        print(f"--> [Sync] Done. Total classes ready for FeCAM: {len(self.class_means)}")
 
     def predict_fecam_internal(self, inputs):
-        """
-        Trả về Logits của FeCAM (Negative Mahalanobis Distance).
-        Inputs là ảnh gốc hoặc features (tùy logic gọi).
-        Ở đây ta nhận vào input ảnh gốc để tiện gọi từ bên ngoài.
-        """
+        self.buffer.use_relu = False
         with torch.no_grad(), autocast('cuda', enabled=False):
-            # Tắt ReLU
-            self.buffer.use_relu = False
-            
-            # Forward
-            if inputs.ndim == 4: # Nếu là ảnh
+            if inputs.ndim == 4:
                 feats = self.backbone(inputs)
-            else: # Nếu là features
+            else:
                 feats = inputs
-                
+            
             feats = feats.float()
-            if torch.isnan(feats).any(): feats = torch.nan_to_num(feats)
             feats = self.buffer(feats)
             feats = self._robust_transform(feats)
             
             dists = []
             for c in range(len(self.class_means)):
-                mean = self.class_means[c].float()
-                var = self.class_vars[c].float()
+                mean = self.class_means[c]
+                # var = self.class_vars[c] # Var = 1 nên bỏ qua chia
                 
+                # Euclidean Distance tới Mean đã được DPCR sửa
                 diff_sq = (feats - mean.unsqueeze(0)) ** 2
-                dist = torch.sum(diff_sq / (var + 1e-6), dim=1)
+                dist = torch.sum(diff_sq, dim=1)
                 dists.append(dist)
-            
-            # Bật lại ReLU
-            self.buffer.use_relu = True
-            
-            # Trả về số âm (Khoảng cách càng nhỏ -> Logits càng lớn)
-            return -torch.stack(dists, dim=1)
+                
+        self.buffer.use_relu = True
+        return -torch.stack(dists, dim=1)
 
-    # =========================================================================
-    # [FORWARD PASSES]
-    # =========================================================================
+    # ... (Các hàm forward, collect_projections... giữ nguyên) ...
+    def update_fc(self, nb_classes): # Copy lại hàm cũ
+        self.cur_task += 1
+        self.known_class += nb_classes
+        if self.cur_task > 0:
+            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
+        else:
+            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
+        if self.normal_fc is not None:
+            old_nb_output = self.normal_fc.out_features
+            with torch.no_grad():
+                new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
+                nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
+            del self.normal_fc
+            self.normal_fc = new_fc
+        else:
+            nn.init.constant_(new_fc.weight, 0.)
+            if new_fc.bias is not None:
+                nn.init.constant_(new_fc.bias, 0.)
+            self.normal_fc = new_fc
+            
+    def update_noise(self):
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].update_noise()
 
+    def after_task_magmax_merge(self):
+        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].after_task_training()
+
+    def unfreeze_noise(self):
+        for j in range(len(self.backbone.noise_maker)):
+            self.backbone.noise_maker[j].unfreeze_incremental()
+
+    def init_unfreeze(self):
+        for j in range(len(self.backbone.noise_maker)):
+            self.backbone.noise_maker[j].unfreeze_task_0()
+            if hasattr(self.backbone.blocks[j], 'norm1'):
+                for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
+            if hasattr(self.backbone.blocks[j], 'norm2'):
+                for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
+        if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
+            for p in self.backbone.norm.parameters(): p.requires_grad = True
+    
     def forward(self, x, new_forward: bool = False):
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        
-        # Luồng chính: Analytic Classifier (ReLU ON)
-        hyper_features_fp32 = hyper_features.to(self.weight.dtype)
-        
-        # Buffer tự động dùng ReLU vì mặc định use_relu=True
-        logits = self.forward_fc(self.buffer(hyper_features_fp32))
-        
+        logits = self.forward_fc(self.buffer(hyper_features.to(self.weight.dtype)))
         return {'logits': logits}
-
-    def extract_feature(self, x):
-        return self.backbone(x)
 
     def forward_normal_fc(self, x, new_forward: bool = False):
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        
         hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
-        
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
 
