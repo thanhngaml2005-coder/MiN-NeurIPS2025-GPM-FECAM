@@ -116,7 +116,11 @@ class DPCREstimator(nn.Module):
                 sample_count += inputs.shape[0]
                 if sample_count > MAX_SAMPLES: break
         
-        epsilon = 1e-4 * torch.eye(self.feature_dim, device=self.device)
+        # [CHỈNH Ở ĐÂY]: Đổi 1e-4 thành 1e-5 để sát với config DPCR hơn (rg_tssp)
+        # Giá trị này nhỏ để đảm bảo Drift Matrix được tính chính xác (Tight fit)
+        RG_TSSP = 1e-5 
+        epsilon = RG_TSSP * torch.eye(self.feature_dim, device=self.device)
+        
         try:
             P_tssp = torch.linalg.solve(cov_old + epsilon, cross_corr)
         except:
@@ -134,8 +138,6 @@ class DPCREstimator(nn.Module):
             corrected_count += 1
             
         print(f"--> [DPCR] Correction Done for {corrected_count} classes.")
-
-
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
