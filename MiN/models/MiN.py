@@ -23,8 +23,6 @@ except ImportError:
 class MinNet(object):
     def __init__(self, args, loger):
         super().__init__()
-        
-        # [USER REQUEST] Giữ nguyên config gốc, không can thiệp gamma.
         self.args = args
         self.logger = loger
         self._network = MiNbaseNet(args)
@@ -54,8 +52,6 @@ class MinNet(object):
         self.total_acc = []
         
         self.scaler = GradScaler('cuda')
-        
-        # [DPCR] Snapshot Model cũ
         self._old_network = None
 
     def _clear_gpu(self):
@@ -75,7 +71,6 @@ class MinNet(object):
         test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
                                  num_workers=self.num_workers)
         
-        # [EVAL] Đánh giá bằng Hybrid Mode
         eval_res = self.eval_task(test_loader)
         
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
@@ -91,33 +86,26 @@ class MinNet(object):
         torch.save(self._network.state_dict(), path_name)
 
     # =========================================================================
-    # [FIXED EVAL] Softmax Ensemble Strategy
+    # [EVALUATION] Softmax Ensemble (Analytic + FeCAM)
     # =========================================================================
 
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
-        
-        # [TUNING] Hệ số hòa trộn. 
-        # Vì đã có Correction Factor cho Variance, FeCAM sẽ ổn định hơn.
-        LAMBDA = 0.2 
+        LAMBDA = 0.6 
         
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                
                 outputs = model(inputs)
                 logits_anal = outputs["logits"]
                 
                 if len(model.class_means) > 0:
                     logits_fecam = model.predict_fecam_internal(inputs)
                     
-                    # [SOFTMAX ENSEMBLE]
-                    # Chuyển về xác suất để giữ thông tin độ tin cậy (Confidence)
                     prob_anal = F.softmax(logits_anal, dim=1)
                     prob_fecam = F.softmax(logits_fecam, dim=1)
                     
-                    # Cộng xác suất (Probability Averaging)
                     final_prob = prob_anal + LAMBDA * prob_fecam
                     predicts = torch.max(final_prob, dim=1)[1]
                 else:
@@ -130,12 +118,11 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        LAMBDA = 0.2 # Đồng bộ với hàm trên
+        LAMBDA = 0.6
         
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                
                 outputs = model(inputs)
                 logits_anal = outputs["logits"]
                 
@@ -213,11 +200,15 @@ class MinNet(object):
 
         self.re_fit(train_loader_noaug, test_loader_buf)
         
-        print("--> [DPCR] Initializing stats for Task 0...")
-        self._network.dpcr.update_stats(self._network, train_loader_noaug)
-        self._network.update_fecam_stats_with_dpcr()
+        # [FIX TASK 0] Tính FeCAM trực tiếp từ dữ liệu thật (Không qua DPCR/Sampling)
+        print("--> [FeCAM] Initializing Task 0 Stats directly from Data...")
+        self._network.compute_fecam_stats_direct(train_loader_noaug)
         
-        # [DPCR] Snapshot Model cũ
+        # [DPCR] Vẫn cần update DPCR để phục vụ cho Task 1 (lưu Raw Stats)
+        print("--> [DPCR] Initializing DPCR stats for future drift correction...")
+        self._network.dpcr.update_stats(self._network, train_loader_noaug)
+        
+        # Snapshot
         self._old_network = copy.deepcopy(self._network)
         self._old_network.eval()
         for p in self._old_network.parameters(): p.requires_grad = False
@@ -270,12 +261,12 @@ class MinNet(object):
 
         self.re_fit(train_loader_noaug, test_loader)
         
-        # [DPCR STEP 3] Xử lý Drift và Update Stats
+        # [DPCR STEP 3]
         
-        # 1. Lưu Stats MỚI (chưa drift)
+        # 1. Stats MỚI (Raw features)
         self._network.dpcr.update_stats(self._network, train_loader_noaug)
         
-        # 2. Sửa lỗi Drift CŨ (TSSP + CIP)
+        # 2. Correct Drift
         self._network.dpcr.correct_drift(
             old_model=self._old_network, 
             new_model=self._network, 
@@ -283,10 +274,10 @@ class MinNet(object):
             known_classes=self.known_class - self.increment
         )
         
-        # 3. Đồng bộ DPCR -> FeCAM (Corrected Generative Replay + Correction Factor)
+        # 3. FeCAM Update (Corrected Generative Replay + Tukey)
         self._network.update_fecam_stats_with_dpcr()
         
-        # 4. Update Snapshot
+        # 4. Snapshot
         self._old_network = copy.deepcopy(self._network)
         self._old_network.eval()
         for p in self._old_network.parameters(): p.requires_grad = False
