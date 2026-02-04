@@ -11,24 +11,20 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
 # Import Mixed Precision
-from torch.amp import autocast, GradScaler
-
-EPSILON = 1e-8
+try:
+    from torch.amp import autocast, GradScaler
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
 
 class MinNet(object):
     def __init__(self, args, loger):
         super().__init__()
         
-        # [USER REQUEST] Giữ nguyên gamma từ config, KHÔNG tự ý chỉnh sửa.
-        # self.args['gamma'] = 2000  <-- ĐÃ XÓA
-        
+        # [USER REQUEST] Giữ nguyên config gốc, không can thiệp gamma.
         self.args = args
         self.logger = loger
         self._network = MiNbaseNet(args)
@@ -56,12 +52,10 @@ class MinNet(object):
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        self.class_acc = []
-        self.task_acc = []
         
         self.scaler = GradScaler('cuda')
         
-        # [DPCR] Biến lưu trữ mạng cũ để tính Drift
+        # [DPCR] Snapshot Model cũ
         self._old_network = None
 
     def _clear_gpu(self):
@@ -104,7 +98,8 @@ class MinNet(object):
         model = self._network.eval()
         correct, total = 0, 0
         
-        # Hệ số hòa trộn xác suất
+        # [TUNING] Hệ số hòa trộn. 
+        # Vì đã có Correction Factor cho Variance, FeCAM sẽ ổn định hơn.
         LAMBDA = 0.6 
         
         with torch.no_grad(), autocast('cuda'):
@@ -117,7 +112,8 @@ class MinNet(object):
                 if len(model.class_means) > 0:
                     logits_fecam = model.predict_fecam_internal(inputs)
                     
-                    # [SOFTMAX] Chuyển về xác suất để giữ thông tin độ tin cậy
+                    # [SOFTMAX ENSEMBLE]
+                    # Chuyển về xác suất để giữ thông tin độ tin cậy (Confidence)
                     prob_anal = F.softmax(logits_anal, dim=1)
                     prob_fecam = F.softmax(logits_fecam, dim=1)
                     
@@ -146,7 +142,6 @@ class MinNet(object):
                 if len(model.class_means) > 0:
                     logits_fecam = model.predict_fecam_internal(inputs)
                     
-                    # [SOFTMAX] Chuyển về xác suất
                     prob_anal = F.softmax(logits_anal, dim=1)
                     prob_fecam = F.softmax(logits_fecam, dim=1)
                     
@@ -288,7 +283,7 @@ class MinNet(object):
             known_classes=self.known_class - self.increment
         )
         
-        # 3. Đồng bộ DPCR -> FeCAM (Có Variance Sampling)
+        # 3. Đồng bộ DPCR -> FeCAM (Corrected Generative Replay + Correction Factor)
         self._network.update_fecam_stats_with_dpcr()
         
         # 4. Update Snapshot
@@ -299,7 +294,7 @@ class MinNet(object):
         del train_set_noaug, test_set
         self._clear_gpu()
 
-    # --- Các hàm hỗ trợ (fit_fc, run, re_fit...) GIỮ NGUYÊN ---
+    # --- Các hàm hỗ trợ GIỮ NGUYÊN ---
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
