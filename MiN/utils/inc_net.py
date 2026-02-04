@@ -302,7 +302,7 @@ class MiNbaseNet(nn.Module):
                 # 1. Shrinkage (Công thức đơn giản hóa: (1-lam)*Cov + lam*I)
                 # Bài báo [cite: 186] dùng trung bình phương sai đường chéo, 
                 # ở đây dùng Identity để đảm bảo tính khả nghịch cơ bản.
-                lam = 0.9
+                lam = 0.95
                 identity = torch.eye(cov.shape[0], device=self.device)
                 cov_shrunk = (1 - lam) * cov + lam * identity
                 
