@@ -96,7 +96,7 @@ class MinNet(object):
         correct, total = 0, 0
         
         # Hệ số hòa trộn giữa Analytic Classifier và NCM (đã sửa Drift)
-        LAMBDA = 0.6 
+        LAMBDA = 0.2
         
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
@@ -127,7 +127,7 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        LAMBDA = 0.6
+        LAMBDA = 0.2
         
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
