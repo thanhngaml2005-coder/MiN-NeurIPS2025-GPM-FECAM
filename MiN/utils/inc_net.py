@@ -8,37 +8,44 @@ from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
 
+# Xử lý tương thích phiên bản PyTorch cho Autocast
 try:
     from torch.amp import autocast
 except ImportError:
     from torch.cuda.amp import autocast
 
 # =============================================================================
-# [MODULE] DPCR Estimator (Giữ nguyên)
+# [MODULE] DPCR Estimator: SỬA LỖI UNCENTERED & DRIFT
 # =============================================================================
 class DPCREstimator(nn.Module):
     def __init__(self, feature_dim, device):
         super().__init__()
         self.feature_dim = feature_dim
         self.device = device
+        
         self.saved_covs = {} 
         self.saved_protos = {} 
         self.projectors = {} 
 
     def get_projector_svd(self, raw_matrix):
+        """Tính SVD để lấy ma trận chiếu CIP"""
         try:
             U, S, V = torch.svd(raw_matrix + 1e-4 * torch.eye(raw_matrix.shape[0], device=self.device))
         except:
             return torch.eye(raw_matrix.shape[0], device=self.device)
+            
         non_zeros = torch.where(S > 1e-5)[0]
         if len(non_zeros) == 0:
             return torch.eye(raw_matrix.shape[0], device=self.device)
+            
         left_vecs = U[:, non_zeros]
         projector = left_vecs @ left_vecs.T
         return projector
 
     def update_stats(self, model, loader):
-        """Lưu Stats 768-dim (Centered)"""
+        """
+        Lưu Stats 768-dim Centered (Raw features)
+        """
         model.eval()
         print(f"--> [DPCR] Scanning Stats (768-dim Centered)...")
         temp_features = {}
@@ -195,7 +202,7 @@ class MiNbaseNet(nn.Module):
         
         # FeCAM Storage (Lưu 768-dim Stats)
         self.class_means = []
-        self.class_covs_inv = [] 
+        self.class_covs_inv = []
         
         self.dpcr = DPCREstimator(self.feature_dim, self.device)
 
@@ -275,58 +282,130 @@ class MiNbaseNet(nn.Module):
         return self.backbone(x)
 
     def _tukey_transform(self, x, lambda_val=0.5):
-        """
-        Tukey's Ladder of Powers Transformation [cite: 190, 191]
-        Giúp phân phối đặc trưng gần với Gaussian hơn.
-        """
+        """Tukey's Ladder of Powers Transformation"""
         if lambda_val != 0:
             return torch.sign(x) * torch.pow(torch.abs(x) + 1e-6, lambda_val)
         else:
             return torch.log(torch.abs(x) + 1e-6)
 
+    def compute_fecam_stats_direct(self, loader):
+        """
+        Dùng cho Task 0: Tính Stats TRỰC TIẾP từ dữ liệu (Chính xác cao).
+        Apply Tukey -> Tính Mean/Cov -> Shrink -> Norm -> Invert.
+        """
+        self.eval()
+        self.class_means = []
+        self.class_covs_inv = []
+        
+        # 1. Gom tất cả features
+        print("--> [FeCAM] Initializing Stats directly from Data (Task 0)...")
+        temp_features = {}
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                feats = self.extract_feature(inputs).float() # Raw 768
+                
+                # Apply Tukey Transform NGAY LẬP TỨC
+                feats = self._tukey_transform(feats, lambda_val=0.5)
+                
+                unique_labels = torch.unique(targets)
+                for label in unique_labels:
+                    label_item = label.item()
+                    mask = (targets == label)
+                    if label_item not in temp_features:
+                        temp_features[label_item] = []
+                    temp_features[label_item].append(feats[mask].cpu())
+        
+        # 2. Tính Stats
+        sorted_classes = sorted(temp_features.keys())
+        for c in sorted_classes:
+            # Gom lại thành Tensor: [N, 768]
+            feats_c = torch.cat(temp_features[c], dim=0).to(self.device)
+            
+            # Mean
+            mean = torch.mean(feats_c, dim=0)
+            
+            # Covariance (Centered)
+            feats_centered = feats_c - mean.unsqueeze(0)
+            cov = feats_centered.T @ feats_centered / (feats_c.shape[0] - 1 + 1e-6)
+            
+            # Shrinkage (lam=0.5 chuẩn bài báo)
+            lam = 0.5 
+            identity = torch.eye(cov.shape[0], device=self.device)
+            cov_shrunk = (1 - lam) * cov + lam * identity
+            
+            # Norm
+            diag_std = torch.sqrt(torch.diag(cov_shrunk))
+            outer_std = torch.outer(diag_std, diag_std)
+            cov_norm = cov_shrunk / (outer_std + 1e-6)
+            
+            # Inverse
+            try:
+                cov_inv = torch.inverse(cov_norm + 1e-4 * identity)
+            except:
+                cov_inv = identity
+            
+            self.class_means.append(mean)
+            self.class_covs_inv.append(cov_inv)
+        
+        print(f"--> [FeCAM] Initialized {len(self.class_means)} classes directly.")
+
     def update_fecam_stats_with_dpcr(self):
         """
-        Cập nhật Stats FeCAM từ DPCR (768-dim) với Shrinkage và Normalization.
+        Dùng cho Task > 0: Generative Replay Stats.
+        Pipeline: DPCR Stats -> Sample -> Tukey -> Mean/Cov -> Shrink -> Norm -> Invert.
         """
-        print("--> [FeCAM] Syncing Stats (768-dim Native Mode with Norm)...")
+        print("--> [FeCAM] Syncing Stats with Generative Tukey Replay...")
         self.class_means = []
         self.class_covs_inv = []
         
         sorted_classes = sorted(self.dpcr.saved_protos.keys())
+        NUM_SAMPLES = 2000
         
         with torch.no_grad():
             for c in sorted_classes:
-                mean = self.dpcr.saved_protos[c].float()
-                cov = self.dpcr.saved_covs[c].float()
+                # 1. Get Raw Stats (from DPCR - drift corrected)
+                raw_mean = self.dpcr.saved_protos[c].float()
+                raw_cov = self.dpcr.saved_covs[c].float()
                 
-                # 1. Shrinkage (Công thức đơn giản hóa: (1-lam)*Cov + lam*I)
-                # Bài báo [cite: 186] dùng trung bình phương sai đường chéo, 
-                # ở đây dùng Identity để đảm bảo tính khả nghịch cơ bản.
-                lam = 0.95
+                # 2. Sample (Generative Replay in Raw Space)
+                jitter = 1e-5 * torch.eye(raw_cov.shape[0], device=self.device)
+                try:
+                    dist = torch.distributions.MultivariateNormal(raw_mean, covariance_matrix=raw_cov + jitter)
+                    samples = dist.sample((NUM_SAMPLES,))
+                except:
+                    samples = raw_mean.unsqueeze(0) + torch.randn(NUM_SAMPLES, self.feature_dim, device=self.device) * 0.1
+                
+                # 3. Apply Tukey Transform
+                samples_trans = self._tukey_transform(samples, lambda_val=0.5)
+                
+                # 4. Compute New Stats in Transformed Space
+                mean = torch.mean(samples_trans, dim=0)
+                samples_centered = samples_trans - mean.unsqueeze(0)
+                cov = samples_centered.T @ samples_centered / (NUM_SAMPLES - 1)
+                
+                # 5. Shrinkage & Norm
+                lam = 0.5 
                 identity = torch.eye(cov.shape[0], device=self.device)
                 cov_shrunk = (1 - lam) * cov + lam * identity
                 
-                # 2. Correlation Normalization  (CRITICAL)
-                # Chuẩn hóa để so sánh được khoảng cách giữa các class có variance khác nhau
-                diag_std = torch.sqrt(torch.diag(cov_shrunk)) # vector sigma_i
-                outer_std = torch.outer(diag_std, diag_std)   # ma trận sigma_i * sigma_j
+                diag_std = torch.sqrt(torch.diag(cov_shrunk))
+                outer_std = torch.outer(diag_std, diag_std)
                 cov_norm = cov_shrunk / (outer_std + 1e-6)
                 
-                # 3. Nghịch đảo ma trận (Precision Matrix)
                 try:
                     cov_inv = torch.inverse(cov_norm + 1e-4 * identity)
                 except:
-                    # Fallback về Euclidean nếu lỗi nghịch đảo
                     cov_inv = identity
                 
                 self.class_means.append(mean)
                 self.class_covs_inv.append(cov_inv)
                 
-        print(f"--> [FeCAM] Sync Done. Ready for 768-dim inference.")
+        print(f"--> [FeCAM] Sync Done. Stats calculated on Tukey Space.")
 
     def predict_fecam_internal(self, inputs):
         """
-        Inference FeCAM trên không gian 768-dim có áp dụng Tukey's Transform.
+        Inference FeCAM trên không gian 768-dim + Tukey.
         """
         with torch.no_grad(), autocast('cuda', enabled=False):
             if inputs.ndim == 4:
@@ -336,19 +415,13 @@ class MiNbaseNet(nn.Module):
             
             feats = feats.float() # [B, 768]
             
-            # 1. Tukey's Transformation [cite: 190] (CRITICAL)
-            # Áp dụng lên input features lúc test
+            # 1. Tukey's Transformation (CRITICAL)
             feats = self._tukey_transform(feats, lambda_val=0.5)
             
             dists = []
             for c in range(len(self.class_means)):
                 mean = self.class_means[c]
                 cov_inv = self.class_covs_inv[c]
-                
-                # Lưu ý: Mean ở đây lấy từ DPCR (feature chưa transform). 
-                # Trong Data-Free setting, đây là điểm yếu chấp nhận được.
-                # Nếu muốn chính xác hơn, cần transform mean, nhưng mean của features đã transform 
-                # khác với transform của mean.
                 
                 diff = feats - mean.unsqueeze(0)
                 
@@ -363,7 +436,6 @@ class MiNbaseNet(nn.Module):
 
     # --- Các hàm khác ---
     def forward(self, x, new_forward: bool = False):
-        # Giữ nguyên Analytic pipeline cũ
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
