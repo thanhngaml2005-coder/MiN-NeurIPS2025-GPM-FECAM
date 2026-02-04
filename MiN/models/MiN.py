@@ -52,6 +52,8 @@ class MinNet(object):
         self.total_acc = []
         
         self.scaler = GradScaler('cuda')
+        
+        # Snapshot Model cũ để dùng cho DPCR
         self._old_network = None
 
     def _clear_gpu(self):
@@ -86,27 +88,34 @@ class MinNet(object):
         torch.save(self._network.state_dict(), path_name)
 
     # =========================================================================
-    # [EVALUATION] Softmax Ensemble (Analytic + FeCAM)
+    # [EVALUATION] Softmax Ensemble (Analytic + DPCR-NCM)
     # =========================================================================
 
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
+        
+        # Hệ số hòa trộn giữa Analytic Classifier và NCM (đã sửa Drift)
         LAMBDA = 0.6 
         
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
+                
+                # 1. Analytic Prediction (16k-dim)
                 outputs = model(inputs)
                 logits_anal = outputs["logits"]
                 
-                if len(model.class_means) > 0:
-                    logits_fecam = model.predict_fecam_internal(inputs)
+                # 2. DPCR-NCM Prediction (768-dim)
+                # Chỉ chạy nếu đã có prototypes (từ Task 0 trở đi)
+                if len(model.dpcr.saved_protos) > 0:
+                    logits_ncm = model.predict_ncm_simple(inputs)
                     
+                    # Softmax Ensemble
                     prob_anal = F.softmax(logits_anal, dim=1)
-                    prob_fecam = F.softmax(logits_fecam, dim=1)
+                    prob_ncm = F.softmax(logits_ncm, dim=1)
                     
-                    final_prob = prob_anal + LAMBDA * prob_fecam
+                    final_prob = prob_anal + LAMBDA * prob_ncm
                     predicts = torch.max(final_prob, dim=1)[1]
                 else:
                     predicts = torch.max(logits_anal, dim=1)[1]
@@ -123,16 +132,17 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
+                
                 outputs = model(inputs)
                 logits_anal = outputs["logits"]
                 
-                if len(model.class_means) > 0:
-                    logits_fecam = model.predict_fecam_internal(inputs)
+                if len(model.dpcr.saved_protos) > 0:
+                    logits_ncm = model.predict_ncm_simple(inputs)
                     
                     prob_anal = F.softmax(logits_anal, dim=1)
-                    prob_fecam = F.softmax(logits_fecam, dim=1)
+                    prob_ncm = F.softmax(logits_ncm, dim=1)
                     
-                    final_prob = prob_anal + LAMBDA * prob_fecam
+                    final_prob = prob_anal + LAMBDA * prob_ncm
                     predicts = torch.max(final_prob, dim=1)[1]
                 else:
                     predicts = torch.max(logits_anal, dim=1)[1]
@@ -200,15 +210,12 @@ class MinNet(object):
 
         self.re_fit(train_loader_noaug, test_loader_buf)
         
-        # [FIX TASK 0] Tính FeCAM trực tiếp từ dữ liệu thật (Không qua DPCR/Sampling)
-        print("--> [FeCAM] Initializing Task 0 Stats directly from Data...")
-        self._network.compute_fecam_stats_direct(train_loader_noaug)
-        
-        # [DPCR] Vẫn cần update DPCR để phục vụ cho Task 1 (lưu Raw Stats)
-        print("--> [DPCR] Initializing DPCR stats for future drift correction...")
+        # [DPCR INITIALIZATION]
+        # Lưu Prototypes cho Task 0 để làm mốc so sánh drift cho Task 1
+        print("--> [DPCR] Initializing stats/prototypes for Task 0...")
         self._network.dpcr.update_stats(self._network, train_loader_noaug)
         
-        # Snapshot
+        # Snapshot Model
         self._old_network = copy.deepcopy(self._network)
         self._old_network.eval()
         for p in self._old_network.parameters(): p.requires_grad = False
@@ -261,12 +268,13 @@ class MinNet(object):
 
         self.re_fit(train_loader_noaug, test_loader)
         
-        # [DPCR STEP 3]
+        # [DPCR DRIFT CORRECTION LOGIC]
         
-        # 1. Stats MỚI (Raw features)
+        # 1. Tính Stats của Task mới (Mean/Cov mới)
         self._network.dpcr.update_stats(self._network, train_loader_noaug)
         
-        # 2. Correct Drift
+        # 2. Tính Drift & Sửa Prototypes cũ
+        # Đây là bước quan trọng nhất: Prototypes cũ sẽ được xoay/dịch chuyển theo P
         self._network.dpcr.correct_drift(
             old_model=self._old_network, 
             new_model=self._network, 
@@ -274,10 +282,10 @@ class MinNet(object):
             known_classes=self.known_class - self.increment
         )
         
-        # 3. FeCAM Update (Corrected Generative Replay + Tukey)
-        self._network.update_fecam_stats_with_dpcr()
+        # Lưu ý: Không cần gọi update_fecam_stats nữa vì ta đã bỏ FeCAM.
+        # Hàm predict_ncm_simple sẽ tự lấy Prototypes từ self._network.dpcr.saved_protos
         
-        # 4. Snapshot
+        # 3. Snapshot Model
         self._old_network = copy.deepcopy(self._network)
         self._old_network.eval()
         for p in self._old_network.parameters(): p.requires_grad = False
