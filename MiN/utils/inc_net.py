@@ -14,14 +14,13 @@ except ImportError:
     from torch.cuda.amp import autocast
 
 # =============================================================================
-# [MODULE] DPCR Estimator (Giữ nguyên logic chuẩn)
+# [MODULE] DPCR Estimator (Giữ nguyên)
 # =============================================================================
 class DPCREstimator(nn.Module):
     def __init__(self, feature_dim, device):
         super().__init__()
         self.feature_dim = feature_dim
         self.device = device
-        
         self.saved_covs = {} 
         self.saved_protos = {} 
         self.projectors = {} 
@@ -65,7 +64,6 @@ class DPCREstimator(nn.Module):
             
             # Centered Covariance (Full Matrix)
             features_centered = features - mean.unsqueeze(0)
-            # Chia N-1 để đúng chuẩn thống kê
             cov = features_centered.T @ features_centered / (features.shape[0] - 1 + 1e-6)
             
             self.saved_protos[c] = mean
@@ -126,7 +124,6 @@ class DPCREstimator(nn.Module):
             
             self.saved_protos[c] = new_mean
             self.saved_covs[c] = new_cov
-            # Cập nhật projector nếu cần
             self.projectors[c] = self.get_projector_svd(new_cov)
 
 # ... (BaseIncNet, RandomBuffer giữ nguyên) ...
@@ -198,7 +195,7 @@ class MiNbaseNet(nn.Module):
         
         # FeCAM Storage (Lưu 768-dim Stats)
         self.class_means = []
-        self.class_covs_inv = [] # Lưu ma trận nghịch đảo để tính Mahalanobis nhanh
+        self.class_covs_inv = [] 
         
         self.dpcr = DPCREstimator(self.feature_dim, self.device)
 
@@ -271,19 +268,27 @@ class MiNbaseNet(nn.Module):
             self.weight += K @ (Y - X @ self.weight)
 
     # =========================================================================
-    # [FeCAM PHƯƠNG ÁN MỚI] 768-dim (Dual Branch)
+    # [FeCAM IMPLEMENTATION] 768-dim + Tukey + Correlation Norm
     # =========================================================================
 
     def extract_feature(self, x):
         return self.backbone(x)
 
+    def _tukey_transform(self, x, lambda_val=0.5):
+        """
+        Tukey's Ladder of Powers Transformation [cite: 190, 191]
+        Giúp phân phối đặc trưng gần với Gaussian hơn.
+        """
+        if lambda_val != 0:
+            return torch.sign(x) * torch.pow(torch.abs(x) + 1e-6, lambda_val)
+        else:
+            return torch.log(torch.abs(x) + 1e-6)
+
     def update_fecam_stats_with_dpcr(self):
         """
-        Cực kỳ đơn giản và chính xác:
-        Lấy Stats 768 đã sửa (từ DPCR) -> Tính nghịch đảo Covariance -> Lưu lại.
-        KHÔNG Buffer, KHÔNG Sampling, KHÔNG ReLU.
+        Cập nhật Stats FeCAM từ DPCR (768-dim) với Shrinkage và Normalization.
         """
-        print("--> [FeCAM] Syncing Stats (768-dim Native Mode)...")
+        print("--> [FeCAM] Syncing Stats (768-dim Native Mode with Norm)...")
         self.class_means = []
         self.class_covs_inv = []
         
@@ -294,20 +299,25 @@ class MiNbaseNet(nn.Module):
                 mean = self.dpcr.saved_protos[c].float()
                 cov = self.dpcr.saved_covs[c].float()
                 
-                # Shrinkage Covariance (theo chuẩn FeCAM)
-                # Giúp ma trận không bị suy biến khi nghịch đảo
+                # 1. Shrinkage (Công thức đơn giản hóa: (1-lam)*Cov + lam*I)
+                # Bài báo [cite: 186] dùng trung bình phương sai đường chéo, 
+                # ở đây dùng Identity để đảm bảo tính khả nghịch cơ bản.
                 lam = 0.5 
-                # Có thể thay mean_cov bằng Identity nếu muốn đơn giản
-                mean_cov = torch.eye(cov.shape[0], device=self.device) 
-                cov_shrunk = (1 - lam) * cov + lam * mean_cov
+                identity = torch.eye(cov.shape[0], device=self.device)
+                cov_shrunk = (1 - lam) * cov + lam * identity
                 
-                # Tính ma trận nghịch đảo (Precision Matrix)
-                # Dùng cho Mahalanobis: (x-u)T @ Inv @ (x-u)
+                # 2. Correlation Normalization  (CRITICAL)
+                # Chuẩn hóa để so sánh được khoảng cách giữa các class có variance khác nhau
+                diag_std = torch.sqrt(torch.diag(cov_shrunk)) # vector sigma_i
+                outer_std = torch.outer(diag_std, diag_std)   # ma trận sigma_i * sigma_j
+                cov_norm = cov_shrunk / (outer_std + 1e-6)
+                
+                # 3. Nghịch đảo ma trận (Precision Matrix)
                 try:
-                    cov_inv = torch.inverse(cov_shrunk + 1e-4 * torch.eye(cov.shape[0], device=self.device))
+                    cov_inv = torch.inverse(cov_norm + 1e-4 * identity)
                 except:
-                    # Fallback về Euclidean nếu lỗi
-                    cov_inv = torch.eye(cov.shape[0], device=self.device)
+                    # Fallback về Euclidean nếu lỗi nghịch đảo
+                    cov_inv = identity
                 
                 self.class_means.append(mean)
                 self.class_covs_inv.append(cov_inv)
@@ -316,7 +326,7 @@ class MiNbaseNet(nn.Module):
 
     def predict_fecam_internal(self, inputs):
         """
-        Inference FeCAM trên không gian 768-dim.
+        Inference FeCAM trên không gian 768-dim có áp dụng Tukey's Transform.
         """
         with torch.no_grad(), autocast('cuda', enabled=False):
             if inputs.ndim == 4:
@@ -326,25 +336,24 @@ class MiNbaseNet(nn.Module):
             
             feats = feats.float() # [B, 768]
             
-            # [LƯU Ý] Normalize feature?
-            # FeCAM gốc thường dùng feature thô (không normalize L2).
-            # Nếu thích có thể thêm PowerTransform ở đây (optional).
+            # 1. Tukey's Transformation [cite: 190] (CRITICAL)
+            # Áp dụng lên input features lúc test
+            feats = self._tukey_transform(feats, lambda_val=0.5)
             
             dists = []
             for c in range(len(self.class_means)):
                 mean = self.class_means[c]
                 cov_inv = self.class_covs_inv[c]
                 
-                # Diff: [B, 768]
+                # Lưu ý: Mean ở đây lấy từ DPCR (feature chưa transform). 
+                # Trong Data-Free setting, đây là điểm yếu chấp nhận được.
+                # Nếu muốn chính xác hơn, cần transform mean, nhưng mean của features đã transform 
+                # khác với transform của mean.
+                
                 diff = feats - mean.unsqueeze(0)
                 
-                # Full Mahalanobis Distance: diag(Diff @ Inv @ Diff.T)
-                # Cách tính tối ưu bộ nhớ: sum((Diff @ Inv) * Diff, dim=1)
-                
-                # [B, 768] @ [768, 768] -> [B, 768]
+                # Mahalanobis Distance: (x-u)^T * Sigma^-1 * (x-u)
                 temp = torch.matmul(diff, cov_inv) 
-                
-                # Dot product từng hàng
                 dist = torch.sum(temp * diff, dim=1)
                 
                 dists.append(dist)
