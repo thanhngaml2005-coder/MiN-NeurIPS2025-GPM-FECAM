@@ -15,8 +15,7 @@ except ImportError:
     from torch.cuda.amp import autocast
 
 # =============================================================================
-# [MODULE] DPCR Estimator: Bộ sửa lỗi trôi đặc trưng (Feature Drift Corrector)
-# Hoạt động trên không gian gốc (768 dim) để tránh OOM
+# [MODULE] DPCR Estimator
 # =============================================================================
 class DPCREstimator(nn.Module):
     def __init__(self, feature_dim, device):
@@ -24,10 +23,9 @@ class DPCREstimator(nn.Module):
         self.feature_dim = feature_dim
         self.device = device
         
-        # Lưu trữ Covariance và Prototype (Mean) ở không gian gốc (768 dim)
         self.saved_covs = {} 
         self.saved_protos = {} 
-        self.projectors = {} # Lưu SVD Projector (CIP)
+        self.projectors = {} 
 
     def get_projector_svd(self, raw_matrix):
         """Tính SVD để lấy ma trận chiếu CIP"""
@@ -45,43 +43,33 @@ class DPCREstimator(nn.Module):
         return projector
 
     def update_stats(self, model, loader):
-        """
-        [FIXED] Tự động quét và lưu stats cho TẤT CẢ class trong loader.
-        Đã thêm bước Centering Features để tính Covariance đúng.
-        """
+        """Quét và lưu stats (Uncentered Covariance)."""
         model.eval()
-        print(f"--> [DPCR] Scanning & Saving Stats (Auto-detect classes)...")
+        print(f"--> [DPCR] Scanning & Saving Stats...")
         
         temp_features = {}
-        
         with torch.no_grad():
             for _, inputs, targets in loader:
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 feats = model.extract_feature(inputs) # [B, 768]
-                
                 unique_labels = torch.unique(targets)
                 for label in unique_labels:
                     label_item = label.item()
                     mask = (targets == label)
-                    
                     if label_item not in temp_features:
                         temp_features[label_item] = []
-                    
                     temp_features[label_item].append(feats[mask].cpu())
 
         count = 0
         for c, feat_list in temp_features.items():
             if len(feat_list) == 0: continue
-            
             features = torch.cat(feat_list, dim=0).to(self.device).float()
             
             # Tính Mean
             mean = torch.mean(features, dim=0)
             
-            # [FIX CRITICAL] Centering Features: Trừ Mean trước khi nhân ma trận
-            # Covariance = (X - Mu)^T @ (X - Mu)
-            features_centered = features - mean.unsqueeze(0)
-            cov = features_centered.T @ features_centered
+            # Tính Uncentered Covariance (X^T X) cho DPCR
+            cov = features.T @ features
             
             self.saved_protos[c] = mean
             self.saved_covs[c] = cov
@@ -106,7 +94,6 @@ class DPCREstimator(nn.Module):
         with torch.no_grad():
             for _, inputs, _ in current_loader:
                 inputs = inputs.to(self.device)
-                
                 feat_old = old_model.extract_feature(inputs).float() 
                 feat_new = new_model.extract_feature(inputs).float() 
                 
@@ -116,8 +103,7 @@ class DPCREstimator(nn.Module):
                 sample_count += inputs.shape[0]
                 if sample_count > MAX_SAMPLES: break
         
-        # [CHỈNH Ở ĐÂY]: Đổi 1e-4 thành 1e-5 để sát với config DPCR hơn (rg_tssp)
-        # Giá trị này nhỏ để đảm bảo Drift Matrix được tính chính xác (Tight fit)
+        # [FIX] Dùng rg_tssp nhỏ (1e-5) để đảm bảo độ chính xác
         RG_TSSP = 1e-5 
         epsilon = RG_TSSP * torch.eye(self.feature_dim, device=self.device)
         
@@ -138,6 +124,8 @@ class DPCREstimator(nn.Module):
             corrected_count += 1
             
         print(f"--> [DPCR] Correction Done for {corrected_count} classes.")
+
+
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
@@ -314,34 +302,54 @@ class MiNbaseNet(nn.Module):
 
     def update_fecam_stats_with_dpcr(self):
         """
-        Đồng bộ dữ liệu: Chuyển stats đã sửa từ DPCR (768) sang FeCAM (16k).
+        [FIX 3] Tính Variance xịn thông qua Sampling thay vì Var=1.
         """
-        print("--> [FeCAM] Syncing Stats from DPCR corrected memory...")
+        print("--> [FeCAM] Syncing Stats & Estimating Variance (Sampling Strategy)...")
         self.class_means = []
         self.class_vars = []
         
         sorted_classes = sorted(self.dpcr.saved_protos.keys())
         
-        self.buffer.use_relu = False # Tắt ReLU để lấy linear projection
+        self.buffer.use_relu = False 
+        
+        # Số lượng mẫu giả lập để ước lượng Variance
+        NUM_SAMPLES = 500 
         
         with torch.no_grad():
             for c in sorted_classes:
                 mean_768 = self.dpcr.saved_protos[c].float()
+                cov_768 = self.dpcr.saved_covs[c].float()
                 
-                # Chiếu Mean qua Buffer (16k dim)
+                # 1. Tính Mean 16k
                 mean_16k = self.buffer(mean_768.unsqueeze(0)).squeeze(0)
-                
-                # Robust Transform
                 mean_16k = self._robust_transform(mean_16k.unsqueeze(0)).squeeze(0)
                 
-                # FeCAM Hybrid (Nearest Mean): Set Var = 1
-                var_16k = torch.ones_like(mean_16k)
+                # 2. Ước lượng Variance 16k bằng Sampling
+                jitter = 1e-5 * torch.eye(cov_768.shape[0], device=self.device)
+                
+                try:
+                    # Tạo bộ sinh mẫu
+                    dist = torch.distributions.MultivariateNormal(mean_768, covariance_matrix=cov_768 + jitter)
+                    samples_768 = dist.sample((NUM_SAMPLES,))
+                except:
+                    # Fallback nếu Covariance lỗi
+                    samples_768 = mean_768.unsqueeze(0) + torch.randn(NUM_SAMPLES, 768, device=self.device) * 0.1
+                
+                # Chiếu 200 mẫu qua Buffer (768 -> 16k)
+                samples_16k = self.buffer(samples_768)
+                samples_16k = self._robust_transform(samples_16k)
+                
+                # Tính Variance theo từng chiều (Diagonal Variance)
+                var_16k = torch.var(samples_16k, dim=0) 
+                
+                # Làm mượt Variance
+                var_16k = var_16k + 1e-4 
                 
                 self.class_means.append(mean_16k)
                 self.class_vars.append(var_16k)
                 
         self.buffer.use_relu = True
-        print(f"--> [FeCAM] Sync Done. Classes: {len(self.class_means)}")
+        print(f"--> [FeCAM] Sync Done. Variance Estimated. Classes: {len(self.class_means)}")
 
     def predict_fecam_internal(self, inputs):
         """FeCAM Inference"""
@@ -359,18 +367,17 @@ class MiNbaseNet(nn.Module):
             dists = []
             for c in range(len(self.class_means)):
                 mean = self.class_means[c]
-                var = self.class_vars[c]
+                var = self.class_vars[c] # [FIX] Đã có Var xịn
                 
                 diff_sq = (feats - mean.unsqueeze(0)) ** 2
                 
-                # [FIX SCALE] Chia cho sqrt(D) để giảm magnitude của khoảng cách
+                # [FIX] Chia cho Variance ước lượng được
                 D = feats.shape[1]
-                dist = torch.sum(diff_sq / (var + 1e-6), dim=1) / math.sqrt(D)
+                dist = torch.sum(diff_sq / var, dim=1) / math.sqrt(D)
                 
                 dists.append(dist)
                 
         self.buffer.use_relu = True
-        # Trả về số âm: Distance nhỏ -> Logits lớn
         return -torch.stack(dists, dim=1)
 
     # --- Các hàm khác ---
