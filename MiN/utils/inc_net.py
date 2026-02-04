@@ -14,7 +14,7 @@ except ImportError:
     from torch.cuda.amp import autocast
 
 # =============================================================================
-# [MODULE] DPCR Estimator
+# [MODULE] DPCR Estimator (Giữ nguyên logic chuẩn)
 # =============================================================================
 class DPCREstimator(nn.Module):
     def __init__(self, feature_dim, device):
@@ -31,25 +31,22 @@ class DPCREstimator(nn.Module):
             U, S, V = torch.svd(raw_matrix + 1e-4 * torch.eye(raw_matrix.shape[0], device=self.device))
         except:
             return torch.eye(raw_matrix.shape[0], device=self.device)
-            
         non_zeros = torch.where(S > 1e-5)[0]
         if len(non_zeros) == 0:
             return torch.eye(raw_matrix.shape[0], device=self.device)
-            
         left_vecs = U[:, non_zeros]
         projector = left_vecs @ left_vecs.T
         return projector
 
     def update_stats(self, model, loader):
-        """Lưu Stats 768-dim Centered"""
+        """Lưu Stats 768-dim (Centered)"""
         model.eval()
-        print(f"--> [DPCR] Scanning & Saving Stats (Centered)...")
-        
+        print(f"--> [DPCR] Scanning Stats (768-dim Centered)...")
         temp_features = {}
         with torch.no_grad():
             for _, inputs, targets in loader:
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                feats = model.extract_feature(inputs) # 768-dim
+                feats = model.extract_feature(inputs) # 768
                 unique_labels = torch.unique(targets)
                 for label in unique_labels:
                     label_item = label.item()
@@ -66,21 +63,21 @@ class DPCREstimator(nn.Module):
             # Mean
             mean = torch.mean(features, dim=0)
             
-            # Centered Covariance
+            # Centered Covariance (Full Matrix)
             features_centered = features - mean.unsqueeze(0)
-            cov = features_centered.T @ features_centered
+            # Chia N-1 để đúng chuẩn thống kê
+            cov = features_centered.T @ features_centered / (features.shape[0] - 1 + 1e-6)
             
             self.saved_protos[c] = mean
             self.saved_covs[c] = cov
             self.projectors[c] = self.get_projector_svd(cov)
             count += 1
-            
         print(f"--> [DPCR] Stats Saved. Classes: {count}")
         del temp_features
 
     def correct_drift(self, old_model, new_model, current_loader, known_classes):
-        """Tính Drift Matrix P trên không gian 768-dim"""
-        print(f"--> [DPCR] Calculating Drift Matrix (768-dim)...")
+        """Tính P và sửa Stats cũ ngay trên 768-dim"""
+        print(f"--> [DPCR] Calculating Drift Matrix P (768-dim)...")
         old_model.eval()
         new_model.eval()
         
@@ -93,13 +90,12 @@ class DPCREstimator(nn.Module):
         with torch.no_grad():
             for _, inputs, _ in current_loader:
                 inputs = inputs.to(self.device)
-                
-                feat_old = old_model.extract_feature(inputs).float() 
+                feat_old = old_model.extract_feature(inputs).float()
                 feat_new = new_model.extract_feature(inputs).float() 
                 
-                # Normalize features để ổn định nghiệm P
-                feat_old = F.normalize(feat_old, p=2, dim=1)
-                feat_new = F.normalize(feat_new, p=2, dim=1)
+                # Centering cục bộ
+                feat_old = feat_old - feat_old.mean(dim=0, keepdim=True)
+                feat_new = feat_new - feat_new.mean(dim=0, keepdim=True)
                 
                 cov_old += feat_old.T @ feat_old
                 cross_corr += feat_old.T @ feat_new
@@ -107,7 +103,6 @@ class DPCREstimator(nn.Module):
                 sample_count += inputs.shape[0]
                 if sample_count > MAX_SAMPLES: break
         
-        # Regularization mạnh hơn chút cho ổn định
         RG_TSSP = 0.01 
         epsilon = RG_TSSP * torch.eye(self.feature_dim, device=self.device)
         
@@ -116,20 +111,25 @@ class DPCREstimator(nn.Module):
         except:
             P_tssp = torch.inverse(cov_old + epsilon) @ cross_corr
         
-        corrected_count = 0
+        print(f"--> [DPCR] Drift Calculated. Correcting Stats...")
+        
+        # Cập nhật trực tiếp Stats cũ
         for c in range(known_classes):
             if c not in self.saved_covs: continue
             
-            W_c = P_tssp @ self.projectors[c]
+            old_mean = self.saved_protos[c]
+            old_cov = self.saved_covs[c]
             
-            self.saved_covs[c] = W_c.T @ self.saved_covs[c] @ W_c
-            self.saved_protos[c] = self.saved_protos[c] @ W_c
-            self.projectors[c] = self.get_projector_svd(self.saved_covs[c])
-            corrected_count += 1
+            # Công thức biến đổi Mean và Covariance
+            new_mean = old_mean @ P_tssp
+            new_cov = P_tssp.T @ old_cov @ P_tssp
             
-        print(f"--> [DPCR] Correction Done for {corrected_count} classes.")
+            self.saved_protos[c] = new_mean
+            self.saved_covs[c] = new_cov
+            # Cập nhật projector nếu cần
+            self.projectors[c] = self.get_projector_svd(new_cov)
 
-
+# ... (BaseIncNet, RandomBuffer giữ nguyên) ...
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
@@ -137,7 +137,6 @@ class BaseIncNet(nn.Module):
         self.backbone = get_pretrained_backbone(args)
         self.feature_dim = self.backbone.out_dim
         self.fc = None
-
     def update_fc(self, nb_classes):
         fc = self.generate_fc(self.feature_dim, nb_classes)
         if self.fc is not None:
@@ -148,17 +147,14 @@ class BaseIncNet(nn.Module):
             fc.bias.data[:nb_output] = bias
         del self.fc
         self.fc = fc
-
     @staticmethod
     def generate_fc(in_dim, out_dim):
         fc = SimpleLinear(in_dim, out_dim)
         return fc
-
     def forward(self, x):
         hyper_features = self.backbone(x)
         logits = self.fc(hyper_features)['logits']
         return {'features': hyper_features, 'logits': logits}
-
 
 class RandomBuffer(nn.Module):
     def __init__(self, in_features: int, buffer_size: int, device):
@@ -170,16 +166,12 @@ class RandomBuffer(nn.Module):
         self.register_buffer("weight", self.W)
         self.use_relu = True
         self.reset_parameters()
-
     def reset_parameters(self) -> None:
         nn.init.normal_(self.W, mean=0.0, std=1.0 / math.sqrt(self.in_features))
-
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         X = X.to(self.weight.dtype)
         out = X @ self.W
-        # Luôn bật ReLU
         return F.relu(out) if self.use_relu else out
-
 
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
@@ -204,11 +196,13 @@ class MiNbaseNet(nn.Module):
         self.cur_task = -1
         self.known_class = 0
         
+        # FeCAM Storage (Lưu 768-dim Stats)
         self.class_means = []
-        self.class_vars = []
+        self.class_covs_inv = [] # Lưu ma trận nghịch đảo để tính Mahalanobis nhanh
         
         self.dpcr = DPCREstimator(self.feature_dim, self.device)
 
+    # ... (Các hàm update_fc, update_noise, Analytic fit giữ nguyên) ...
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
@@ -228,20 +222,16 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None:
                 nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
-
     def update_noise(self):
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].update_noise()
-
     def after_task_magmax_merge(self):
         print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].after_task_training()
-
     def unfreeze_noise(self):
         for j in range(len(self.backbone.noise_maker)):
             self.backbone.noise_maker[j].unfreeze_incremental()
-
     def init_unfreeze(self):
         for j in range(len(self.backbone.noise_maker)):
             self.backbone.noise_maker[j].unfreeze_task_0()
@@ -251,36 +241,16 @@ class MiNbaseNet(nn.Module):
                 for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
-
-    # =========================================================================
-    # [ANALYTIC LEARNING] - ĐÃ SỬA: Thêm _robust_transform
-    # =========================================================================
-
-    def extract_feature(self, x):
-        return self.backbone(x)
-
-    def _robust_transform(self, x, beta=0.5):
-        """Biến đổi feature để giống Gaussian hơn: Sign * Power(0.5) + LayerNorm"""
-        x = torch.sign(x) * torch.pow(torch.abs(x) + 1e-6, beta)
-        x = F.layer_norm(x, x.shape[-1:])
-        return x
-
     def forward_fc(self, features):
         features = features.to(self.weight.dtype) 
         return features @ self.weight
-
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         self.buffer.use_relu = True
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
             X = self.buffer(X) 
-            
-            # [FIX CRITICAL] Thêm Transform vào đây để đồng bộ với FeCAM
-            X = self._robust_transform(X)
-            
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
-
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
@@ -291,106 +261,105 @@ class MiNbaseNet(nn.Module):
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
-
             term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             try:
                 K = torch.linalg.solve(term + jitter, X @ self.R).T
             except:
                 K = self.R @ X.T @ torch.inverse(term + jitter)
-
             self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
 
     # =========================================================================
-    # [FeCAM INTEGRATION] - Giữ nguyên Transform để khớp với Analytic
+    # [FeCAM PHƯƠNG ÁN MỚI] 768-dim (Dual Branch)
     # =========================================================================
+
+    def extract_feature(self, x):
+        return self.backbone(x)
 
     def update_fecam_stats_with_dpcr(self):
         """
-        Stats estimation using Corrected Generative Replay.
-        Pipeline: 768 (Drifted) -> 768 (Sample) -> Buffer -> ReLU -> Transform -> Stats
+        Cực kỳ đơn giản và chính xác:
+        Lấy Stats 768 đã sửa (từ DPCR) -> Tính nghịch đảo Covariance -> Lưu lại.
+        KHÔNG Buffer, KHÔNG Sampling, KHÔNG ReLU.
         """
-        print("--> [FeCAM] Syncing Stats & Estimating Variance (Corrected Generative)...")
+        print("--> [FeCAM] Syncing Stats (768-dim Native Mode)...")
         self.class_means = []
-        self.class_vars = []
+        self.class_covs_inv = []
         
         sorted_classes = sorted(self.dpcr.saved_protos.keys())
-        self.buffer.use_relu = True 
-        NUM_SAMPLES = 2000 
         
         with torch.no_grad():
             for c in sorted_classes:
-                mean_768 = self.dpcr.saved_protos[c].float()
-                cov_768 = self.dpcr.saved_covs[c].float()
+                mean = self.dpcr.saved_protos[c].float()
+                cov = self.dpcr.saved_covs[c].float()
                 
-                # 1. GENERATE
-                jitter = 1e-5 * torch.eye(cov_768.shape[0], device=self.device)
+                # Shrinkage Covariance (theo chuẩn FeCAM)
+                # Giúp ma trận không bị suy biến khi nghịch đảo
+                lam = 0.5 
+                # Có thể thay mean_cov bằng Identity nếu muốn đơn giản
+                mean_cov = torch.eye(cov.shape[0], device=self.device) 
+                cov_shrunk = (1 - lam) * cov + lam * mean_cov
+                
+                # Tính ma trận nghịch đảo (Precision Matrix)
+                # Dùng cho Mahalanobis: (x-u)T @ Inv @ (x-u)
                 try:
-                    dist = torch.distributions.MultivariateNormal(mean_768, covariance_matrix=cov_768 + jitter)
-                    samples_768 = dist.sample((NUM_SAMPLES,))
+                    cov_inv = torch.inverse(cov_shrunk + 1e-4 * torch.eye(cov.shape[0], device=self.device))
                 except:
-                    samples_768 = mean_768.unsqueeze(0) + torch.randn(NUM_SAMPLES, 768, device=self.device) * 0.1
+                    # Fallback về Euclidean nếu lỗi
+                    cov_inv = torch.eye(cov.shape[0], device=self.device)
                 
-                # 2. PROJECT (Buffer + ReLU)
-                samples_16k = self.buffer(samples_768)
+                self.class_means.append(mean)
+                self.class_covs_inv.append(cov_inv)
                 
-                # 3. TRANSFORM (Đồng bộ với Analytic)
-                samples_16k = self._robust_transform(samples_16k)
-                
-                # 4. ESTIMATE
-                mean_16k = torch.mean(samples_16k, dim=0)
-                var_16k = torch.var(samples_16k, dim=0)
-                
-                # 5. CORRECTION
-                CORRECTION_FACTOR = 3.0
-                var_16k = var_16k * CORRECTION_FACTOR + 1e-4
-                
-                self.class_means.append(mean_16k)
-                self.class_vars.append(var_16k)
-                
-        print(f"--> [FeCAM] Sync Done. Classes: {len(self.class_means)}")
+        print(f"--> [FeCAM] Sync Done. Ready for 768-dim inference.")
 
     def predict_fecam_internal(self, inputs):
-        """FeCAM Inference"""
-        self.buffer.use_relu = True
+        """
+        Inference FeCAM trên không gian 768-dim.
+        """
         with torch.no_grad(), autocast('cuda', enabled=False):
             if inputs.ndim == 4:
                 feats = self.backbone(inputs)
             else:
                 feats = inputs
             
-            feats = feats.float()
-            feats = self.buffer(feats) 
+            feats = feats.float() # [B, 768]
             
-            # [FIX] TRANSFORM here too
-            feats = self._robust_transform(feats)
+            # [LƯU Ý] Normalize feature?
+            # FeCAM gốc thường dùng feature thô (không normalize L2).
+            # Nếu thích có thể thêm PowerTransform ở đây (optional).
             
             dists = []
             for c in range(len(self.class_means)):
                 mean = self.class_means[c]
-                var = self.class_vars[c]
+                cov_inv = self.class_covs_inv[c]
                 
-                diff_sq = (feats - mean.unsqueeze(0)) ** 2
+                # Diff: [B, 768]
+                diff = feats - mean.unsqueeze(0)
                 
-                # Mahalanobis Diagonal
-                dist = torch.sum(diff_sq / var, dim=1)
+                # Full Mahalanobis Distance: diag(Diff @ Inv @ Diff.T)
+                # Cách tính tối ưu bộ nhớ: sum((Diff @ Inv) * Diff, dim=1)
+                
+                # [B, 768] @ [768, 768] -> [B, 768]
+                temp = torch.matmul(diff, cov_inv) 
+                
+                # Dot product từng hàng
+                dist = torch.sum(temp * diff, dim=1)
+                
                 dists.append(dist)
                 
+        # Trả về negative distance
         return -torch.stack(dists, dim=1)
 
-    # --- Sửa Forward để dùng Transform ---
+    # --- Các hàm khác ---
     def forward(self, x, new_forward: bool = False):
+        # Giữ nguyên Analytic pipeline cũ
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        
-        # [FIX] Thêm Transform vào luồng chính
-        hyper_features = self.buffer(hyper_features.to(self.weight.dtype))
-        hyper_features = self._robust_transform(hyper_features)
-        
-        logits = self.forward_fc(hyper_features)
+        logits = self.forward_fc(self.buffer(hyper_features.to(self.weight.dtype)))
         return {'logits': logits}
 
     def forward_normal_fc(self, x, new_forward: bool = False):
@@ -398,12 +367,7 @@ class MiNbaseNet(nn.Module):
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-            
         hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
-        
-        # [FIX] Thêm Transform vào luồng normal_fc
-        hyper_features = self._robust_transform(hyper_features)
-        
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
