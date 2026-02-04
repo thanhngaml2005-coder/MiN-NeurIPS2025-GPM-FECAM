@@ -100,7 +100,7 @@ class MinNet(object):
         
         # [TUNING] Hệ số hòa trộn. 
         # Vì đã có Correction Factor cho Variance, FeCAM sẽ ổn định hơn.
-        LAMBDA = 0.6 
+        LAMBDA = 0.2 
         
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
@@ -130,7 +130,7 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        LAMBDA = 0.6 # Đồng bộ với hàm trên
+        LAMBDA = 0.2 # Đồng bộ với hàm trên
         
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
