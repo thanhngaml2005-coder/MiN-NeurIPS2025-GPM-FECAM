@@ -25,6 +25,10 @@ EPSILON = 1e-8
 class MinNet(object):
     def __init__(self, args, loger):
         super().__init__()
+        
+        # [USER REQUEST] Giữ nguyên gamma từ config, KHÔNG tự ý chỉnh sửa.
+        # self.args['gamma'] = 2000  <-- ĐÃ XÓA
+        
         self.args = args
         self.logger = loger
         self._network = MiNbaseNet(args)
@@ -93,20 +97,15 @@ class MinNet(object):
         torch.save(self._network.state_dict(), path_name)
 
     # =========================================================================
-    # [FIXED EVAL] Normalization & Hybrid Decision
+    # [FIXED EVAL] Softmax Ensemble Strategy
     # =========================================================================
-    
-    def _normalize_logits(self, logits):
-        """Hàm chuẩn hóa Z-score cho Logits"""
-        # (Logits - Mean) / Std
-        mean = logits.mean(dim=1, keepdim=True)
-        std = logits.std(dim=1, keepdim=True) + 1e-6
-        return (logits - mean) / std
 
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
-        LAMBDA = 0.2 # Tune giá trị này (0.2 -> 0.8)
+        
+        # Hệ số hòa trộn xác suất
+        LAMBDA = 0.6 
         
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
@@ -118,15 +117,16 @@ class MinNet(object):
                 if len(model.class_means) > 0:
                     logits_fecam = model.predict_fecam_internal(inputs)
                     
-                    # [NORMALIZE] Chuẩn hóa trước khi cộng
-                    norm_anal = self._normalize_logits(logits_anal)
-                    norm_fecam = self._normalize_logits(logits_fecam)
+                    # [SOFTMAX] Chuyển về xác suất để giữ thông tin độ tin cậy
+                    prob_anal = F.softmax(logits_anal, dim=1)
+                    prob_fecam = F.softmax(logits_fecam, dim=1)
                     
-                    logits = norm_anal + LAMBDA * norm_fecam
+                    # Cộng xác suất (Probability Averaging)
+                    final_prob = prob_anal + LAMBDA * prob_fecam
+                    predicts = torch.max(final_prob, dim=1)[1]
                 else:
-                    logits = logits_anal
+                    predicts = torch.max(logits_anal, dim=1)[1]
                 
-                predicts = torch.max(logits, dim=1)[1]
                 correct += (predicts.cpu() == targets).sum()
                 total += len(targets)
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
@@ -134,7 +134,7 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        LAMBDA = 0.2 # Tune giá trị này
+        LAMBDA = 0.6 # Đồng bộ với hàm trên
         
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
@@ -146,15 +146,15 @@ class MinNet(object):
                 if len(model.class_means) > 0:
                     logits_fecam = model.predict_fecam_internal(inputs)
                     
-                    # [NORMALIZE] Chuẩn hóa trước khi cộng
-                    norm_anal = self._normalize_logits(logits_anal)
-                    norm_fecam = self._normalize_logits(logits_fecam)
+                    # [SOFTMAX] Chuyển về xác suất
+                    prob_anal = F.softmax(logits_anal, dim=1)
+                    prob_fecam = F.softmax(logits_fecam, dim=1)
                     
-                    logits = norm_anal + LAMBDA * norm_fecam
+                    final_prob = prob_anal + LAMBDA * prob_fecam
+                    predicts = torch.max(final_prob, dim=1)[1]
                 else:
-                    logits = logits_anal
+                    predicts = torch.max(logits_anal, dim=1)[1]
                 
-                predicts = torch.max(logits, dim=1)[1]
                 pred.extend(predicts.cpu().numpy().tolist())
                 label.extend(targets.cpu().numpy().tolist())
                 
@@ -218,12 +218,11 @@ class MinNet(object):
 
         self.re_fit(train_loader_noaug, test_loader_buf)
         
-        # [DPCR STEP 1] Lưu Stats cho Task 0 (đã sửa lỗi gọi hàm thừa arguments)
         print("--> [DPCR] Initializing stats for Task 0...")
         self._network.dpcr.update_stats(self._network, train_loader_noaug)
         self._network.update_fecam_stats_with_dpcr()
         
-        # [DPCR STEP 2] Snapshot Model cũ
+        # [DPCR] Snapshot Model cũ
         self._old_network = copy.deepcopy(self._network)
         self._old_network.eval()
         for p in self._old_network.parameters(): p.requires_grad = False
@@ -289,7 +288,7 @@ class MinNet(object):
             known_classes=self.known_class - self.increment
         )
         
-        # 3. Đồng bộ DPCR -> FeCAM
+        # 3. Đồng bộ DPCR -> FeCAM (Có Variance Sampling)
         self._network.update_fecam_stats_with_dpcr()
         
         # 4. Update Snapshot
